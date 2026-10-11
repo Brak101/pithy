@@ -24,6 +24,31 @@ Use `/ship`. It takes a `Ready` issue and carries it to a merged PR — TDD impl
 
 Mechanics live in the shared `ship` skill, in the workspace checkout alongside this repository. What it does *here* — the changeset, the `Security:` line, the worktree commands, the gates — is in `.claude/project.md`.
 
+## Pull requests from outside the team
+
+Welcome. A pull request merges into `main` when three things hold, and GitHub enforces all of them:
+
+- **The `CI` check is green**, on a branch that is up to date with `main`. If `main` moves, update your branch and CI runs again.
+- **One maintainer has approved the change.** A push that changes it dismisses an earlier approval, so the approval is of the diff that merges.
+- **Every review conversation is resolved.**
+
+**Your first pull request's CI run waits for a maintainer to approve it.** That is this repository's Actions setting for first-time contributors, not a judgment on the change: the run executes your code, so a maintainer reads the diff first. After that it runs on every push.
+
+**A change under `.github/` is read line by line.** A pull request's CI runs the workflows on its own branch, so a green `CI` proves only what those workflows checked. The review is what makes it mean the rest.
+
+Link the issue your change closes (`Closes #N`), add a test that fails without the change, and add a changeset when it ships in a package (§Releases). A fix for a platform CI does not run — CI runs on Linux — needs the command, the shell and the output before and after, because your machine is the only one that has proved it.
+
+The rule is a repository ruleset, committed at `.github/rulesets/main.json` and applied from it. `packages/cli/src/ci/mainRuleset.test.ts` holds that file, and the `CI` job it requires, to the rule. It does not read GitHub, so the live ruleset can drift from the file; `/vet` compares the two before every merge it performs.
+
+Repository admins bypass it — all of it, force push and deletion included. That is how `/ship` commits to `main`, and merges its own pull requests with `--admin`, while the team is solo.
+
+To change the rule, edit the file, then apply it. `gh api repos/pithy-sh/pithy/rulesets` lists the id; with no `main` ruleset listed, create it instead:
+
+```bash
+gh api -X PUT repos/pithy-sh/pithy/rulesets/<id> --input .github/rulesets/main.json   # update
+gh api -X POST repos/pithy-sh/pithy/rulesets --input .github/rulesets/main.json        # create
+```
+
 ## The board
 
 The [Pithy board](https://github.com/orgs/pithy-sh/projects/1) tracks each issue's **Status** across its life:

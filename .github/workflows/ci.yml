@@ -516,20 +516,25 @@ jobs:
       - name: The same, at every declared floor
         run: bun run clean-room -- --floors
 
-  # The one check branch protection requires, and the only one whose name is stable.
+  # The one check the `main` ruleset requires, and the only one whose name is stable.
   #
   # Every other job here is named from the shard it drew — `Tests (payments, email, …)`,
   # `Node 22 (cli)` — and those names change the day a package is added or the LPT packing shifts a
   # boundary. A required check names a job; a required check naming a job that no longer exists is a
-  # protection that silently stops protecting. So protection requires this, and this requires the rest.
+  # protection that silently stops protecting. So the ruleset requires this, and this requires the rest.
   #
   # `if: always()` so it reports even when something upstream failed — without it the job would be
   # skipped on failure and the check would go green by absence, which is the failure mode it exists to
   # close. `result` is `success` only when a job actually succeeded: a *skipped* job is a pass here,
   # because that is how `plan` narrows a docs-only pull request, and a canceled one is not.
+  #
+  # So `needs` is the whole of what this checks, and it names every other job — `plan` included. It once
+  # left `plan` out: a failing `plan` skips both test jobs, this read two skips as two passes, and a pull
+  # request whose tests never ran went green. The ruleset that requires this check is committed at
+  # `.github/rulesets/main.json`, and `packages/cli/src/ci/mainRuleset.test.ts` holds both files to it.
   ci:
     name: CI
-    needs: [verify, test, test-node, clean-room]
+    needs: [plan, verify, test, test-node, clean-room]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 15
