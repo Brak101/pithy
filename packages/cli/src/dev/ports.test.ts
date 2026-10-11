@@ -3,7 +3,13 @@
 
 import { ConflictError } from "@pithy-sh/core/src/error/pithyError";
 import { describe, expect, test, vi } from "vitest";
-import { isReapableDevCommand, sweepStaleDevPorts, verifyPinnedPort, waitForExit } from "./ports";
+import {
+  isReapableDevCommand,
+  parseNetstatListening,
+  sweepStaleDevPorts,
+  verifyPinnedPort,
+  waitForExit,
+} from "./ports";
 
 describe("verifyPinnedPort", () => {
   test("returns when the port is free on both families", async () => {
@@ -129,6 +135,39 @@ describe("sweepStaleDevPorts", () => {
   });
 });
 
+describe("parseNetstatListening", () => {
+  /** The real shape of `netstat -ano -p TCP` on Windows 11, with a 8787 story written into it. */
+  const TABLE = [
+    "Active Connections",
+    "",
+    "  Proto  Local Address          Foreign Address        State           PID",
+    "  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1704",
+    "  TCP    127.0.0.1:8787         0.0.0.0:0              LISTENING       27200",
+    "  TCP    [::1]:8787             [::]:0                 LISTENING       27200",
+    "  TCP    127.0.0.1:8787         127.0.0.1:57875        ESTABLISHED     27200",
+    "  TCP    127.0.0.1:57875        127.0.0.1:8787         ESTABLISHED     2872",
+    "  TCP    127.0.0.1:51066        127.0.0.1:8787         TIME_WAIT       0",
+  ].join("\r\n");
+
+  test("names the listener on both families once, from a real table shape", () => {
+    expect(parseNetstatListening(TABLE, 8787)).toEqual([27200]);
+  });
+
+  test("an ESTABLISHED client connection to the port is not a holder of it", () => {
+    // pid 2872 has the port as its *foreign* address — a browser tab, not the server. Reaping it for
+    // a stale dev port would kill the operator's browser, not the orphan.
+    expect(parseNetstatListening(TABLE, 8787)).not.toContain(2872);
+  });
+
+  test("a table with no listener for the port is empty, and TIME_WAIT is not a listener", () => {
+    expect(parseNetstatListening(TABLE, 5173)).toEqual([]);
+  });
+
+  test("the header row and the CRLF line endings of the real binary are absorbed", () => {
+    expect(parseNetstatListening(TABLE, 135)).toEqual([1704]);
+  });
+});
+
 describe("isReapableDevCommand", () => {
   test.each<[string | null, boolean]>([
     ["/usr/local/bin/workerd serve --socket-addr=127.0.0.1:8787", true],
@@ -139,6 +178,13 @@ describe("isReapableDevCommand", () => {
     ["docker-proxy -proto tcp -host-port 8791", false],
     ["nvim wrangler.jsonc", false],
     [null, false],
+    // #701 item 3: the CIM command lines the Windows sweep feeds this. Backslash paths, an `.exe`
+    // suffix, and a quoted program path (a Windows home with a space is the common case).
+    ["C:\\Users\\x\\node_modules\\@cloudflare\\workerd\\bin\\workerd.exe serve", true],
+    ['"C:\\Program Files\\nodejs\\node.exe" C:\\proj\\node_modules\\wrangler\\bin\\wrangler.js dev', true],
+    ["C:\\Users\\x\\AppData\\Roaming\\npm\\node_modules\\bun\\bin\\bun.exe x wrangler dev", true],
+    ['"C:\\Program Files\\Git\\usr\\bin\\git.exe" status', false],
+    ["C:\\Windows\\System32\\netstat.exe -ano", false],
   ])("%s → %s", (command, expected) => {
     expect(isReapableDevCommand(command)).toBe(expected);
   });

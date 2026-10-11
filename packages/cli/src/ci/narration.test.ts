@@ -46,8 +46,8 @@ import { isTestFile, readSource, sourcePaths } from "./sourceFiles";
  *    decided: `commandProgress({ json: true })` is no sink. `terminal/progress.test.ts` holds that at runtime.
  *
  * **Not every child needs a step, and there are two exceptions.** A child whose executable is written as the
- * literal `"git"`, `"lsof"`, `"ps"` or `"taskkill"` is a bounded local query — git's metadata, the process
- * table — judged at
+ * literal `"git"`, `"lsof"`, `"ps"`, `"taskkill"`, `"netstat"` or `"powershell.exe"` is a bounded
+ * local query — git's metadata, the process table, and the CIM process table behind PowerShell — judged at
  * the call site, so the same `execFile` with `"npm"` beside it is held. And a `spawn` in one of three named
  * modules that hand the child's streams on rather than collecting them — the editor that owns the terminal,
  * the browser opener that detaches, `pithy dev`'s servers whose output *is* the narration — is not captured.
@@ -122,7 +122,7 @@ const WRAP = /\bwithErrorReporting\s*\(/;
 
 /** What needs no step. Each entry is argued in the docblock above. */
 const POLICY: ChildProcessPolicy = {
-  boundedExecutables: new Set(["git", "lsof", "ps", "taskkill"]),
+  boundedExecutables: new Set(["git", "lsof", "ps", "taskkill", "netstat", "powershell.exe"]),
   uncapturedModules: new Set(
     ["platform/browser.ts", "platform/editor.ts", "dev/orchestrator.ts"].map((path) => resolve(CLI_SRC, path)),
   ),

@@ -93,6 +93,42 @@ export const lsofPort: LsofPort = async (port) => {
   }
 };
 
+/**
+ * The pids listening on a TCP `port`, read from `netstat -ano` — the Windows {@link LsofPort} (#701
+ * item 3). Windows has no `lsof`, and the POSIX default reads a missing binary as "nothing holds this
+ * port", so the sweep reaps nothing and a pinned port that outlived a crash silently blocks startup.
+ */
+export const netstatPort: LsofPort = async (port) => {
+  try {
+    const { stdout } = await run("netstat", ["-ano", "-p", "TCP"]);
+    return parseNetstatListening(stdout, port);
+  } catch {
+    return [];
+  }
+};
+
+/**
+ * The LISTENING pids for one port out of `netstat -ano`'s table.
+ *
+ * A row is `TCP  <local>  <foreign>  <state>  <pid>`, and the state column is what tells a listener
+ * from a connection: an `ESTABLISHED` row's fourth token is a pid, not a state, so only a literal
+ * `LISTENING` there is kept — a client connection to a port must not read as a holder of it. The
+ * local address is `127.0.0.1:8787` on IPv4 and `[::1]:8787` on IPv6 — the port is the text after
+ * the last colon, and both families count, because the dev ports are verified on both.
+ */
+export function parseNetstatListening(stdout: string, port: number): number[] {
+  const pids = new Set<number>();
+  for (const line of stdout.split(/\r?\n/)) {
+    const tokens = line.trim().split(/\s+/);
+    if (tokens.length < 5 || tokens[0] !== "TCP" || tokens[3] !== "LISTENING") continue;
+    const local = tokens[1] ?? "";
+    if (Number(local.slice(local.lastIndexOf(":") + 1)) !== port) continue;
+    const pid = Number(tokens[4]);
+    if (Number.isInteger(pid) && pid > 0) pids.add(pid);
+  }
+  return [...pids];
+}
+
 /** Look up a pid's full command line — the sweep's scope filter. */
 export type ProcessCommand = (pid: number) => Promise<string | null>;
 
@@ -121,14 +157,70 @@ export const psParent: ParentPid = async (pid) => {
   }
 };
 
+/**
+ * `Get-CimInstance Win32_Process` → the parent pid, or `null` when it is gone or CIM is unavailable —
+ * the Windows {@link ParentPid} (#701). The sweep's ancestry guard has to walk parents on this
+ * platform too, and `ps` is not a Windows binary.
+ */
+export const cimParent: ParentPid = async (pid) => {
+  const value = await cimProcess(pid, "ParentProcessId");
+  const ppid = Number(value);
+  return Number.isInteger(ppid) && ppid > 0 ? ppid : null;
+};
+
+/**
+ * `Get-CimInstance Win32_Process` → the command line, or `null` when it is gone — the Windows
+ * {@link ProcessCommand}. The pid goes in as a number literal, so no user text reaches the filter.
+ */
+export const cimCommand: ProcessCommand = async (pid) => (await cimProcess(pid, "CommandLine")) ?? null;
+
+/** One CIM property of one pid, asked with the pid as a numeric filter literal. Null when CIM finds nothing. */
+async function cimProcess(pid: number, property: "ParentProcessId" | "CommandLine"): Promise<string | null> {
+  try {
+    const { stdout } = await run("powershell.exe", [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      `(Get-CimInstance Win32_Process -Filter "ProcessId=${Math.trunc(pid)}").${property}`,
+    ]);
+    const value = stdout.trim();
+    return value === "" ? null : value;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The port holder for the platform: `lsof` where it exists, `netstat -ano` on Windows (#701 item 3).
+ * Windows has no `lsof`, and {@link lsofPort} reads a missing binary as an empty answer — so there the
+ * sweep finds nothing, reaps nothing, and a pinned port that outlived a crashed session blocks every
+ * startup with a message that says "stop whatever is holding it" while the holder stays invisible.
+ */
+export function defaultPortHolders(platform: NodeJS.Platform = process.platform): LsofPort {
+  return platform === "win32" ? netstatPort : lsofPort;
+}
+
+/** The command-line lookup for the platform — CIM is the Windows `ps`. */
+export function defaultCommandOf(platform: NodeJS.Platform = process.platform): ProcessCommand {
+  return platform === "win32" ? cimCommand : psCommand;
+}
+
+/** The parent lookup for the platform — CIM is the Windows `ps -o ppid=`. */
+export function defaultParentOf(platform: NodeJS.Platform = process.platform): ParentPid {
+  return platform === "win32" ? cimParent : psParent;
+}
+
 /** The binaries the sweep owns: the Workers runtime and its supervisor. */
 const WORKER_BINARY = /^(workerd|wrangler)(\.[cm]?js)?$/;
 /** Launchers that run a script — the script name, not the launcher, says what the process is. */
 const SCRIPT_RUNNER = /^(node|bun|deno|npx|bunx)$/;
 
-/** The last path segment of `token`, stripped of a Windows `.exe` suffix. */
+/** The last path segment of `token`, stripped of a Windows `.exe` suffix and of the quotes CIM wraps
+ * around a program path (every path with a space, which on Windows includes Program Files). Both
+ * separators count: the command line arrives from `ps` on POSIX and from CIM on Windows. */
 function commandBase(token: string): string {
-  return (token.split("/").pop() ?? "").replace(/\.exe$/, "");
+  const bare = token.replace(/^"|"$/g, "");
+  return (bare.split(/[/\\]/).pop() ?? "").replace(/\.exe$/, "");
 }
 
 /**
@@ -140,11 +232,20 @@ function commandBase(token: string): string {
  */
 export function isReapableDevCommand(command: string | null): boolean {
   if (!command) return false;
-  const tokens = command.trim().split(/\s+/);
+  const tokens = splitCommandLine(command);
   const exe = commandBase(tokens[0] ?? "");
   if (WORKER_BINARY.test(exe)) return true;
   if (!SCRIPT_RUNNER.test(exe)) return false;
   return tokens.slice(1).some((token) => WORKER_BINARY.test(commandBase(token)));
+}
+
+/**
+ * Split a command line into words, quotes honored. CIM hands back `"C:\Program Files\nodejs\node.exe"
+ * C:\proj\…` — the program path is quoted *because* it carries spaces, so a whitespace split would
+ * shatter it and the scope filter would read the word `"C:\Program` as the executable.
+ */
+function splitCommandLine(command: string): string[] {
+  return command.match(/"[^"]*"|\S+/g) ?? [];
 }
 
 /** This process and every ancestor of it — never signaled, whatever is holding a port. */
@@ -187,11 +288,11 @@ export interface SweepDeps {
  * Returns the pids reaped, so a re-run can report what it cleaned up.
  */
 export async function sweepStaleDevPorts(ports: number[], deps: SweepDeps = {}): Promise<number[]> {
-  const lsof = deps.lsof ?? lsofPort;
+  const lsof = deps.lsof ?? defaultPortHolders();
   const alive = deps.isAlive ?? isAlive;
   const kill = deps.kill ?? defaultKillFor();
-  const commandOf = deps.commandOf ?? psCommand;
-  const parentOf = deps.parentOf ?? psParent;
+  const commandOf = deps.commandOf ?? defaultCommandOf();
+  const parentOf = deps.parentOf ?? defaultParentOf();
   const selfPid = deps.selfPid ?? process.pid;
   const known = new Set(deps.knownPids ?? []);
   const reaped: number[] = [];
