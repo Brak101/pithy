@@ -16,7 +16,7 @@ import {
   NO_PROVISION_ARG,
   wranglerEnvironment,
 } from "./effectiveConfig";
-import { detectPackageManager, execArgs, type PackageManager } from "./packageManager";
+import { detectPackageManager, execArgs, type PackageManager, shimCommand } from "./packageManager";
 import type { DeployVerification, VerifyDeployResult } from "./verifyDeploy";
 import { isDeployFailure, verifyDeployedVersion } from "./verifyDeploy";
 import { readAddressStanza, resolveWorkerAddress } from "./workerAddress";
@@ -337,7 +337,7 @@ const runProcess = promisify(execFile);
  */
 const defaultRunBuild: RunBuild = async (target, command, args, buildEnv) => {
   try {
-    await runProcess(command, args, {
+    await runProcess(shimCommand(command), args, {
       cwd: target.dir,
       maxBuffer: 16 * 1024 * 1024,
       // Overlaid on the real environment rather than replacing it: a build needs PATH, and CI needs

@@ -10,7 +10,7 @@ import { cloudflareChildEnv, credentialedChildEnv } from "../cloudflare/childEnv
 import type { CloudflareAccountSelection, CloudflareCredentials } from "../cloudflare/config";
 import { assertCreatesNoResources } from "./effectiveConfig";
 import { writeJsonc } from "./jsonc";
-import { detectPackageManager, execArgs } from "./packageManager";
+import { detectPackageManager, execArgs, shimCommand } from "./packageManager";
 import { readOptionalFile } from "./readOptionalFile";
 
 /** The slice of `wrangler.jsonc` the per-environment var helpers read and write. */
@@ -226,7 +226,7 @@ export async function runWrangler(
   // rejects the call rather than the child, so nothing is running when the refusal is raised.
   const childEnv = { ...wranglerChildEnv(options.account), ...(options.env ?? {}) };
   return new Promise((resolve, reject) => {
-    const child = spawn(command, commandArgs, {
+    const child = spawn(shimCommand(command), commandArgs, {
       cwd: options.cwd,
       stdio: options.passthrough ? "inherit" : ["ignore", "pipe", "pipe"],
       env: childEnv,
