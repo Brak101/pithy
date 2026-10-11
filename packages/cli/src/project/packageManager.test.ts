@@ -16,7 +16,6 @@ import {
   installPackage,
   promoteDependencies,
   runPackageManager,
-  shimCommand,
   uninstallArgs,
   uninstallPackage,
 } from "./packageManager";
@@ -184,48 +183,6 @@ describe("execArgs", () => {
     expect(execArgs("pnpm", "wrangler", ["dev"])).toEqual({ command: "pnpm", args: ["exec", "wrangler", "dev"] });
     expect(execArgs("yarn", "wrangler", ["dev"])).toEqual({ command: "yarn", args: ["wrangler", "dev"] });
     expect(execArgs("npm", "wrangler", ["dev"])).toEqual({ command: "npx", args: ["wrangler", "dev"] });
-  });
-});
-
-describe("shimCommand", () => {
-  /**
-   * #698. On Windows the package managers are `.cmd` shims and `child_process` resolves only `.exe`,
-   * so every install spawn dies with `ENOENT` before a manager runs. `.cmd` is appended there and
-   * nowhere else, and an absolute path — a `process.execPath` a test spawns — is never a shim.
-   */
-  function withPlatform(platform: NodeJS.Platform, body: () => void): void {
-    const descriptor = Object.getOwnPropertyDescriptor(process, "platform") as PropertyDescriptor;
-    Object.defineProperty(process, "platform", { value: platform });
-    try {
-      body();
-    } finally {
-      Object.defineProperty(process, "platform", descriptor);
-    }
-  }
-
-  test("appends .cmd to a bare package-manager name on win32", () => {
-    withPlatform("win32", () => {
-      expect(shimCommand("npm")).toBe("npm.cmd");
-      expect(shimCommand("npx")).toBe("npx.cmd");
-      expect(shimCommand("bun")).toBe("bun.cmd");
-      expect(shimCommand("pnpm")).toBe("pnpm.cmd");
-      expect(shimCommand("yarn")).toBe("yarn.cmd");
-    });
-  });
-
-  test("is identity off win32", () => {
-    withPlatform("linux", () => {
-      expect(shimCommand("npm")).toBe("npm");
-      expect(shimCommand("bun")).toBe("bun");
-    });
-  });
-
-  test("never touches a path that cannot be a shim", () => {
-    withPlatform("win32", () => {
-      expect(shimCommand(process.execPath)).toBe(process.execPath);
-      expect(shimCommand("C:\\Program Files\\nodejs\\node.exe")).toBe("C:\\Program Files\\nodejs\\node.exe");
-      expect(shimCommand("wrangler")).toBe("wrangler");
-    });
   });
 });
 

@@ -49,7 +49,8 @@ import { isTestFile, readSource, sourcePaths } from "./sourceFiles";
  * literal `"git"`, `"lsof"` or `"ps"` is a bounded local query — git's metadata, the process table — judged at
  * the call site, so the same `execFile` with `"npm"` beside it is held. And a `spawn` in one of three named
  * modules that hand the child's streams on rather than collecting them — the editor that owns the terminal,
- * the browser opener that detaches, `pithy dev`'s servers whose output *is* the narration — is not captured.
+ * the browser opener that detaches, and the shared command spawner (`platform/command.ts`, whose callers
+ * raise the step) — is not captured.
  * Only `spawn` there: an `execFile` in any of them is held like anywhere else.
  *
  * **Where silence is reported.** A declaration that reaches a child without a step passes that on to whatever
@@ -123,7 +124,7 @@ const WRAP = /\bwithErrorReporting\s*\(/;
 const POLICY: ChildProcessPolicy = {
   boundedExecutables: new Set(["git", "lsof", "ps"]),
   uncapturedModules: new Set(
-    ["platform/browser.ts", "platform/editor.ts", "dev/orchestrator.ts"].map((path) => resolve(CLI_SRC, path)),
+    ["platform/browser.ts", "platform/command.ts", "platform/editor.ts"].map((path) => resolve(CLI_SRC, path)),
   ),
   progressModule: resolve(CLI_SRC, "terminal", "progress.ts"),
 };
@@ -183,6 +184,7 @@ describe("a long command narrates itself", () => {
       "packages/cli/src/feature/ports.ts",
       "packages/cli/src/feature/worktree.ts",
       "packages/cli/src/platform/browser.ts",
+      "packages/cli/src/platform/command.ts",
       "packages/cli/src/platform/editor.ts",
       "packages/cli/src/project/deploy.ts",
       "packages/cli/src/project/packageManager.ts",

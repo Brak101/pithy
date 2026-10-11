@@ -1,33 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
-import { execFile } from "node:child_process";
 import { access, readFile, realpath } from "node:fs/promises";
 import { join, relative } from "node:path";
-import { promisify } from "node:util";
 import { InternalError } from "@pithy-sh/core/src/error/pithyError";
+import { execCommand } from "../platform/command";
 import { startStep } from "../terminal/progress";
 import { writeFileAtomic } from "./atomic";
 import { readOptionalFile } from "./readOptionalFile";
-
-const run = promisify(execFile);
-
-/**
- * The command line for a spawn, resolved for the platform.
- *
- * **On Windows, `npm`, `bun`, `pnpm`, `yarn`, and `npx` are `.cmd` shims, and `child_process` resolves
- * only `.exe` without one.** A bare `npm` spawn dies with `ENOENT` before the shims run, which makes every
- * install `pithy` performs — `add`, `worker add`, `feature create` — fail on that platform (#698). Appending
- * `.cmd` lets the shim resolve on its own, so no shell is needed and every argument reaches the child
- * exactly as the caller wrote it. `process.execPath` is a real `.exe`, every path in it is absolute, and it
- * names no package manager — so it passes through untouched, and every spawn a test drives through Node is
- * unaffected.
- *
- * Off Windows the name is already the whole story and the function is identity.
- */
-export function shimCommand(command: string): string {
-  return process.platform === "win32" && /^(npm|npx|bun|bunx|pnpm|yarn)$/.test(command) ? `${command}.cmd` : command;
-}
 
 /** The package managers a Pithy adopter might use. Adoption is never gated behind Bun. */
 export type PackageManager = "npm" | "pnpm" | "yarn" | "bun";
@@ -175,7 +155,7 @@ export type InstallRunner = (command: string, args: string[], cwd: string) => Pr
  */
 export const runPackageManager: InstallRunner = async (command, args, cwd) => {
   startStep(`Running ${[command, ...args].join(" ")}`);
-  await run(shimCommand(command), args, { cwd });
+  await execCommand(command, args, { cwd });
 };
 
 const spawnInstall: InstallRunner = async (command, args, cwd) => {

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
-import { spawn as spawnChild } from "node:child_process";
 import { isContinuousIntegration } from "@pithy-sh/core/src/env/ci";
 import { messageOf, ValidationError } from "@pithy-sh/core/src/error/pithyError";
 import { LOCAL_ENVIRONMENT } from "@pithy-sh/core/src/naming/environment";
@@ -35,9 +34,10 @@ import {
 import { heldReservations } from "../feature/prune";
 import { currentBranch, defaultGit } from "../feature/worktree";
 import { openUrl as openUrlDefault } from "../platform/browser";
+import { spawnCommand } from "../platform/command";
 import { composeFor } from "../project/composeFor";
 import { allCapabilities } from "../project/config";
-import { detectPackageManager, execArgs, shimCommand } from "../project/packageManager";
+import { detectPackageManager, execArgs } from "../project/packageManager";
 import { defaultWorkerDev } from "../project/workerManifest";
 import { discoverWorkers as discoverWorkersDefault, type WorkerTarget } from "../project/workers";
 import { type KeyReader, readKeys as readKeysDefault } from "../terminal/keys";
@@ -360,7 +360,7 @@ const realSleep: Sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms
 
 /** The real spawn: a group-leader child (POSIX `setsid` via `detached`) with piped stdout/stderr. */
 const spawnDefault: SpawnDev = (command, args, options) =>
-  spawnChild(command, args, {
+  spawnCommand(command, args, {
     cwd: options.cwd,
     env: options.env,
     detached: options.detached,
@@ -1623,7 +1623,7 @@ export async function startDev(options: StartDevOptions): Promise<DevHandle> {
     // environment reaches a custom `dev.command`, where there is no argv to append to and
     // `@pithy-sh/vite` turns it into the same binding.
     const env = childEnvFor(childEnv, ownOrigin);
-    const child = spawn(shimCommand(command), args, { cwd: worker.dir, env, detached: hasSetsid });
+    const child = spawn(command, args, { cwd: worker.dir, env, detached: hasSetsid });
     // Replaced in place on a restart, so `shutdown` signals the child that is actually running and the
     // state file names its pid.
     const seat = children.findIndex((entry) => entry.name === worker.name);

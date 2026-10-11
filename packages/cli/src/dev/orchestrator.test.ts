@@ -13,7 +13,6 @@ import { GENERATED_MARKER, generateDevVars } from "../devSecrets/generate";
 import { buildDevConfig, type DevConfig, devConfigPath, readDevConfig, writeDevConfig } from "../feature/devConfig";
 import { BASE_PORT, BLOCK_SIZE, type PortsRegistry } from "../feature/ports";
 import { pruneFeatureBlocks } from "../feature/prune";
-import { shimCommand } from "../project/packageManager";
 import type { WorkerTarget } from "../project/workers";
 import { parseDevLogFileName } from "./devLogPath";
 import type { DevLogRecord } from "./devLogRecord";
@@ -520,9 +519,10 @@ describe("startDev — spawn commands and env", () => {
     const api = h.spawned.find((s) => s.opts.cwd === "/proj/apps/api");
     const web = h.spawned.find((s) => s.opts.cwd === "/proj/apps/web");
     expect(api).toMatchObject({
-      // The spawn carries the platform's spelling of the manager (#698): `bun` everywhere, `bun.cmd`
-      // on Windows, where the bare name is a `.cmd` shim `child_process` cannot launch.
-      command: shimCommand("bun"),
+      // The seam sees the command as `startWorker` names it — `bun` everywhere. The platform spelling
+      // is the spawn default's resolution (#698), applied below the seam and tested in
+      // `platform/command.test.ts`, where the Windows literal lives.
+      command: "bun",
       args: [
         "x",
         "wrangler",
