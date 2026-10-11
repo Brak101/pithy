@@ -35,6 +35,7 @@ import {
 import { heldReservations } from "../feature/prune";
 import { currentBranch, defaultGit } from "../feature/worktree";
 import { openUrl as openUrlDefault } from "../platform/browser";
+import { defaultKillFor } from "../platform/killTree";
 import { composeFor } from "../project/composeFor";
 import { allCapabilities } from "../project/config";
 import { detectPackageManager, execArgs } from "../project/packageManager";
@@ -584,7 +585,7 @@ export async function startDev(options: StartDevOptions): Promise<DevHandle> {
   const loadDevConfig = options.loadDevConfig ?? ((dir: string) => readDevConfig(devConfigPath(dir)));
   const bind = options.tryBind ?? tryBindDefault;
   const spawn = options.spawn ?? spawnDefault;
-  const kill = options.kill ?? ((pid, signal) => process.kill(pid, signal));
+  const kill = options.kill ?? defaultKillFor();
   const isAlive = options.isAlive ?? isAliveDefault;
   const sleep = options.sleep ?? realSleep;
   const hasSetsid = options.hasSetsid ?? process.platform !== "win32";

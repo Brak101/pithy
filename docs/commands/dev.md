@@ -198,7 +198,7 @@ A terminal whose **stdin** is redirected (`pithy dev < /dev/null`) still gets th
 
 - Writes a git-ignored `.dev-state.json` (pid, resolved ports, child pids).
 - A re-run stops the previous session first, then **reaps orphaned `workerd`/`wrangler`** processes still holding the default ports (an `lsof` sweep) so a crashed session can't block startup.
-- Children are spawned via `setsid` so one `kill(-pgid)` tears down the whole `wrangler → workerd` subtree. Teardown is graceful `SIGTERM`, then `SIGKILL` after a short grace window.
+- Children are spawned via `setsid` so one `kill(-pgid)` tears down the whole `wrangler → workerd` subtree; on Windows, where there is no `setsid`, the teardown walks the child tree with `taskkill /T` — the pid as an argument, no shell — for the same reason (`workerd` verified on a Windows host, 2026-10-11, #701). Teardown is graceful `SIGTERM`, then `SIGKILL` after a short grace window.
 
 ### The session log
 
