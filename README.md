@@ -68,7 +68,7 @@ Every command takes full flags, never requires a prompt, and answers with `--jso
 
 ## One project, or two?
 
-Do these apps share users or data? Then it is one project with more Workers, not two projects. Two projects never share, because each carries its own migration registry. Every resource Pithy provisions is named `<project>-<env>-<thing>`, so separate projects can still live in one Cloudflare account. The [full answer](https://pithy.sh/docs/core-concepts/one-project-or-two/) is worth reading before `pithy init`, because the project name is permanent once anything is provisioned.
+Do these apps share users or data? Then it is one project with more Workers, not two projects. Two projects never share, because each carries its own migration registry. Every resource Pithy provisions is named `<project>-<env>-<thing>`, so separate projects can still live in one Cloudflare account. The project name comes from `name` in the root `pithy.config.ts`. It stops at 26 characters, and it is permanent once anything is provisioned, so the [full answer](https://pithy.sh/docs/core-concepts/one-project-or-two/) is worth reading before `pithy init`. Every limit is in [`docs/NAMING.md`](docs/NAMING.md).
 
 ## In this repository
 
