@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, win32 } from "node:path";
@@ -27,13 +27,18 @@ requireWindows();
 
 const sleep = (ms: number) => new Promise<void>((resolve) => void setTimeout(resolve, ms));
 
+/**
+ * Is the pid in the live process table? `process.kill(pid, 0)` is not this on Windows: a terminated
+ * child whose process handle is still open answers the probe as alive, so the launcher of a kill we
+ * issued ourselves can poll true forever. `tasklist /FI "PID eq N"` reads the table, passively —
+ * measured on this host: the CSV row when present, `INFO: No tasks are running` when not. (Not
+ * `taskkill /FI` without `/F`, which is not a query — it *attempts the kill*, the same measured
+ * ask-the-console-process refuses with "can only be terminated forcefully".)
+ */
 function isAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+  const tasklist = win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tasklist.exe");
+  const query = spawnSync(tasklist, ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], { encoding: "utf8" });
+  return (query.stdout ?? "").includes(`,"${pid}",`); // the CSV row: name,"pid",session,studio,mem
 }
 
 async function gone(pid: number, withinMs = 10_000): Promise<boolean> {
