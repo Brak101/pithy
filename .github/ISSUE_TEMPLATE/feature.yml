@@ -1,0 +1,27 @@
+# Applies needs-triage: it marks an issue from outside the team as not yet evaluated (#707).
+# Keep `labels:` on one line. packages/cli/src/ci/contributorIntake.test.ts reads it as text.
+name: Feature request
+description: Something Pithy should do and does not.
+labels: [enhancement, needs-triage]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and where Pithy gets in the way. Leave the solution for the next box.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you propose
+      description: Optional. A rough shape is enough.
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do today instead
+      description: Optional. The workaround, if there is one.
+    validations:
+      required: false
