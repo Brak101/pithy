@@ -86,27 +86,26 @@ export function resolveCommand(command: string, args: string[], options: Command
   // through cmd.exe however it was named, and cmd.exe does the lookup. It cannot reach `spawn` bare —
   // that is the EINVAL throw, which escapes a per-worker start and ends a `pithy dev` session over one
   // worker's `dev.command`.
-  if (SHELL_RUNNABLE.has(extensionOf(command))) return cmdShell([command, ...args], env);
+  if (SHELL_RUNNABLE.has(extensionOf(command))) return cmdShell(command, args, env);
   // Any other name with a path in it is already a location, and the spawn resolves it.
   if (command.includes("/") || command.includes("\\")) return { command, args, shell: false, verbatim: false };
   const file = findOnPath(command, env, options.fileExists ?? existsSync);
   if (file === null) return { command, args, shell: false, verbatim: false };
   if (!SHELL_RUNNABLE.has(extensionOf(file))) return { command: file, args, shell: false, verbatim: false };
-  return cmdShell([file, ...args], env);
+  return cmdShell(file, args, env);
 }
 
 /**
  * The command line as `cmd.exe` runs it, cross-spawn's shape: `/d` skips the registry's AutoRun,
  * `/s` lets the one outer quote pair be stripped so the line inside is cmd's to re-split, and
- * `windowsVerbatimArguments` (set by the caller, carried on {@link ResolvedCommand.verbatim}) keeps
- * Node from re-quoting an argv it did not build. The command word is caret-escaped and unquoted;
- * every argument is quoted and escaped by {@link escapeWord}/{@link quoteForCmd}.
+ * `windowsVerbatimArguments` (carried on {@link ResolvedCommand.verbatim}) keeps Node from re-quoting
+ * an argv it did not build. The command word is caret-escaped and unquoted; every argument is quoted
+ * and escaped by {@link escapeWord}/{@link quoteForCmd}.
  */
-export function cmdShell(words: string[], env: NodeJS.ProcessEnv = process.env): ResolvedCommand {
-  const [command, ...args] = words;
+export function cmdShell(command: string, args: string[], env: NodeJS.ProcessEnv = process.env): ResolvedCommand {
   const line = [escapeWord(command), ...args.map(quoteForCmd)].join(" ");
   return {
-    command: environmentValue(env, "COMSPEC") ?? "cmd.exe",
+    command: comSpec(env),
     args: ["/d", "/s", "/c", `"${line}"`],
     shell: false,
     verbatim: true,
@@ -203,6 +202,15 @@ function extensionOf(file: string): string {
   const base = file.split(/[/\\]/).pop() ?? file;
   const dot = base.lastIndexOf(".");
   return dot === -1 ? "" : base.slice(dot).toLowerCase();
+}
+
+/**
+ * The shell to run batch files under: `COMSPEC` when the environment names one (Windows spells it
+ * `ComSpec`, and every call site's env is a case-mangled copy), and `cmd.exe` otherwise — a name
+ * every Windows PATH carries. An empty `COMSPEC` is no shell: it falls back like a missing one.
+ */
+function comSpec(env: NodeJS.ProcessEnv): string {
+  return environmentValue(env, "COMSPEC") || "cmd.exe";
 }
 
 /** The characters `cmd.exe` reads as syntax: http://www.robvanderwoude.com/escapechars.php. */

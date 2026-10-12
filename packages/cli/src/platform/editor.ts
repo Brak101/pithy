@@ -173,6 +173,8 @@ export interface RunEditorOptions {
   platform?: NodeJS.Platform;
   /** How to spawn, defaulting to `node:child_process`'s `spawn`. */
   spawn?: SpawnEditor;
+  /** Environment for the command resolution, defaulting to `process.env` (see `command.ts`). */
+  env?: NodeJS.ProcessEnv;
   /** Existence probe for the command resolution, defaulting to the real filesystem (see `command.ts`). */
   fileExists?: (path: string) => boolean;
 }
@@ -205,6 +207,7 @@ export async function runEditor(editor: ResolvedEditor, file: string, options: R
   // resolution is identity and the editor's own args stream straight through.
   const target = resolveCommand(editor.command, [...editor.args, file], {
     platform,
+    env: options.env,
     fileExists: options.fileExists,
   });
 

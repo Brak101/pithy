@@ -250,6 +250,7 @@ describe("runEditor", () => {
     const calls: { command: string; args: readonly string[]; verbatim: boolean }[] = [];
     await runEditor({ command: "code", args: ["--wait"], source: "EDITOR" }, "C:\\Users\\Jim Scott\\s.jsonc", {
       platform: "win32",
+      env: { PATH: "C:\\Program Files\\nodejs", PATHEXT: ".COM;.EXE;.BAT;.CMD" },
       fileExists: (path) => path === "C:\\Program Files\\nodejs\\code.cmd",
       spawn: (command, args, options) => {
         calls.push({ command, args, verbatim: options.windowsVerbatimArguments });
