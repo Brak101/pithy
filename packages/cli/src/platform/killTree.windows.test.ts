@@ -85,6 +85,8 @@ describe("the tree kill on a Windows host", () => {
         windowsVerbatimArguments: true,
         stdio: "ignore",
       });
+      const launcherPid = launcher.pid;
+      if (launcherPid === undefined) throw new Error("the launcher never started");
       try {
         const child = await (async () => {
           const deadline = Date.now() + 20_000;
@@ -99,15 +101,15 @@ describe("the tree kill on a Windows host", () => {
         })();
         expect(isAlive(child.pid)).toBe(true); // the chain is up: a child the session does not hold a handle to, by pid
 
-        defaultKillFor(process.platform)(launcher.pid, "SIGKILL");
+        defaultKillFor(process.platform)(launcherPid, "SIGKILL");
 
         expect(await gone(child.pid), "the port-holding child survives the tree kill").toBe(true);
-        expect(await gone(launcher.pid), "the launcher survives the tree kill").toBe(true);
+        expect(await gone(launcherPid), "the launcher survives the tree kill").toBe(true);
         expect(await portFree(child.port), "the port the child held is free").toBe(true);
       } finally {
         // The tree kill already fired on the pass path; this is the guard for the failure paths, so a
         // red run leaves no server behind on a CI box.
-        defaultKillFor(process.platform)(launcher.pid, "SIGKILL");
+        defaultKillFor(process.platform)(launcherPid, "SIGKILL");
       }
     } finally {
       await rm(dir, { recursive: true, force: true, maxRetries: 5 });
