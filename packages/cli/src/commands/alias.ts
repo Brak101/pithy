@@ -4,7 +4,7 @@
 import { ValidationError } from "@pithy-sh/core/src/error/pithyError";
 import { defineCommand } from "citty";
 import { appendToRcFile, readRcFile, removeFromRcFile } from "../platform/rc";
-import { detectShell } from "../platform/shell";
+import { aliasRcPaths, detectShell } from "../platform/shell";
 import { formatJsonLine, withErrorReporting } from "../terminal/output";
 
 /** Marker comments that delimit the block `--remove` finds and deletes. Universal `#` comment syntax. */
@@ -69,6 +69,11 @@ function alreadyInstalled(contents: string): boolean {
  * Install the `p.` alias into the detected shell's rc file. Idempotent: a second run detects the existing
  * block (or a hand-added `alias p.=`) and writes nothing. Silent mode suppresses only the "Already pithy."
  * line — a fresh install still prints its confirmation.
+ *
+ * **The rc "file" is a set** ({@link aliasRcPaths}): every shell has one path, PowerShell has the
+ * profiles of both families on the machine, because Windows has two PowerShells and no single profile
+ * file loads in both (#701 item 6). A block in any member of the set counts as installed; installing
+ * tops up the members that lack it.
  */
 export async function installAlias(opts: AliasOptions = {}): Promise<void> {
   const shell = await detectShell();
@@ -77,14 +82,25 @@ export async function installAlias(opts: AliasOptions = {}): Promise<void> {
     return;
   }
 
-  const contents = await readRcFile(shell.rcPath);
-  if (alreadyInstalled(contents)) {
+  const paths = aliasRcPaths(shell);
+  const contents = await Promise.all(paths.map((path) => readRcFile(path)));
+  const installed = contents.some((text) => alreadyInstalled(text));
+  // **Install tops the set up, it does not all-or-nothing it.** An old install — one family's profile,
+  // the only file the CLI before #701 wrote — is repaired by re-running `pithy alias`: every member
+  // without the block gets it, and the run is still reported as `Already pithy.` because it is.
+  const block = [MARKER_OPEN, shell.aliasSyntax, MARKER_CLOSE].join("\n");
+  for (const [index, path] of paths.entries()) {
+    const text = contents[index] ?? "";
+    if (!alreadyInstalled(text)) await appendToRcFile(path, `\n${block}\n`);
+  }
+  if (installed) {
     if (opts.json) {
       emitJson("install", {
         installed: true,
         alreadyInstalled: true,
         shell: shell.kind,
         rcPath: shell.rcPath,
+        ...(paths.length > 1 ? { rcPaths: paths } : {}),
         alias: shell.aliasSyntax,
       });
       return;
@@ -93,20 +109,18 @@ export async function installAlias(opts: AliasOptions = {}): Promise<void> {
     return;
   }
 
-  const block = [MARKER_OPEN, shell.aliasSyntax, MARKER_CLOSE].join("\n");
-  await appendToRcFile(shell.rcPath, `\n${block}\n`);
-
   if (opts.json) {
     emitJson("install", {
       installed: true,
       alreadyInstalled: false,
       shell: shell.kind,
       rcPath: shell.rcPath,
+      ...(paths.length > 1 ? { rcPaths: paths } : {}),
       alias: shell.aliasSyntax,
     });
     return;
   }
-  emit(`Added \`${shell.aliasSyntax}\` to ${shell.rcPath}`);
+  emit(`Added \`${shell.aliasSyntax}\` to ${paths.join(" and ")}`);
   emit(`Open a new terminal, or run: source ${shell.rcPath}`);
 }
 
@@ -118,16 +132,24 @@ export async function removeAlias(opts: AliasOptions = {}): Promise<void> {
     return;
   }
 
-  const removed = await removeFromRcFile(shell.rcPath, MARKER_OPEN, MARKER_CLOSE);
+  const paths = aliasRcPaths(shell);
+  let removed = false;
+  for (const path of paths) {
+    removed = (await removeFromRcFile(path, MARKER_OPEN, MARKER_CLOSE)) || removed;
+  }
   if (opts.json) {
-    emitJson("remove", { removed, rcPath: shell.rcPath });
+    emitJson("remove", {
+      removed,
+      rcPath: shell.rcPath,
+      ...(paths.length > 1 ? { rcPaths: paths } : {}),
+    });
     return;
   }
   if (!removed) {
     emit("No Pithy alias installed.");
     return;
   }
-  emit(`Removed \`${shell.aliasSyntax}\` from ${shell.rcPath}`);
+  emit(`Removed \`${shell.aliasSyntax}\` from ${paths.join(" and ")}`);
   emit(`Open a new terminal, or run: source ${shell.rcPath}`);
 }
 
@@ -143,13 +165,19 @@ export async function aliasStatus(opts: AliasOptions = {}): Promise<void> {
     return;
   }
 
-  const contents = await readRcFile(shell.rcPath);
-  const installed = contents.includes(MARKER_OPEN);
+  const paths = aliasRcPaths(shell);
+  const contents = await Promise.all(paths.map((path) => readRcFile(path)));
+  const installed = contents.some((text) => text.includes(MARKER_OPEN));
   if (opts.json) {
-    emitJson("status", { installed, shell: shell.kind, rcPath: shell.rcPath });
+    emitJson("status", {
+      installed,
+      shell: shell.kind,
+      rcPath: shell.rcPath,
+      ...(paths.length > 1 ? { rcPaths: paths } : {}),
+    });
     return;
   }
-  if (installed) emit(`Installed in ${shell.rcPath}`);
+  if (installed) emit(`Installed in ${paths.join(" and ")}`);
   else emit("Not installed. Run `pithy alias` to install.");
 }
 
