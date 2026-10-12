@@ -996,24 +996,15 @@ What bounds it. It is **not in any deployed Worker** — a deployed Worker runs 
 
 Accepted, not ignored. It closes when miniflare 5 stabilizes and **both** declarations are promoted — `@pithy-sh/cli`'s runtime dependency and `@pithy-sh/auth`'s devDependency. Moving cli's alone leaves auth resolving 4.x and `bun audit` reporting the same five advisories under the same path it prints today. That is the same revisit as above.
 
-### `@cloudflare/workers-types` is held at `5.20260729.1`
+### `@cloudflare/workers-types` is no longer held, and what the fix left behind
 
-Held by an `overrides` entry in the root `package.json`, while the declared ranges stay `^5.20260729.1` so **adopters are not constrained by our tooling problem** — they are not affected by this.
+**`5.20260807.2` added `declare const Buffer: any;`**, and every release through `5.20261008.1` carried it. `@types/node` declares `var Buffer: BufferConstructor`, and a block-scoped `const` does not merge with a `var`: the redeclaration discarded `@types/node`'s `declare global { … }` block in `buffer.buffer.d.ts`, so `randomBytes(8).toString("hex")` became *"Expected 0 arguments, but got 1"*. It broke any project listing both `@cloudflare/workers-types` and `node` in `types`, which `packages/cli` must, because it is a Node program that type-checks against capability packages using `D1Database` and `KVNamespace` globals. A root `overrides` entry held the workspace at `5.20260804.1`, the last clean release, while the declared ranges stayed `^5.20260729.1` for adopters (#402).
 
-**`5.20260807.2` added `declare const Buffer: any;`** — not `5.20260816.1`, which is where #402 first noticed it. **`5.20260804.1` is the last clean release**, and every release since carries the line. `@types/node` declares `var Buffer: BufferConstructor`, and a `var` merges where a block-scoped `const` does not. With `skipLibCheck` off, TypeScript says it plainly:
+**Upstream fixed it in `5.20261009.1`** (`cloudflare/workerd#7149`): both `Buffer` and `process` are now `declare var … : any`. The override is gone, and `bun.lock` resolves the latest release. Measured both ways at the removal: `5.20260816.1` puts `TS2554` into `packages/cli`'s own `dev/logging.ts`, `dev/devLogRead.ts` and `capabilities/secretPrompt.pty.test.ts`; `5.20261012.1` type-checks clean. `workersTypes.test.ts` now reads the resolved copy out of `bun.lock`, one copy inside the published range, rather than reading an override.
 
-```
-@cloudflare/workers-types/index.d.ts(486,15): error TS2451: Cannot redeclare block-scoped variable 'Buffer'.
-@types/node/buffer.buffer.d.ts(356,19):       error TS2451: Cannot redeclare block-scoped variable 'Buffer'.
-```
+**What remains is one `any`, accepted.** Two `var` declarations of different types merge to the first one TypeScript reads, and it reads `workers-types` first whatever order `types` lists them in — verified both ways. So in a program with both, `Buffer` *as a value* is `any`: `Buffer.from`, `Buffer.alloc` and `Buffer.concat` return `any`, and a misspelled static method compiles. Instances are unaffected, because the `Buffer` *interface* merges, which is why `.toString("hex")` type-checks again. `process` keeps `@types/node`'s `Process`. Six call sites take a static `Buffer` method — four in `packages/cli` (`dev/devLogRead.ts`, `capabilities/secretValue.ts`, `kitPackages/tarball.ts`) and two in `packages/auth/src/test-utils/liveApp.ts` — and each hands the result straight to something typed. A seventh is where to annotate rather than trust.
 
-The redeclaration discards `@types/node`'s `declare global { … }` block in `buffer.buffer.d.ts`, so the `Buffer` interface loses its own members and falls back to `Uint8Array`'s: `randomBytes(8).toString` resolves to `() => string`, and `randomBytes(8).toString("hex")` becomes *"Expected 0 arguments, but got 1"*. `skipLibCheck: true` hides the `TS2451` and leaves only the confusing downstream error, which is why this reads as a mystery rather than a redeclaration.
-
-It breaks any project listing both `@cloudflare/workers-types` and `node` in `types` — which `packages/cli` must do, because it is a Node program that type-checks against capability packages using `D1Database` and `KVNamespace` globals. **Reordering `types` does not help**, verified both ways. Lifting the override puts three real errors into `packages/cli` (`dev/logging.ts`, `devSecrets/edit.ts`, `project/atomic.ts`), so the pin is load-bearing, not defensive.
-
-The same release also added `declare const process: any;`, which collides with `@types/node`'s `var process` in exactly the same way. It causes no error only because `any` absorbs every member access — it silently degrades `process` to `any` rather than breaking. Worth knowing when the override lifts.
-
-**Adopters are unaffected, and this was checked rather than assumed.** A project scaffolded by `pithy init` keeps the two `types` arrays disjoint — `apps/api/tsconfig.json` lists `["@cloudflare/workers-types"]`, `tsconfig.tools.json` lists `["node"]`, and no project lists both. A real scaffold type-checks clean against `5.20260816.1` under both `tsc` 5.9.3 and `tsgo` 7.0.2; add `"node"` to the Worker's `types` and it fails immediately with the same `TS2554`. So the split holds: **pinned for us, open for them.** Lift the override once upstream declares `Buffer` mergeably, or drops it.
+**Adopters were never affected.** A project scaffolded by `pithy init` keeps the two `types` arrays disjoint — `apps/api/tsconfig.json` lists `["@cloudflare/workers-types"]`, `tsconfig.tools.json` lists `["node"]` — so neither the break nor the `any` reaches them.
 
 ### `postal-mime` is at `^3.0.0`, and that is a security bump
 
