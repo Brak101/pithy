@@ -260,7 +260,7 @@ describe("runEditor", () => {
     expect(calls).toEqual([
       {
         command: "cmd.exe",
-        args: ["/d", "/s", "/c", '"C:\\Program^ Files\\nodejs\\code.cmd --wait ^"C:\\Users\\Jim Scott\\s.jsonc^""'],
+        args: ["/d", "/s", "/c", '"C:\\Program^ Files\\nodejs\\code.cmd ^"--wait^" ^"C:\\Users\\Jim Scott\\s.jsonc^""'],
         verbatim: true,
       },
     ]);
