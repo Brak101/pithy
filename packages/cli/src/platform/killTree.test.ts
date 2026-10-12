@@ -22,25 +22,29 @@ describe("defaultKillFor — win32", () => {
     };
   }
 
-  test("SIGTERM tree-kills by pid with taskkill /T, no /F, and the pid as its own argument", () => {
+  test("SIGTERM tree-kills by pid with taskkill /T /F, the pid as its own argument", () => {
     const { kill, calls } = recorder();
     kill(4242, "SIGTERM");
     // Literal, not computed: the shape is the fix. `/T` walks the child tree (the shim → node →
     // wrangler → workerd chain the reproduction verified), and no shell means the pid is an argv
-    // element, never text for cmd to re-split.
-    expect(calls).toEqual([["/PID", "4242", "/T"]]);
+    // element, never text for cmd to re-split. `/F` is measured necessity, not force for force's
+    // sake: on a Windows host, `taskkill /PID <launcher> /T` without it exits 128 — "This process
+    // can only be terminated forcefully (with /F option)" — the walk asks, a windowless console
+    // process refuses, and the ask's non-zero exit is swallowed below exactly as a gone pid's is.
+    // The polite step POSIX has has no Windows spelling; Node's own SIGTERM there is TerminateProcess.
+    expect(calls).toEqual([["/PID", "4242", "/T", "/F"]]);
   });
 
-  test("SIGKILL adds /F — the polite close first, the kill in the grace window's timeout", () => {
+  test("SIGKILL is the same shape — one kill, because Windows has one kill", () => {
     const { kill, calls } = recorder();
     kill(4242, "SIGKILL");
     expect(calls).toEqual([["/PID", "4242", "/T", "/F"]]);
   });
 
-  test("SIGINT is the polite close too — the previous-session stop asks, it does not shoot", () => {
+  test("SIGINT is the same shape too — the reap that only sends SIGTERM kills, where /T alone never would", () => {
     const { kill, calls } = recorder();
     kill(99, "SIGINT");
-    expect(calls).toEqual([["/PID", "99", "/T"]]);
+    expect(calls).toEqual([["/PID", "99", "/T", "/F"]]);
   });
 
   test("a kill that fails on the child's exit race is swallowed, the way ESRCH is on POSIX", async () => {

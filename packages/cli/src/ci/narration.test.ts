@@ -45,9 +45,9 @@ import { isTestFile, readSource, sourcePaths } from "./sourceFiles";
  *    reaches a narrating producer must route its body through it, which is also where the `--json` half is
  *    decided: `commandProgress({ json: true })` is no sink. `terminal/progress.test.ts` holds that at runtime.
  *
- * **Not every child needs a step, and there are two exceptions.** A child whose executable is written as the
- * literal `"git"`, `"lsof"`, `"ps"` or `"taskkill"` is a bounded local query — git's metadata, the process
- * table — judged at
+ * **Not every child needs a step, and there are two exceptions.** A child whose executable is written as
+ * the literal `"git"`, `"lsof"`, `"ps"` or `"taskkill"` is bounded local work — git's metadata, the process
+ * table, a short kill — judged at
  * the call site, so the same `execFile` with `"npm"` beside it is held. And a `spawn` in one of three named
  * modules that hand the child's streams on rather than collecting them — the editor that owns the terminal,
  * the browser opener that detaches, `pithy dev`'s servers whose output *is* the narration — is not captured.

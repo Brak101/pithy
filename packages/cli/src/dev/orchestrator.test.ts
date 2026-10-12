@@ -190,6 +190,7 @@ function harness(overrides: Partial<StartDevOptions> = {}) {
     sweep: async () => [],
     spawn,
     kill,
+    killStale: kill,
     isAlive: (pid) => livePids.has(pid),
     sleep: async () => {},
     schedule,

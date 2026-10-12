@@ -5,7 +5,6 @@ import { execFile } from "node:child_process";
 import net from "node:net";
 import { promisify } from "node:util";
 import { ConflictError } from "@pithy-sh/core/src/error/pithyError";
-import { defaultKillFor } from "../platform/killTree";
 
 const run = promisify(execFile);
 
@@ -189,7 +188,7 @@ export interface SweepDeps {
 export async function sweepStaleDevPorts(ports: number[], deps: SweepDeps = {}): Promise<number[]> {
   const lsof = deps.lsof ?? lsofPort;
   const alive = deps.isAlive ?? isAlive;
-  const kill = deps.kill ?? defaultKillFor();
+  const kill = deps.kill ?? ((pid, signal) => process.kill(pid, signal));
   const commandOf = deps.commandOf ?? psCommand;
   const parentOf = deps.parentOf ?? psParent;
   const selfPid = deps.selfPid ?? process.pid;
