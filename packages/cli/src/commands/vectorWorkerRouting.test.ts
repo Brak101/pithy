@@ -11,7 +11,9 @@ import { beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import { z } from "zod";
 import { scaffoldProject } from "../project/scaffold";
 import { readWranglerConfig, writeWranglerConfig } from "../project/wrangler";
+import { EXIT } from "../terminal/exitClass";
 import { linkKitPackages } from "../test-utils/linkKit";
+import { expectConforms } from "../test-utils/payloadContract";
 import vector from "./vector";
 
 /**
@@ -102,6 +104,10 @@ vi.mock("../capabilities/vectorProvisioner", async (importOriginal) => ({
       await this.#resolveEnv(env);
       recorded.envs.push(env);
     }
+    async deleteIndex() {}
+    async reprocess(_env: string, index: string) {
+      return { indexName: `acme-staging-vector-${index}`, pages: 1, scanned: 2, reembedded: 2, skipped: 0 };
+    }
   },
 }));
 
@@ -175,8 +181,13 @@ interface Run {
 
 /** Drive `pithy vector provision`'s real `run` to completion, from inside the fixture project. */
 async function runProvision(args: Record<string, unknown>): Promise<Run> {
-  const entry = (vector.subCommands as Record<string, CommandDef>).provision;
-  if (!entry) throw new Error("expected a provision subcommand on pithy vector");
+  return runSubcommand("provision", args);
+}
+
+/** Drive one of `pithy vector`'s real subcommands to completion, from inside the fixture project. */
+async function runSubcommand(name: string, args: Record<string, unknown>): Promise<Run> {
+  const entry = (vector.subCommands as Record<string, CommandDef>)[name];
+  if (!entry) throw new Error(`expected a ${name} subcommand on pithy vector`);
 
   const out: string[] = [];
   const err: string[] = [];
@@ -238,6 +249,21 @@ describe("pithy vector provision reads and writes the app worker's wrangler.json
     expect(existsSync(join(fixture.dir, "apps", WORKER, "wrangler.jsonc"))).toBe(true);
   });
 
+  /** All three, through their real commands, held to the schemas `pithy schema vector` publishes (#697). */
+  test("provision, reset and reprocess --json conform to their published payloads", async () => {
+    await expectConforms("vector provision", (await runSubcommand("provision", { env: "staging", json: true })).stdout);
+    const reset = await runSubcommand("reset", {
+      env: "staging",
+      "confirm-reset": "yes, i really want to reset staging",
+      json: true,
+    });
+    await expectConforms("vector reset", reset.stdout);
+    await expectConforms(
+      "vector reprocess",
+      (await runSubcommand("reprocess", { env: "staging", all: false, json: true })).stdout,
+    );
+  });
+
   test("a run provisions the environment and writes nothing to the project root", async () => {
     const run = await runProvision({ env: "staging", json: true });
 
@@ -288,9 +314,9 @@ describe("pithy vector provision reads and writes the app worker's wrangler.json
   test("an environment with no DB id is refused, by the worker's name", async () => {
     const run = await runProvision({ env: "prod", json: true });
 
-    expect(run.exitCode).toBe(1);
+    expect(run.exitCode).toBe(EXIT.precondition);
     const failure = JSON.parse(run.stderr) as { error: { code: string; message: string } };
-    expect(failure.error.code).toBe("validation/invalid_input");
+    expect(failure.error.code).toBe("core/precondition_failed");
     expect(failure.error.message).toBe(`${WORKER}'s wrangler.jsonc has no DB database_id for prod.`);
   });
 });
@@ -326,7 +352,7 @@ describe("pithy vector provision --worker names a Worker that composes no vector
 
     const run = await runProvision({ env: "staging", json: true, worker: "web" });
 
-    expect(run.exitCode).toBe(1);
+    expect(run.exitCode).toBe(EXIT.usage);
     const failure = JSON.parse(run.stderr) as { error: { message: string } };
     expect(failure.error.message).toBe("web does not compose the vector capability.");
     expect(recorded.envs).toEqual([]);

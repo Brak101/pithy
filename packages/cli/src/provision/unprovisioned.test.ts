@@ -6,7 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PithyError } from "@pithy-sh/core/src/error/pithyError";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { assertEnvironmentProvisioned, unprovisionedBindings } from "./unprovisioned";
+import { fixOf } from "../terminal/exitClass";
+import { assertEnvironmentProvisioned, bindingProvisioning, unprovisionedBindings } from "./unprovisioned";
 
 describe("unprovisionedBindings", () => {
   let dir: string;
@@ -60,6 +61,31 @@ describe("unprovisionedBindings", () => {
     expect(await unprovisionedBindings(dir, "staging")).toEqual([{ worker: "board", kind: "d1", binding: "DB" }]);
   });
 
+  /**
+   * **An empty stanza is not a provisioned one (#697).** `pithy init` writes `d1_databases: []` into every
+   * environment, so "no binding lacks an id" is true of a project nobody ever provisioned. `provisioned`
+   * counts the positive evidence: a D1 or KV id a provision wrote. An R2 bucket's name is written by the
+   * scaffold, so it counts for nothing.
+   */
+  test("bindingProvisioning counts the D1 and KV ids a provision wrote, and an empty stanza has none", async () => {
+    await worker("board", {
+      name: "replay-board",
+      env: {
+        staging: {
+          d1_databases: [{ binding: "DB", database_id: "uuid" }],
+          kv_namespaces: [{ binding: "CACHE", id: "kv-id" }, { binding: "SESSIONS" }],
+          r2_buckets: [{ binding: "ASSETS", bucket_name: "replay-staging-assets" }],
+        },
+        prod: { d1_databases: [], kv_namespaces: [], r2_buckets: [{ binding: "ASSETS", bucket_name: "replay-prod" }] },
+      },
+    });
+    expect(await bindingProvisioning(dir, "staging")).toEqual({
+      missing: [{ worker: "board", kind: "kv", binding: "SESSIONS" }],
+      provisioned: 2,
+    });
+    expect(await bindingProvisioning(dir, "prod")).toEqual({ missing: [], provisioned: 0 });
+  });
+
   test("a Worker with no stanza and no top-level bindings contributes nothing to check", async () => {
     await worker("board", { name: "replay-board", env: { prod: {} } });
     expect(await unprovisionedBindings(dir, "staging")).toEqual([]);
@@ -89,6 +115,27 @@ describe("unprovisionedBindings", () => {
     expect(failure).toBeInstanceOf(PithyError);
     expect((failure as PithyError).payload.action).toContain("pithy provision --env staging");
     expect((failure as PithyError).payload.message).toContain("DB");
+    // The call is right and the account is not ready: a precondition, with the command that readies it (#697).
+    expect((failure as PithyError).payload.code).toBe("core/precondition_failed");
+    expect(fixOf(failure as PithyError)).toBe("pithy provision --env staging --yes");
+  });
+
+  // Provisioning production needs the `--confirm` phrase too, a person's to give, so `--yes` alone would
+  // end exit 5. A `fix` is runnable as written; production gets none (#697).
+  test.each([
+    ["prod", undefined],
+    ["live", ["live"]],
+  ])("a refusal on %s, a production environment, carries no fix", async (env, productionEnvironments) => {
+    await worker("board", {
+      name: "replay-board",
+      env: { [env]: { d1_databases: [{ binding: "DB", database_name: `replay-${env}-db` }] } },
+    });
+
+    const failure = await assertEnvironmentProvisioned(dir, env, productionEnvironments).catch(
+      (error: unknown) => error,
+    );
+    expect((failure as PithyError).payload.code).toBe("core/precondition_failed");
+    expect(fixOf(failure as PithyError)).toBeUndefined();
   });
 
   test("lets a provisioned deploy through", async () => {
@@ -142,6 +189,9 @@ describe("unprovisionedBindings", () => {
       expect(failure.payload.action).toContain("--env staging");
       expect(failure.payload.action).toContain("--env prod");
       expect(failure.payload.action).not.toContain("pithy provision");
+      // The call aimed at a stanza that never has resources: fix the call, exit 2, and nothing to run (#697).
+      expect(failure.payload.code).toBe("validation/invalid_input");
+      expect(fixOf(failure)).toBeUndefined();
     }
   });
 
@@ -159,6 +209,7 @@ describe("unprovisionedBindings", () => {
     expect(await unprovisionedBindings(dir, "feature")).toEqual([{ worker: "board", kind: "d1", binding: "DB" }]);
     const failure = (await assertEnvironmentProvisioned(dir, "feature").catch((error: unknown) => error)) as PithyError;
     expect(failure.payload.action).toContain("pithy provision --feature");
+    expect(fixOf(failure)).toBe("pithy provision --feature");
   });
 
   test("the refusal says what wrangler would do now, which is fail rather than create", async () => {

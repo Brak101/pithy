@@ -1,6 +1,6 @@
 # Pithy CLI Specification
 
-_The site renders this for readers: [pithy.sh/docs/cli](https://pithy.sh/docs/cli). This page is the specification it renders — `packages/cli/src/binDocs.test.ts`, `packages/cli/src/commands/doctorDocs.test.ts` and `packages/cli/src/terminal/styleDocs.test.ts` hold the code to it — so it stays here._
+_The site renders this for readers: [pithy.sh/docs/cli](https://pithy.sh/docs/cli). This page is the specification it renders — `packages/cli/src/binDocs.test.ts`, `packages/cli/src/commands/doctorDocs.test.ts`, `packages/cli/src/terminal/styleDocs.test.ts` and `packages/cli/src/terminal/exitClass.test.ts` hold the code to it — so it stays here._
 
 > The CLI is the brand's primary interface. Every command, every flag, every output line should feel like Pithy — short, deliberate, and confident. This document specifies what every command shares: the command shape, the flag conventions, the alias, the output styling, the help text, and the update notifier. What one command does is specified on its own page under [`docs/commands/`](commands/) — §1.4 indexes them. For visual identity, voice, and color tokens, see `BRAND.md`.
 
@@ -36,7 +36,7 @@ The binary is always `pithy`. The alias system (Section 3) ships a shorter short
 |---|---|
 | `pithy init` | Scaffold a new Pithy project in the current directory |
 | `pithy add <capability> [--worker <name>]` | Install a capability (auth, leaderboard, storage, vector) — installs the package, wires it into **that Worker's** `apps/<name>/pithy.config.ts` and `wrangler.jsonc`, writes any Durable Object class it binds into that Worker's entry (wrangler resolves `class_name` against the module `main` names), scaffolds its **config** (you pick the mount path; handler source stays in the package), and runs its migrations. `--eject` copies the source into your repo — the only path that writes handler source (see `docs/EJECT.md`) |
-| `pithy remove <capability> [--worker <name>]` | The manual, interactive inverse of `add` (and `add --eject`): unwires that Worker's config, bindings, and Durable Object exports, and uninstalls the package (or deletes the ejected source), leaving your data untouched unless you pass `--drop`. **Manual-only — `--json` is rejected** (see below) |
+| `pithy remove <capability> [--worker <name>]` | The manual, interactive inverse of `add` (and `add --eject`): unwires that Worker's config, bindings, and Durable Object exports, and uninstalls the package (or deletes the ejected source), leaving your data untouched unless you pass `--drop`. **Manual-only — `--json`, `--no-input` and `PITHY_NONINTERACTIVE=1` are rejected, exit 5** (see below) |
 | `pithy worker <add\|list\|remove\|rename\|sync> [name]` | Manage the project's Workers under `apps/<name>/`; `apps/` is the registry every command discovers (see [`commands/dev.md`](commands/dev.md)). `rename` moves the directory and the two other places a Worker's name is stamped (see Section 6.6). `sync` writes the Worker's **app-declared** Workflows and cron triggers into its `wrangler.jsonc`, for every environment it declares — the app's equivalent of what `pithy <capability> provision` writes for a library capability's (see Section 6.5) |
 | `pithy ui <add\|sync\|list> [--worker <name>]` | Scaffold a front end into an existing Worker and wire it end to end — Vite, the SPA entry, the routes, the `assets` stanza, the dev command. `sync` re-derives the asset routing after the Worker's capabilities change; `list` reports which Workers carry a UI (see [`commands/ui.md`](commands/ui.md) and `docs/UI.md`) |
 | `pithy dev [--app <name>]… [--list]` | Start the local development environment — app Workers plus each composed capability's host Worker, on per-feature ports (see [`commands/dev.md`](commands/dev.md)) |
@@ -51,6 +51,7 @@ The binary is always `pithy`. The alias system (Section 3) ships a shorter short
 | `pithy alias` | Install or remove the shell shortcut (see Section 3) |
 | `pithy docs <connect\|disconnect\|status>` | Point your AI coding agent at the Pithy documentation server — writes the `pithy` MCP entry into whichever of ten clients this machine has (Claude Code, Cursor, VS Code, Codex, Zed, Goose, …), merging into each tool's own file and leaving every other server in it alone. `--scope project` commits it for the team, `--scope user` follows you; a file it cannot parse is refused with the snippet to paste, never rewritten. No credential is written or read — the client runs the OAuth flow (see [`commands/docs.md`](commands/docs.md)) |
 | `pithy doctor [--worker <name>]` | Report toolchain state and update status, plus — inside a project — each Worker's config, binding, and migration health (exits non-zero when any Worker fails a check, so CI can gate on it) |
+| `pithy schema [command…] --json` | Describe the installed CLI as JSON, for an agent to build a call from: every command's positionals and flags with their types, defaults, values and aliases, the rules over several flags, the JSON Schema of its `--json` payload and of the error line, and whether it mutates, is idempotent and needs the network. With no command, the whole tree plus the global flags, environment variables, exit codes and error codes. Served from the binary, so it answers for the version installed — `docs/catalog.generated.json` is a projection of the same walk (see [`commands/schema.md`](commands/schema.md)) |
 | `pithy --help` / `pithy -h` | Show help for any command |
 | `pithy --version` / `pithy -v` | Print the installed version |
 
@@ -60,7 +61,7 @@ The binary is always `pithy`. The alias system (Section 3) ships a shorter short
 
 Two consequences worth stating outright:
 
-- **Commands that wire one Worker take `--worker <name>`** (`add`, `remove`). With a single-Worker project the flag is optional; with several, the CLI prompts at a terminal and **fails with an actionable error under `--json`** rather than guessing — wiring a capability into the wrong Worker would put its bindings and DO class migrations on the wrong script. Commands that operate on the whole project (`migrate`, `seed`, `upgrade`, `doctor`, `env`) **fan out over every Worker** and accept `--worker` to narrow.
+- **Commands that wire one Worker take `--worker <name>`** (`add`, `remove`). With a single-Worker project the flag is optional; with several, the CLI prompts when the run may ask and otherwise **fails `input/required`, naming `--worker` and every Worker it takes** (§1.2), rather than guessing — wiring a capability into the wrong Worker would put its bindings and DO class migrations on the wrong script. Commands that operate on the whole project (`migrate`, `seed`, `upgrade`, `doctor`, `env`) **fan out over every Worker** and accept `--worker` to narrow.
 - **Workers share a resource by declaring the same binding name.** Feature resource names derive from `(project, issue, slug, binding, kind)` with no Worker segment, so two Workers that both declare `DB` are backed by one D1; a Worker wanting its own declares a different binding (e.g. `COLLAB_DB`). Locally this is why Miniflare state persists at the project root — per-Worker state would silently split a shared database.
 
 ### 1.2 Flag conventions
@@ -69,19 +70,70 @@ Two consequences worth stating outright:
 - Short flags: `-f` (single letter)
 - Boolean flags default to `false`; pass to enable
 - Values pass with `=` or space: `--env=prod` or `--env prod`
-- **A flag the command does not declare is refused, on every command.** `pithy doctor --bogus-flag yes` exits 1 with `Unknown flag: --bogus-flag.` and, under it, the flags `pithy doctor` does take. Under `--json` the refusal is the one `{ "error": … }` line on stderr — `validation/invalid_input`, one `unrecognized_keys` issue per flag — and nothing on stdout. It is checked once, in `bin.ts`, before anything answers the invocation: before citty, which would parse the flag without a word, and before `--version`, which would print over it. A flag is the command's wherever it is typed, before its positional or after it: `pithy secrets rotate API_KEY --dry-rn` is refused exactly as `pithy secrets rotate --dry-rn API_KEY` is. A group takes no flags, so `pithy token --json` is refused rather than answered with usage. "Declares" means what the docs catalog publishes for that command: each arg's name, its camelCase spelling, its aliases, `--no-<name>` on a boolean, and the flags below that work everywhere. A declared string flag takes the next token as its value even when it starts with a dash; anything else meant for a child process goes after `--`
+- **A boolean flag reads one way, everywhere.** `bin.ts` reads `--json`, `--events`, `--pretty` and `--no-input` before citty parses, and reads them by citty's rule, so the run and the command never disagree: a bare `--no-<name>` wins wherever it is typed, and otherwise the last `--<name>` or `--<name>=<value>` decides. So `pithy init --json --no-json` is a text run, and may prompt. A `--json` spelling citty would read other than as written is refused, exit 2: `--json=maybe`, which citty reads as on, and `--no-json=<value>`, which it does not read at all. `--no-pretty=<value>` and `--no-input=<value>` are the exception, because citty never parses either flag: `true` or `false` is read as the double negative it spells
+- **A flag the command does not declare is refused, on every command.** `pithy doctor --bogus-flag yes` exits 2 with `Unknown flag: --bogus-flag.` and, under it, the flags `pithy doctor` does take. Under `--json` the refusal is the one `{ "error": … }` line on stderr — `validation/invalid_input`, one `unrecognized_keys` issue per flag — and nothing on stdout. It is checked once, in `bin.ts`, before anything answers the invocation: before citty, which would parse the flag without a word, and before `--version`, which would print over it. A flag is the command's wherever it is typed, before its positional or after it: `pithy secrets rotate API_KEY --dry-rn` is refused exactly as `pithy secrets rotate --dry-rn API_KEY` is. A group declares no flags of its own, so `pithy token --json` is refused rather than answered with usage, and its action line says it takes only the global flags, which `pithy schema --json` lists. "Declares" means what the docs catalog publishes for that command: each arg's name, its camelCase spelling, its aliases, `--no-<name>` on a boolean, and the flags below that work everywhere. A declared string flag takes the next token as its value even when it starts with a dash; anything else meant for a child process goes after `--`
 - `--help` / `-h` and `--version` / `-v` work on any command. citty answers its version builtin only when it is the *sole* argument, so `bin.ts` answers it first and `pithy add --version` prints the version instead of running `add`. It fires on a bare `--version` or `-v` anywhere before a `--` separator; a value that is literally the string passes as `--flag=--version` or after `--`
-- **`--pretty` / `--no-pretty` work on any command that takes `--json`, and format that line.** They are answered in `bin.ts` before citty parses, like `--version`, so no command declares them and every command accepts them; the docs catalog publishes both under `globalFlags`. `--pretty` indents the `--json` document two spaces and adds restrained syntax color; `--no-pretty` keeps it on one line. Neither means anything without `--json`, so either one alone is refused — `pithy doctor --pretty` exits 1 with `--pretty needs --json.`, and so does `pithy remove --pretty`, since `remove` is the one command that takes no `--json` at all. Only a bare, exactly-matching token counts, on the same rule as `--version`
+- **`--pretty` / `--no-pretty` work on any command that takes `--json`, and format that line.** They are answered in `bin.ts` before citty parses, like `--version`, so no command declares them and every command accepts them; the docs catalog publishes both under `globalFlags`. `--pretty` indents the `--json` document two spaces and adds restrained syntax color; `--no-pretty` keeps it on one line. Neither means anything without `--json`, so either one alone is refused — `pithy doctor --pretty` exits 2 with `--pretty needs --json.`, and so does `pithy remove --pretty`, since `remove` is the one command that takes no `--json` at all. Only a bare, exactly-matching token counts, on the same rule as `--version`
+- **`--events` works on `deploy` and `provision`, and needs `--json`.** It turns the one `--json` document into a stream of progress records closed by that document (below). Like `--pretty` it means nothing without `--json`, so alone it is refused in `bin.ts` before the command runs — `pithy deploy --events` exits 2 with `--events needs --json.` `--events=false` and `--no-events` ask for nothing and pass. Any value but `true` or `false` is refused, as `--pretty=maybe` is, so `--events=maybe` exits 2 with `--events=maybe is not a value --events takes.` rather than quietly turning the stream on. `--no-events=<value>` is refused whatever the value, because citty does not read it: `pithy deploy --json --events --no-events=true` would stream, so it exits 2 with `--no-events=true is not a spelling --events takes.` Every other command refuses it as a flag it does not declare
+- **`--no-input` works on every command, and forbids every prompt for that call.** It is answered in `bin.ts` like `--pretty` and published under `globalFlags`, but it needs no `--json`: forbidding prompts is a statement about the run, not about a format. `--no-input=true` and `--no-input=false` are read too, and any other value is refused. A bare `--no-input` forbids wherever it is typed, so `--no-input=false` cannot undo it. `=false` grants nothing that `PITHY_NONINTERACTIVE=1` or `--json` forbade. There is no `--input`, because asking is already the default
 
 **`--env` takes `dev`, `staging`, or `prod`, and it is validated at the flag.** It defaults to `dev`, because every command is safe there. It is **not** `production`: the environment sits verbatim in the middle of every Cloudflare name the project composes, so each of its characters costs one character of project name, one for one — and `--env production` is answered with an error naming `prod`. A custom environment is allowed (`live`, `eu-prod`), held to the same charset and to a hard maximum of 7 characters, the length of `staging`. Every project-name budget is derived against that 7, and a provisioned project cannot be renamed, so a longer environment is refused rather than quietly shrinking a cap projects were already accepted under.
 
 **Which of them this project has is declared**, once, as `environments` in the root `pithy.config.ts` — `["staging", "prod"]` unless it says otherwise, asked at `pithy init` with that default. A command that deploys or provisions refuses an `--env` the project does not declare, naming the ones it does; `dev` is never declared, because it is local and always there. See `docs/NAMING.md`.
 
-Every command is agent-drivable and supports `--json`, with **one deliberate exception**: `pithy remove` is destructive, so it is **manual, interactive-only** — passing `--json` fast-fails with a clear error before anything changes. Its `--drop` confirmations are typed at a real terminal; there is no headless path. Automated teardown of an ephemeral environment is a different command (the `feature` lifecycle), not `remove`.
+Every command is agent-drivable and supports `--json`, with **one deliberate exception**: `pithy remove` is destructive, so it is **manual, interactive-only** — passing `--json` fast-fails with `core/person_required` and exit 5 before anything changes. Its `--drop` confirmations are typed at a real terminal; there is no headless path. `--no-input` and `PITHY_NONINTERACTIVE=1` are refused the same way, exit 5, because they say nobody is at the keyboard. A run that only lacks a terminal still unwires, and a `--drop` there fails `core/person_required`, exit 5, before anything is read. Automated teardown of an ephemeral environment is a different command (the `feature` lifecycle), not `remove`.
+
+**A run may be told it may not ask anything.** `PITHY_NONINTERACTIVE=1` forbids every prompt for the session, `--no-input` forbids them for one call, and `--json` forbids them implicitly, because a caller parsing one line is not reading a question. All three are resolved once, in `bin.ts`, and every command reads that one answer instead of deciding for itself. Any one of them forbids; none of them can grant what another forbade:
+
+| Signal | Effect |
+|---|---|
+| `PITHY_NONINTERACTIVE=1` | Forbids prompts for the whole session. Empty is unset. Any other value is refused, naming the one it takes |
+| `--no-input` | Forbids prompts for this invocation |
+| `--json` | Forbids prompts for this invocation, as it always has |
+| none of them | A prompt opens only when stdin and stdout are both a terminal |
+
+**The variable exists because a TTY does not prove a person is present**, for the reason `PITHY_JSON` exists: an agent harness that allocates a PTY and runs without `--json` used to reach a prompt and wait for an answer nobody would give. With input forbidden, a prompt never opens, and what happens instead depends on whether its question has a default:
+
+- **A question with a default takes it**, exactly as a piped run always has. `pithy init` scaffolds with the directory's name, `api` and the default environments, and asks for no account or domain.
+- **A question with no default fails `input/required`**, a 400 that names the flag answering it and, when the set is known, every value that flag takes. Under `--json` it is the one `{ "error": … }` line: `{ "code": "input/required", "flag": "--worker", "choices": ["api", "admin"], … }`, exit 2. `flag` is `null` when no flag can answer — a secret, which comes on stdin and never on the command line.
+- **A question only a person may answer fails `core/person_required`**, exit 5: a typed confirmation phrase (`--confirm`, `--confirm-production`, `--confirm-reset`, `--confirm-rollback`), `remove --drop`, and `pithy remove` itself under `--no-input` or `PITHY_NONINTERACTIVE=1`. The action line still names the flag, for the person; the exit code tells an agent to stop and ask rather than try variations (§3.8).
+
+The flag that answers each one is named on the command's page. `docs/commands/*.md` calls them out where a prompt is described; `packages/cli/src/ci/promptSites.test.ts` enumerates every prompt in the CLI and holds each to one kind or the other.
+
+**`--dry-run` plans, and every command that takes it plans in one shape.** Eleven commands plan — `add`, `ui add`, `worker rename`, `provision`, `migrate`, `deploy`, `upgrade`, `seed`, `secrets rotate`, `feature prune` and `payments reconcile` — each declaring the flag once with one description — *Show the plan and write nothing* — so `pithy schema` publishes the same flag for each. The other commands that change something do not plan yet: `init`, `secrets create`, `token mint`, `feature create`, `worker add` and the rest take no `--dry-run`. `pithy schema` says which take it, and an agent reads that rather than this list. A dry run makes every refusal the real run makes, before it plans anything: a plan for a run that would be refused is a promise nobody can keep. Missing Cloudflare credentials are one of them, so `provision --dry-run` without them is refused exit 3 as the run is. `secrets rotate` reaches no account at all, so it makes every refusal this machine can answer and leaves one to the run: its store's pre-flight, which asks the account whether it would take the value. A binding with no id is another, so `deploy --dry-run` for an unprovisioned staging is refused exit 3, with `pithy provision --env staging --yes` as its `fix`. So under `--json` a dry run either succeeds with its plan, exit 0, or fails as the real run would: a refusal is the one error line on stderr, carrying its `exit` and, when the cause is known, its `fix`, and nothing on stdout. The one failure that is not a refusal is a report's: a `deploy` or `upgrade` dry run that finds an item that would fail writes its plan with that item's row and exits as the real run does (§3.8): 1, or the `exit` a refused Worker's row carries. A dry run skips the confirmations, because nothing it does needs one. Its text output ends with a line that opens `Dry run.` in place of `Done.`, and that line is `Dry run. Nothing written.` on eight of them. The other three say what else a real run would have done: `secrets rotate` ends `Dry run. Nothing rolled, nothing written.`, `payments reconcile` ends `Dry run. Nothing repaired.`, and `deploy` ends `Dry run. Nothing uploaded.`
+
+Under `--json` each of them carries `dryRun`, and under `--dry-run` a `plan` beside the keys it always wrote. The plan's schema is one Zod value, shared by every one of them, and `packages/cli/src/plan/dryRun.test.ts` fails on a command whose payload carries a copy instead. Every list is always present, empty when there is nothing of its kind, so an agent reads `plan.files.length` without asking whether the key was there:
+
+| key | type | meaning |
+|---|---|---|
+| `files` | object[] | Files and directories it would write: `path` relative to the project root (absolute only outside it, like the port registry), `action` (`create`, `edit`, `delete`, `move`), `from` on a `move`, `changes` as one sentence each, and `diff` — the change as a unified diff of the text — wherever the command knows the bytes |
+| `resources` | object[] | Cloudflare resources it would `create`, `adopt` or `upload`: `kind`, `name`, `binding`, `env`, and `id` on an adopt |
+| `migrations` | object[] | Migrations it would apply (`up`) or roll back (`down`): `env`, `worker`, `database`, `binding`, `name` |
+| `secrets` | object[] | Secrets it would `mint`, `write`, `rotate` or `bind`: `name`, `env`, and `where` the value lands. Never the value |
+| `data` | object[] | Rows, entries and objects it would write into existing stores: `store`, `target`, `count`, `action` |
+| `notes` | string[] | What the plan cannot settle without making the change, one sentence each |
+
+**A dry run writes nothing, and calls nothing that writes.** `add` and `ui add` make their real writes in a private copy of the project under the system temporary directory and plan the difference, so the diff a person reviews is the bytes the run writes; the copy is gone before the command exits. The copy leaves out `.git`, local state, build output the repository ignores, every `.dev.vars`, every `.env` git does not track, and any directory it cannot list. A `.env` the repository tracks is copied, because committing it said it is no secret; with no repository to ask, none is. A file it cannot read is in the copy and cannot be read there either, so a command that reads it fails with the real run's error. A link that leads out of the project to a file is a copy of that file: the real run writes through the link, so the command reads and edits the copy as it would the file, the plan names the edit at the link's path, and a note says it lands outside the project. A link that leads out to a directory is a snapshot of that directory, under the same rules as the rest of the copy: the command reads the tree as it would through the link, a link inside it that leads further out is a snapshot too, and each write there is planned at the path the command wrote, with a note that it lands outside the project. Nothing written in the copy reaches the directory itself. A check that refuses a link — `apps/api/src/routes is a symlink.` — refuses the snapshot as it refuses the link, so a run the real one refuses is refused here too. A link that leads out to nothing still leads nowhere in the copy, and a write through it fails. A failure in the copy is an error line naming the project's paths, never the copy's. `provision` does the same with the account it would provision: it asks whether each resource exists, as the real run does, and hands back a placeholder id where it would create one, so the diff shows where the new id lands. `migrate` reads each database's ledger and never claims one, and in `dev` it reads a copy of the local store, because opening a Miniflare store can write to it. They read Cloudflare at most — `worker rename` asks whether the old script is live, as the real rename does — and each command's suite asserts that no write call was made. `deploy` is Pithy's plan, then wrangler's: in a private copy of the project, it builds each Worker with a front end as the deploy would and runs `wrangler deploy --dry-run` on the deploy's own argv, so a bundle that does not build fails the dry run with the build's error, and neither the build's output nor wrangler's bundle lands in the project. wrangler bundles and stops; nothing is uploaded. The copy reaches the installed packages through a link to `node_modules`, so a build that keeps a cache there writes that cache, and it carries no `.dev.vars` and no untracked `.env`, so a build that reads one builds without it, while a tracked `.env.production` is there for the build that reads it. `payments reconcile` is the one exception, and it says so in its plan: the pass runs in the deployed reconcile Workflow, so a dry run starts that Workflow, which reads the entitlements in scope and repairs none.
+
+**A success says what it left required, as `next`, and only then.** Five commands can finish a run that still needs a step before it works, and under `--json` each names that step as data: `next: [{ command, why }]`, in the order to run them, `command` whole and runnable as written. The key is **absent unless the command knows the step is required — never an empty list** — so every `next` an agent sees is one it should act on, and a suggestion it would have to judge is never one of them. No `--dry-run` carries it, and nor does a run that failed: its failure is the next thing to read.
+
+| Command | `next` names | When |
+|---|---|---|
+| `add` | `pithy provision --env <env> --yes`, else `pithy migrate --env <env>` | A declared environment other than production that a provision had readied (a resource for every binding, and a D1 or KV id a provision wrote, so the empty stanzas `pithy init` writes do not count) gained a binding without one; else the add applied migrations in `dev` and a provisioned environment has migrations it has not applied |
+| `provision` | `pithy deploy --env <env>` | A Worker it named has no deployed script on the account |
+| `deploy` | `pithy migrate --env <env>` | The environment's databases have not applied every migration. Deploy never migrates |
+| `upgrade` | `pithy migrate --env <env>`, or the project's own CLI's `upgrade` | It counted pending migrations and `--migrate` did not run them; or `--packages` moved `@pithy-sh/cli` and left the reconcile to it |
+| `ui add` | The project's install, `<pm> install` | It wrote dependencies into the Worker's `package.json` |
+
+A follow-up the run could not establish — an account it could not ask, a ledger that would not read — is not named. Nor is a step only a person may take: provisioning a production environment needs its `--confirm` phrase, so `add` names no step for one, as no error's `fix` does (§3.3). `pithy doctor` carries the same idea the other way round: each check that fails its exit is one `failures` entry with a `fix` command, or `fix: null` where the remedy is an edit or a person's, and every finding in its blocks carries the same `fix`, the ones that never gate included — a deployed environment's pending migrations name `pithy migrate --env <env>`, an unbound secret names `pithy secrets provision` (§5.6).
+
+**Every `--json` payload names the version of its shape, as `schemaVersion`.** An integer per command, from `1`, carried on every line a command writes — `doctor`'s report and each record of a stream included — and published by `pithy schema` as each command's `schemaVersion`. It is bumped only by a change that breaks a parser: a key removed, or a key whose type changed, a value added to a fixed set among them. An added key does not bump it, so a parser keys its expectations on the number and ignores keys it does not know. The formatter stamps it, so no command can write a line without it, and `packages/cli/src/contract/payloadShapes.test.ts` fails a payload that loses or retypes a key while its number stays put.
 
 **`--json` formats for whoever is reading it.** A script, a CI job or an agent gets exactly the compact line it has always parsed; a person at a terminal gets that same document indented two spaces, with restrained syntax color. Nothing about the payload changes, so both round-trip through `JSON.parse` to the same value.
 
 **This applies to a command that writes one document.** A document can be reshaped for its reader because nothing parses it incrementally: the trailing newline is a terminator rather than a separator, so indenting cannot break a framing that is not there. **`pithy dev` is the exception, and it is not reshaped — and nor is `pithy dev logs`, which reads its records back.** A session never ends, so its `--json` stdout is a *stream* — one object per line, which is the only rule a consumer reading it line by line can apply (`docs/commands/dev.md` §`--json`). Indenting those records would hand that consumer `{` as its first line, so a session's records stay compact and uncolored at a terminal exactly as they are in a pipe. The reader inherits the exception for a sharper reason: `pithy dev logs --follow` is a stream and `pithy dev logs -n 50` is not, and a consumer's parse must not change with a flag it did not pass — so both are compact and uncolored. `pithy dev --list --json` writes one document and exits, and is formatted like any other.
+
+**`--json --events` on `deploy` and `provision` is the other exception, and the only way a one-document command writes more than one line.** A deploy or a provision can run for minutes, and a run that says nothing for minutes is the run an agent kills. Under `--events` each step it would have narrated with `▸` is a record instead — `{ command, schemaVersion, event: "start", what }` as it begins, `{ command, schemaVersion, event: "settled", line }` as it ends, with the row behind the line where there is one — and the document `--json` alone writes closes the stream as its last line, the one line with no `event`. It is framed as `pithy dev`'s stream is: compact and uncolored, whatever `--pretty` or `PITHY_JSON` asked for. A failure ends the stream with no document, and the error line goes to stderr as it always does. Without `--events` both commands write their one document, unchanged. `pithy schema` publishes each one's record as its `events`.
 
 **Which one you get is decided the way color already is (§3.4) — first match wins:**
 
@@ -138,6 +190,7 @@ One page per command, under [`docs/commands/`](commands/). Every page carries th
 | `pithy migrate` | [`commands/migrate.md`](commands/migrate.md) — Run each Worker's migration registry |
 | `pithy payments` | [`commands/payments.md`](commands/payments.md) — Provision and inspect the payments capability |
 | `pithy remove` | [`commands/remove.md`](commands/remove.md) — Unwire a capability. Manual only |
+| `pithy schema` | [`commands/schema.md`](commands/schema.md) — Describe every command, flag, payload and error code as JSON |
 | `pithy secrets` | [`commands/secrets.md`](commands/secrets.md) — Create, rotate, edit, and provision the secret registry |
 | `pithy seed` | [`commands/seed.md`](commands/seed.md) — Seed an environment from your Zod-typed fixtures |
 | `pithy storage` | [`commands/storage.md`](commands/storage.md) — Provision and manage the storage backends |
@@ -149,6 +202,16 @@ One page per command, under [`docs/commands/`](commands/). Every page carries th
 | `pithy upgrade` | [`commands/upgrade.md`](commands/upgrade.md) — Reconcile package-served capabilities with their manifests |
 | `pithy vector` | [`commands/vector.md`](commands/vector.md) — Provision and manage Vectorize indexes |
 | `pithy worker` | [`commands/worker.md`](commands/worker.md) — Manage the project's Workers under `apps/` |
+
+### 1.5 The agent instructions a project carries
+
+**A project tells the agent working in it how to drive this CLI.** `pithy init` writes a marked Pithy block into the project's `AGENTS.md`, and `pithy upgrade` rewrites it as the CLI changes. It says five things: `pithy schema --json` describes every command the installed version takes; `PITHY_JSON=compact` keeps every `--json` document on one line; `PITHY_NONINTERACTIVE=1` means no prompt waits; `--dry-run` comes before a command that changes anything; and `pithy remove` and every typed confirmation phrase belong to a person. Under them is the exit-code table of §3.8, rendered from the same rows `pithy schema` publishes, so the two cannot drift.
+
+**The block is the only part of `AGENTS.md` Pithy owns.** It runs from a line starting `<!-- pithy:begin` to the line `<!-- pithy:end -->`, both HTML comments, so a rendered file shows neither. A write replaces those lines and nothing either side of them, byte for byte; a file without the block gains it at the end, after a blank line; a current block is not rewritten, so a re-run moves no mtime. Markers Pithy cannot read unambiguously — an open with no close, a close first, two blocks — are refused and reported, never guessed at, as §2.5 refuses to guess at a shell rc file. A symlinked `AGENTS.md` is refused too: a cloned repository can ship the link, and the write would follow it out of the project.
+
+**`CLAUDE.md` gets one line, from `pithy init` alone.** Claude Code reads its own file and not the shared one, so `init` appends `Agent instructions for this project, Pithy's included: @AGENTS.md` — `@AGENTS.md` is Claude Code's import — to a `CLAUDE.md` the repository already has, or creates `CLAUDE.md` holding just that line. A file already importing `@AGENTS.md` is left alone, and so is a `CLAUDE.md` that is a link to `AGENTS.md`, or the reverse: one file read under both names needs no pointer. `pithy upgrade` touches `AGENTS.md`'s block and nothing else, so a `CLAUDE.md` it finds is never edited.
+
+Neither file is in the starter template. `pithy init` refuses a target that already holds a file it would copy, and `AGENTS.md` is the file a cloned repository is likeliest to carry, so both are merged after the scaffold instead. A refusal of either is reported — a line for a person, a `refused` state under `--json` — and never fails the run.
 
 ---
 
@@ -471,6 +534,20 @@ Check your CLOUDFLARE_API_TOKEN and try again.
 - Last line: the action the user should take
 - Color: ANSI basic-16 red (terminal-themed) for the first line; default otherwise. See Section 3.4.
 
+**A question this run could not ask is `input/required`.** Under `PITHY_NONINTERACTIVE=1`, `--no-input` or `--json` (§1.2), a prompt with no default fails instead of opening. The problem and action lines read as any other refusal; the `--json` line also carries `flag`, the flag that answers the question (`null` when only a person or a piped document can), and `choices`, every value that flag takes when the set is known. `choices` is absent rather than empty when it is not:
+
+```json
+{ "error": { "code": "input/required", "status": 400, "flag": "--worker", "choices": ["api", "admin"], "message": "This project has several workers, so which one to wire is ambiguous.", "action": "Pass --worker <name>. Known: api, admin.", "exit": 2, "retryable": false } }
+```
+
+**The `--json` line says what to do next.** Every error line carries `exit`, the code the process ends with, and `retryable`, whether the same call can succeed unchanged — `true` only for an upstream failure. When the throw site knows the cause, it also carries `fix`, one `pithy` command that rights it, runnable as written. `fix` is absent, never `null` or empty, when nothing is known for certain, and a step only a person may take never carries one — so an unprovisioned production environment names no `fix`, because provisioning it needs the `--confirm` phrase. §3.8 has the table:
+
+```json
+{ "error": { "code": "core/precondition_failed", "status": 412, "message": "No environment is ready — staging and prod have no DB database_id.", "action": "Run pithy provision --env staging to create its app database, then run pithy email provision again.", "exit": 3, "retryable": false, "fix": "pithy provision --env staging --yes" } }
+```
+
+The text path stays two lines. The action line already says what `fix` says, in a sentence.
+
 **When the failure came from a service Pithy does not control, that service's own answer is carried on the problem line, after the words `Cloudflare said:`** — its code, its sentence, and its documentation link, entries separated by semicolons. Pithy reports it rather than paraphrasing it. A refusal that names only what Pithy was attempting cannot tell a missing permission from a dead credential from an outage, and each of those has a different remedy:
 
 ```
@@ -602,6 +679,8 @@ Default values shown in brackets. `Y/n` means default yes; `y/N` means default n
 
 **Every one of these is skippable.** A project without a domain yet is legitimate, and most are on the first day; an empty answer writes no `domains` block at all, and adding one later is a config edit plus a deploy, never a rescaffold. A non-interactive run asks nothing and declares nothing — `domains` goes in `pithy.config.ts` directly, which is exactly what the prompt writes.
 
+**A non-interactive run is one that may not ask (§1.2):** no terminal on stdin and stdout, `--json`, `--no-input`, or `PITHY_NONINTERACTIVE=1`. Every prompt is one of three kinds there. A prompt with a default — every question `pithy init` asks, the domain prompt, the screen sets `pithy ui add` offers, the scopes `pithy dashboard connect` grants — takes it silently. A prompt with no default — which Worker, a required `--set` option, the yes-or-no `pithy dashboard revoke-key` and `disconnect` ask before acting — fails `input/required`, naming its flag (§3.3). A typed confirmation phrase, `pithy remove --drop`, and `pithy remove` itself under the switch, fail `core/person_required` instead, exit 5, with no `flag` key: the action line names the flag for the person, and the exit code tells an agent to stop and ask (§1.2, §3.8). A confirmation defaults to no, so a run that cannot ask is never taken as yes: it passes `--yes`, or the phrase, or it is refused. No prompt waits on a person who was not asked for.
+
 **And the declaration is the only place an origin is written down.** Every capability that needs a public origin asks the same question: `auth.baseURL` builds OAuth callbacks, magic-link URLs and the CSRF allowed-origin; `email.baseUrl` builds tracking and unsubscribe links; `payments`' Stripe return URLs decide where Checkout sends the browser back. Write a URL into any of them and you have written *one* environment's origin into all of them — which is how a staging deploy mails real users links into production, an unsubscribe from a staging test unsubscribes that person in production, and a staging payer lands in production on an account that bought nothing. Three capabilities, one mistake, three separate discoveries.
 
 So it is derived, and **`pithy init` scaffolds the derivation** — an adopter who never thinks about it gets it right, and one who wants a literal can still write one:
@@ -715,6 +794,35 @@ The exception is bounded by four things, and each is a gate rather than a note:
 
 A second command wanting a pinned region is a new argument to be made here, not a precedent to inherit.
 
+### 3.8 Exit codes
+
+**A failed run's exit code says what to do next.** Every failure used to exit 1, so a bad flag, a project nobody provisioned, a Cloudflare outage and a step only a person may take looked the same to a script. Each kind has its own code now:
+
+| Exit | Class | Meaning | The agent should |
+|---|---|---|---|
+| `0` | — | Done | Continue |
+| `1` | `failed` | Unclassified failure | Read the error |
+| `2` | `usage` | Usage or validation | Fix the call |
+| `3` | `precondition` | Precondition unmet | Run the `fix` command |
+| `4` | `upstream` | Upstream or transient | Retry with backoff |
+| `5` | `person` | Needs a person | Stop and ask |
+| `130` | — | Interrupted | Stop |
+| `141` | — | Output closed early | Read what arrived |
+
+**A script should test for non-zero, not for `1`.** `if pithy deploy --env staging; then …` keeps working; `[ $? -eq 1 ]` does not, because most failures are no longer 1.
+
+What lands in each class:
+
+- **2, usage.** The call is wrong and a different call fixes it: an undeclared flag, a value a flag does not take, a name that matches nothing (`--worker`, `--client`, the Worker `pithy worker remove` names), an unknown command, `input/required` (§1.2), `validation/invalid_input`.
+- **3, precondition.** The call is right and something it depends on is missing: no Cloudflare credentials, an environment with no resources behind its bindings, a resource that is not there, a project with no `name`, a capability the project does not compose — whose `fix` is `pithy add <capability>`, runnable as written with nobody to ask: `--worker` naming the `apps/` directory whenever the project has more than one Worker, `--with-prerequisites` whenever the capability's manifest declares any, and no `fix` at all where no single Worker can be named or a required option has no default to pick — and a config out of step with itself, such as a declared origin nothing routes, whose `fix` is the `pithy worker sync` that `pithy doctor` names for it. A Worker named with `--worker` that does not compose the capability is a usage error instead: another `--worker` is the fix. `core/precondition_failed`, `core/not_found`, `core/conflict` and the other 401, 403, 404, 409 and 410 codes. This is the class that carries `fix` most often.
+- **4, upstream.** A service Pithy does not control failed or asked for less traffic: `core/upstream_failed`, `core/upstream_timeout`, the 429s, 502s, 503s and 504s. The one class with `retryable: true`.
+- **5, person.** A typed confirmation phrase, `pithy remove`, a credential rolled at its issuer that the store never took, a store `pithy secrets verify` found something wrong with. No retry or variation fixes these. `core/person_required` never carries `fix`.
+- **1, failed.** Pithy itself broke, or a code it cannot classify — an adopter's own code included. A run that reports and found something — `doctor` with a finding, `deploy` or `upgrade` with a failed item, `ui sync` with an uncovered route — exits 1 too: its report is the answer, not one error. A `deploy` whose failed Worker row carries `exit` exits with the first such row's `exit` — 3 when Cloudflare refused the credentials after an earlier Worker already had a row.
+- **130.** Ctrl-C at a prompt. `@clack/prompts` reads in raw mode, so the interrupt arrives as a cancel; it exits 130 as a signal would. A person who answers **no** to a confirmation exits 1.
+- **141.** The reader closed the pipe before the output was done — `pithy schema --json | head`. Node ignores `SIGPIPE`, so the write sees `EPIPE` instead of the process dying of the signal; the run ends quietly with the code the signal would have left, 128 + 13, as 130 does for an interrupt. Nothing is printed: the reader has gone. Not 0, because the output was cut short, and `set -o pipefail` reports it as it would for any other program.
+
+**Every kit error code has exactly one class.** The table is `packages/cli/src/terminal/exitClass.ts`, keyed on `KitErrorPayload`'s codes and checked against them by the compiler and by `exitClass.test.ts`, so a new code cannot ship unclassified. `pithy schema --json` publishes it from the installed binary, as `exitCodes` and `errorCodes`, and `docs/catalog.generated.json` carries the same rows: each `errorCodes` entry carries `exitClass`, `exit`, `retryable` and `remedy` beside its `code` and `status`.
+
 
 
 ---
@@ -727,11 +835,11 @@ The two transcripts below are captured from the real binary and pinned by `packa
 
 **A command that names no action is asking what it can do, and being answered is a success.** One rule, at every level: bare `pithy` prints the command list and exits 0, and so does a group with no subcommand — `pithy secrets`, `pithy worker`, all fourteen. Nothing is printed after the help, because the list *is* the answer to the missing command; repeating it as a complaint is the CLI arguing with a user it has just served. Exit 0 is what makes `pithy && next` and a bare invocation in a CI step work, and it is what keeps `bun run pithy` from adding `error: script "pithy" exited with code 1` under a successful help screen.
 
-A name that is **not** a command is a different thing. `pithy nonsense` is a mistake, not a question: it names what was not recognized, shows the help, and exits non-zero.
+A name that is **not** a command is a different thing. `pithy nonsense` is a mistake, not a question: it names what was not recognized, shows the help, and exits 2.
 
 **And a name is a command only when the tree declares it.** Every `subCommands` is an object literal, so `Object.prototype` used to be in scope for every lookup at every level: `pithy valueOf` called `Object.prototype.valueOf` with no receiver and died on a raw `TypeError` under a crash banner, and `pithy constructor` called `Object`, took the `{}` it returned for a command definition, ran nothing, and exited **0**. `ownNamesOnly` in `dispatch.ts` copies each record onto a null prototype on its way to citty, so an inherited name resolves to nothing and takes the `pithy nonsense` path — named, help shown, non-zero. Done once, for the whole tree, and lazily: a subcommand thunk is wrapped, never called.
 
-The rule lives in `packages/cli/src/dispatch.ts`, once, and is applied before citty parses — citty throws `E_NO_COMMAND` for the root and for every group, and `runMain` catches every such error into usage plus the message plus `process.exit(1)`. A group added later inherits the rule with nothing to remember.
+The rule lives in `packages/cli/src/dispatch.ts`, once, and is applied before citty parses — citty throws `E_NO_COMMAND` for the root and for every group, and would answer it with usage, the message and a failure. A group added later inherits the rule with nothing to remember. Everything citty does refuse — an unknown name, a missing argument — goes through `runTree` beside it, which shows the usage of the deepest command named, prints the message, and exits 2 (§3.8). Under `--json` the refusal is the one `validation/invalid_input` line instead, and stdout stays empty.
 
 ### 4.1 Top-level help
 
@@ -781,13 +889,14 @@ COMMANDS
      doctor    Check the toolchain, project, and for a new CLI version
       alias    Install the `p.` shortcut for `pithy`
        docs    Connect the Pithy documentation server to your AI coding agent
+     schema    Describe every command, flag, payload and error code as JSON
 
 Use pithy <command> --help for more information about a command.
 ```
 
 ### 4.2 Subcommand help
 
-Same renderer, one command deep. `pithy add` is the representative case — a positional argument and seven flags. Help never enumerates the capability catalog: `pithy add --list` is the command for that (§3.5), and it reads the installed set, which no static block can.
+Same renderer, one command deep. `pithy add` is the representative case — a positional argument and eight flags. Help never enumerates the capability catalog: `pithy add --list` is the command for that (§3.5), and it reads the installed set, which no static block can.
 
 ```
 $ pithy add --help
@@ -807,6 +916,7 @@ OPTIONS
                --eject    Copy the capability's source into your repo and own it (no upgrades) (Default: false)
                --force    With --eject, overwrite an existing local copy (discards edits) (Default: false)
   --with-prerequisites    Compose the capabilities this one requires, if they aren't composed yet (Default: false)
+             --dry-run    Show the plan and write nothing (Default: false)
                 --json    Machine-readable output (Default: false)
 ```
 
@@ -1029,6 +1139,10 @@ Two tiers, because they cost different things:
 
 **What makes `doctor` fail:** a finding from either tier. A local finding is established from the project's own files. An account finding is established from an account that answered — so the exit gate reads the findings, never the tier's state. When the account cannot be reached (offline, no credentials, no answer) the tier is reported as **skipped**, with the reason, and gates nothing; a capability whose check threw is reported as **unchecked**, with the tier that failed. Neither is ever rendered as a pass. Every finding renders as a problem line and an action line naming the `pithy` command, config key, or one-time account action that resolves it, and every finding and every skip appears in `--json`. The check never writes anything.
 
+**A finding may also carry `fix`: the `pithy` command that resolves it, whole and runnable as written.** It is optional on `SettingsFinding`, beside the `action` sentence that is not: set it where one command resolves the finding — `pithy email provision` for a missing suppression database, `pithy secrets provision` for a signing key with no entry — and leave it off where the remedy is an edit, an account action, or a command that is safe only once something the check did not establish is true. Doctor reads it as `fix: null` when it is absent, which is also how it reads a capability older than the field, so an older install costs a command and never the report. A capability names its command bare, and `pithy email provision` acts on one Worker, refusing `input/required` when the project has several; so doctor names the Worker the finding came from — `pithy email provision --worker api` — and the testers daily pass's missing-database refusal names the Worker it resolved the same way. Every finding is one entry of doctor's `failures` and one of `settings.findings`, each with that `fix` and never without the key (`docs/commands/doctor.md`).
+
+**Every other block's findings carry `fix` the same way, whether or not they gate.** A finding that fails the exit is one `failures` entry; a finding that only reports — a deployed environment's pending migrations, an unbound secret, an AI client nobody connected, a Worker whose `.dev.vars` holds nothing, a Turnstile sitekey nothing renders — is a fault all the same, and its entry in its block carries `fix`: one `pithy` command run as written, or `null` where the remedy is an edit, a person's step, or something the check did not establish. Where a finding is both, both carry the same command. `devSecrets` and `devVarsLocal`, which sort names into classes rather than list findings, carry none. `docs/commands/doctor.md` lists every list that carries one.
+
 ### 5.7 Project capability updates
 
 Distinct from CLI updates. When run inside a Pithy project, the doctor command reports outdated capability packages alongside the CLI version. Two upgrade paths, two distinct commands:
@@ -1054,13 +1168,13 @@ That line is the difference between `upgrade` and `doctor` agreeing and not. Rep
 
 **`--packages` is what moves a version; `pithy upgrade` alone never did.** It moves every `@pithy-sh/*` dependency to the newest version its range admits and reinstalls, then reconciles. A version beyond a breaking boundary — a new major, or a new minor under `0.x` — is held and named, and `--latest` is the explicit opt-in that crosses it. Doctor names whichever of the two clears its line, and names none when no `pithy` command would.
 
-`pithy upgrade --json` carries five fields, and a sixth, `packages`, only when `--packages` was passed. `command` is the command's name, `env` the environment the pending-migration count was computed for, and `dryRun` whether anything was written. `workers` is one entry per Worker in discovery order, each holding the `plan` built for it and the `applied` result of writing it — `null` on a dry run. Each applied capability carries `addedBindings` (what landed) and `skippedBindings` (what did not, each with its `reason`). `manifestFaults` is the project-wide list, one entry per unusable manifest, each naming its `package` and the `reason`.
+`pithy upgrade --json` carries six fields, a seventh, `packages`, only when `--packages` was passed, an eighth, `plan`, only under `--dry-run` (§1.2), and a ninth, `next`, only when the run left a step required — the migrations it counted and did not run, or the reconcile a moved `@pithy-sh/cli` was left to (§1.2). `command` is the command's name, `env` the environment the pending-migration count was computed for, and `dryRun` whether anything was written. `workers` is one entry per Worker in discovery order, each holding the `plan` built for it and the `applied` result of writing it — `null` on a dry run. Each applied capability carries `addedBindings` (what landed) and `skippedBindings` (what did not, each with its `reason`). `manifestFaults` is the project-wide list, one entry per unusable manifest, each naming its `package` and the `reason`. `agents` says what happened to the Pithy block in `AGENTS.md` — `added`, `updated`, `unchanged` or `refused` — and is absent only when `--packages` moved `@pithy-sh/cli` and left the reconcile to the new one (§1.5).
 
 `pithy add --list --json` carries three. `command`, then `capabilities` — the catalog, each entry naming the capability, its package, when to enable it, and whether this project has it installed — and the same `manifestFaults` list, for the same reason and in the same shape.
 
 ```
 $ pithy add --list --json
-{"command":"add","capabilities":[{"name":"auth","package":"@pithy-sh/auth","whenToEnable":"Authentication and session management.","installed":true}],"manifestFaults":[{"package":"@pithy-sh/leaderboard","reason":"configOptions[0].key: not a bare identifier"}]}
+{"command":"add","schemaVersion":1,"capabilities":[{"name":"auth","package":"@pithy-sh/auth","whenToEnable":"Authentication and session management.","installed":true}],"manifestFaults":[{"package":"@pithy-sh/leaderboard","reason":"configOptions[0].key: not a bare identifier"}]}
 ```
 
 ### 5.8 Testing checklist
@@ -1112,7 +1226,7 @@ Idempotent, comment-preserving, and all-or-nothing: a run with nothing to change
 ### 6.6 Renaming a worker (`pithy worker rename`)
 
 ```
-pithy worker rename <old> <new> [--force] [--json]
+pithy worker rename <old> <new> [--force] [--dry-run] [--json]
 ```
 
 **A worker's name is not one string. It is three, and they have to agree.**
@@ -1149,7 +1263,7 @@ Moved to [`docs/commands/seed.md`](commands/seed.md).
 - **Line endings:** Write `\n` on POSIX, `\r\n` on Windows. Detect via `os.EOL`.
 - **File permissions:** Created rc files get `0644` on POSIX; on Windows, default ACLs.
 - **Terminal width:** Detect via `process.stdout.columns`; fall back to 80 if undefined.
-- **TTY detection:** Use `process.stdout.isTTY` to enable color and interactive prompts. Non-TTY (piped) output must be plain text and parseable.
+- **TTY detection:** Use `process.stdout.isTTY` to enable color (§3.4). Whether to prompt is never read off a stream directly: every command asks `terminal/inputMode.ts`, which also reads `PITHY_NONINTERACTIVE` and `--no-input` (§1.2). Non-TTY (piped) output must be plain text and parseable.
 
 ---
 

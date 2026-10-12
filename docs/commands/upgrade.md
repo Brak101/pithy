@@ -16,7 +16,7 @@ pithy upgrade [--env <env>] [--worker <name>] [--dry-run] [--migrate] [--package
 |---|---|---|---|
 | `--env <env>` | string | `dev` | Target environment — drives the pending-migration count, and any `--migrate` run. `dev`, `staging`, `prod`, or a custom name |
 | `--worker <name>` | string | — | Upgrade only this Worker. Default: every Worker under `apps/` |
-| `--dry-run` | boolean | `false` | Show the plan without writing anything |
+| `--dry-run` | boolean | `false` | Show the plan and write nothing |
 | `--migrate` | boolean | `false` | Run pending migrations after reconciling |
 | `--packages` | boolean | `false` | Move each `@pithy-sh/*` dependency to the newest version its range admits, and reinstall, before reconciling. Project-wide: refused beside `--worker` |
 | `--latest` | boolean | `false` | With `--packages`: move held packages across a breaking boundary to `latest`. Refused without `--packages` |
@@ -60,7 +60,17 @@ Over every composed capability, not only the ones with a missing binding — a p
 
 A dry run resolves no project name and proposes none, so nothing can be written. An apply resolves the name from the root `pithy.config.ts`, because a capability wired by `upgrade` must get the same `<project>-<env>-<binding>` resource name it would have got from `add`. With `--migrate`, the name is required and checked first, so a nameless project fails having written nothing rather than mid-fan-out.
 
-`upgrade` skips ejected capabilities, touches no Cloudflare account, and writes only config files, the Worker entry's Durable Object exports, and — with `--migrate` — the database for `--env`. With `--packages` it also writes the `package.json` files it moves and runs one install.
+**The Pithy block in `AGENTS.md` is refreshed too**, once per run, project-wide, after the Workers resolve — so `upgrade` in a directory that is not a project fails on that and writes nothing. The block is what `pithy init` writes for the agent working in the project (`docs/CLI.md` §1.5), and a newer CLI has newer things to say. Only the lines from `<!-- pithy:begin` through `<!-- pithy:end -->` are replaced; every byte outside them is left exactly as it was. A project scaffolded before the block existed gets it, appended after a blank line, or a new `AGENTS.md` holding it. A current block is not rewritten and gets no line. `--worker` does not narrow it, because the file is the project's. `--dry-run` says what it would do and writes nothing. Markers already there and broken — an open with no close, two blocks — and a symlinked `AGENTS.md` are refused and named, never guessed at, and the run's exit is unchanged by it. `CLAUDE.md` is never touched: its pointer is `init`'s, and a line you removed stays removed.
+
+```
+$ pithy upgrade
+AGENTS.md: Pithy block refreshed.
+board:
+  Nothing to upgrade.
+Done.
+```
+
+`upgrade` skips ejected capabilities, touches no Cloudflare account, and writes only config files, the Worker entry's Durable Object exports, the Pithy block in `AGENTS.md`, and — with `--migrate` — the database for `--env`. With `--packages` it also writes the `package.json` files it moves and runs one install.
 
 ## `--packages`
 
@@ -91,7 +101,7 @@ Done.
 
 **One install, at the root.** The rewritten manifests and the lockfile are one rollback scope: an install that fails puts every `package.json` and a text lockfile back byte for byte, and the run ends there. `bun.lockb` is binary and is not restored; `bun install` settles it. After the install, every moved package is read back from where its manifest resolves it. A package manager that resolved something else is a mismatch, named, and the run exits 1.
 
-**When `@pithy-sh/cli` itself moves, the reconcile waits.** The process running is the old CLI, and reconciling with its engine would write the old answer into a project that just asked for the new one. It says so, naming the project's own CLI through its package manager — `@pithy-sh/cli moved to 0.10.0. Run bun x pithy upgrade to reconcile with it.` — and exits 0. A bare `pithy` may be a global install, which is the old CLI.
+**When `@pithy-sh/cli` itself moves, the reconcile waits.** The process running is the old CLI, and reconciling with its engine would write the old answer into a project that just asked for the new one. So does the `AGENTS.md` block, for the same reason, and `agents` is absent from `--json`. It says so, naming the project's own CLI through its package manager — `@pithy-sh/cli moved to 0.10.0. Run bun x pithy upgrade to reconcile with it.` — and exits 0. A bare `pithy` may be a global install, which is the old CLI.
 
 **A registry that does not answer moves nothing.** Every packument is read before any is acted on, and one that fails or will not parse makes the step `unavailable`: nothing is written or installed, the reconcile still runs, and the exit is 1. A plan built from the packages that did answer would move half of a group that is released together.
 
@@ -121,12 +131,12 @@ One line, one object. The `workers` array carries a **plan** on a dry run and an
 
 ```
 $ pithy upgrade --dry-run --json
-{"command":"upgrade","env":"dev","dryRun":true,"workers":[{"state":"reconciled","worker":"board","deployedAs":"replay-board","env":"dev","perCapability":[{"name":"audit","missingBindings":[],"missingConfigKeys":[]},{"name":"auth","missingBindings":[],"missingConfigKeys":[]},{"name":"secrets","missingBindings":[],"missingConfigKeys":[]}],"ejectedSkipped":[],"ledger":{"state":"read","pending":1,"undeclared":[]},"entitlements":{"state":"read","gates":[]},"missingVersionMetadata":false}],"manifestFaults":[]}
+{"command":"upgrade","schemaVersion":1,"env":"dev","dryRun":true,"workers":[{"state":"reconciled","worker":"board","deployedAs":"replay-board","env":"dev","perCapability":[{"name":"audit","missingBindings":[],"missingConfigKeys":[]},{"name":"auth","missingBindings":[],"missingConfigKeys":[]},{"name":"secrets","missingBindings":[],"missingConfigKeys":[]}],"ejectedSkipped":[],"ledger":{"state":"read","pending":1,"undeclared":[]},"entitlements":{"state":"read","gates":[]},"missingVersionMetadata":false}],"manifestFaults":[],"agents":{"path":"AGENTS.md","state":"updated","reason":null},"plan":{"files":[{"path":"AGENTS.md","action":"edit","changes":["Refreshes the Pithy block. Nothing outside it changes."]}],"resources":[],"migrations":[],"secrets":[],"data":[],"notes":["board: 1 migration pending on dev. pithy upgrade --migrate applies them."]}}
 ```
 
 ```
 $ pithy upgrade --json
-{"command":"upgrade","env":"dev","dryRun":false,"workers":[{"state":"reconciled","worker":"board","deployedAs":"replay-board","perCapability":[],"ejectedSkipped":[],"migrated":false,"migrations":[],"addedVersionMetadata":false}],"manifestFaults":[]}
+{"command":"upgrade","schemaVersion":1,"env":"dev","dryRun":false,"workers":[{"state":"reconciled","worker":"board","deployedAs":"replay-board","perCapability":[],"ejectedSkipped":[],"migrated":false,"migrations":[],"addedVersionMetadata":false}],"manifestFaults":[],"agents":{"path":"AGENTS.md","state":"unchanged","reason":null}}
 ```
 
 ### The envelope
@@ -134,6 +144,7 @@ $ pithy upgrade --json
 | key | type | meaning |
 |---|---|---|
 | `command` | `"upgrade"` | The command that produced the line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `env` | string | The environment the run targeted — the validated `--env` |
 | `dryRun` | boolean | Whether `--dry-run` was passed. **This is what says which shape `workers` carries** |
 | `workers` | array | One entry per Worker in scope, in discovery order. A plan when `dryRun` is true, an applied result otherwise |
@@ -142,6 +153,21 @@ $ pithy upgrade --json
 | `manifestFaults[].package` | string | The package the manifest was read from, as an adopter names it: `@pithy-sh/audit` |
 | `manifestFaults[].reason` | string | Why it could not be used — the schema's refusal text, or the errno where the file would not open |
 | `packages` | object | Present only with `--packages`. What the package step did — below |
+| `agents` | object | The Pithy block in `AGENTS.md`. Absent only when `--packages` moved `@pithy-sh/cli`, which leaves the block to the new CLI |
+| `agents.path` | string | `"AGENTS.md"`, relative to the project root |
+| `agents.state` | `"added"` \| `"updated"` \| `"unchanged"` \| `"refused"` | `added` — there was no block, and now there is. `updated` — the block was stale and was rewritten in place. `unchanged` — already current, and the file was not written. `refused` — not written, and `reason` says why; the exit is unchanged by it. On a dry run, what a write would do |
+| `agents.reason` | string or `null` | Why it was refused, in one line that never quotes the file. `null` otherwise |
+| `plan` | object | Present only under `--dry-run`: the same run, in the shape every `--dry-run` shares (`docs/CLI.md` §1.2) — below |
+| `next` | object[] | `[{ command, why }]`, the step this run left required: the project's own CLI's `upgrade` through its package manager (`bun x pithy upgrade`) when `--packages` moved `@pithy-sh/cli` and the reconcile was left to it, otherwise `pithy migrate --env <env>` for the migrations it counted and did not run without `--migrate`. Absent otherwise — under `--dry-run`, on a failed run — and never empty (`docs/CLI.md` §1.2) |
+
+### `plan`
+
+`workers` is the reconcile's own report and keeps its shape; `plan` says the same run the way every other dry run says it, so an agent reading `pithy add --dry-run` reads this with the same parser. It is built from what the run already read, and adds no second reading of the project.
+
+- **`files`** — one `edit` per file the apply would write, each with a sentence per change: every binding a Worker's `wrangler.jsonc` gains, by name, type and stanza; every key its `pithy.config.ts` gains; the Durable Object exports its entry gains; `version_metadata`; each `--packages` move in its manifest; and `AGENTS.md`, `create` when the file is not there yet. No diffs: the reconcile plan names the binding and the key, and the bytes are written by the apply a dry run does not reach.
+- **`notes`** — what the run would do that a file entry cannot say, and what it would refuse: the reinstall after a package move, each Worker's pending migrations by count (`--migrate` applies them; without it they are named, not run), and a required option with no default, which stops the apply.
+
+A Worker that could not be planned, or was refused, contributes nothing to `plan`; its entry in `workers` says why.
 
 ### `packages`
 
@@ -259,7 +285,7 @@ Every *other* Worker still reports in full. A run that loses four Workers' repor
 
 ## Errors
 
-Each one is a `PithyError`: the problem, then the action. Under `--json` it is a single `{"error":{…}}` line on stderr and exit 1.
+Each one is a `PithyError`: the problem, then the action. Under `--json` it is a single `{"error":{…}}` line on stderr, with `exit`, `retryable` and, where the cause is known, `fix`, and the process exits by its kind — 2 for a call to fix, 3 for something to set up first, 4 to retry, 5 for a person (`docs/CLI.md` §3.8).
 
 **An environment that does not exist.** Validated at the flag, before anything is read.
 

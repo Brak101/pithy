@@ -6,8 +6,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { InternalError, PithyError } from "@pithy-sh/core/src/error/pithyError";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { exitCodeOf } from "../terminal/exitClass";
 import { NO_PROVISION_ARG } from "./effectiveConfig";
-import { readOptionalWranglerConfig, readWranglerConfig, runWrangler, workerEntryPath } from "./wrangler";
+import {
+  readOptionalWranglerConfig,
+  readWranglerConfig,
+  refusesTheRun,
+  runWrangler,
+  WranglerCredentialsError,
+  workerEntryPath,
+} from "./wrangler";
 
 /** Use `node` as the binary so these run without wrangler installed. */
 const NODE = "node";
@@ -167,6 +175,22 @@ describe("runWrangler", () => {
   });
 
   /**
+   * **wrangler's color stops at the capture (#697).** Its `✘ [ERROR]` is red and its links are OSC 8, and the
+   * captured output is what a `--json` payload carries as a failure's `detail` and a deploy row's `error`. The
+   * encoder writes every value faithfully, so the noise is taken out here, where it is known to be a terminal's.
+   */
+  test("the captured output in detail carries no terminal control sequence", async () => {
+    const error = (await runWrangler(
+      await standIn(
+        "process.stderr.write('\\u001b[31m\\u2718 [ERROR]\\u001b[0m boom \\u001b]8;;https://x.dev\\u001b\\\\docs\\u001b]8;;\\u001b\\\\\\n'); process.exit(1)",
+      ),
+      { account: null, bin: NODE },
+    ).catch((e: unknown) => e)) as PithyError;
+    expect(error.payload.detail).toBe("exit 1\n\u2718 [ERROR] boom docs");
+    expect(error.payload.message).not.toContain("\u001b");
+  });
+
+  /**
    * **wrangler's own reason is on screen, not only in its log file** (#645). A failed deploy printed
    * `wrangler deploy failed.` and nothing else; the one line that said why — `Could not resolve
    * "@pithy-sh/ledger/src/ledger"` — was in `~/.wrangler/logs`. The error block is lifted into the message,
@@ -205,6 +229,46 @@ describe("runWrangler", () => {
     ]);
     // Everything wrangler said is still in `detail`, for the log.
     expect(error.payload.detail).toContain("Logs were written to");
+  });
+
+  /**
+   * **Cloudflare refusing the credentials is a precondition, exit 3, not an unclassified 1 (#697).** The call
+   * was right; what it depends on is a token Cloudflare will take. Three spellings, each one wrangler 4.125.0
+   * itself treats as authentication: API codes 10000 and 9106 (`AUTHENTICATION_ERROR_CODES`), and the refusal
+   * it raises before any request when no token is set and nobody can log in. No `fix`: a token is minted in
+   * the dashboard, which `pithy doctor` says too.
+   */
+  test.each([
+    ["an API token Cloudflare rejected", "Authentication error [code: 10000]"],
+    ["no Authorization header at all", "Missing X-Auth-Key, X-Auth-Email or Authorization headers [code: 9106]"],
+    [
+      "no token where nobody can log in",
+      "In a non-interactive environment, it's necessary to set a CLOUDFLARE_API_TOKEN environment variable for wrangler to work.",
+    ],
+  ])("%s is a credentials refusal, exit 3", async (_, line) => {
+    const printed = `\u001b[31m\u2718 \u001b[41;31m[\u001b[41;97mERROR\u001b[41;31m]\u001b[0m A request to the Cloudflare API failed.\n  ${line}\n`;
+    const error = (await runWrangler(
+      await standIn(`process.stderr.write(${JSON.stringify(printed)}); process.exit(1)`),
+      { account: null, bin: NODE },
+    ).catch((e: unknown) => e)) as PithyError;
+    expect(error).toBeInstanceOf(WranglerCredentialsError);
+    expect(refusesTheRun(error)).toBe(true);
+    expect(error.payload.code).toBe("core/precondition_failed");
+    expect(exitCodeOf(error.payload)).toBe(3);
+    expect(error.payload.message.split("\n")[0]).toMatch(/ failed\.$/);
+    expect(error.payload.action).toBe(
+      "Cloudflare refused the credentials. Run pithy doctor to see whether the token or the account is wrong.",
+    );
+  });
+
+  test("another failure that mentions a code is not a credentials refusal", async () => {
+    const error = (await runWrangler(
+      await standIn("console.error('A request failed. Unknown error [code: 10013]'); process.exit(1)"),
+      { account: null, bin: NODE },
+    ).catch((e: unknown) => e)) as PithyError;
+    expect(error).toBeInstanceOf(InternalError);
+    expect(refusesTheRun(error)).toBe(false);
+    expect(exitCodeOf(error.payload)).toBe(1);
   });
 
   test("a failure with no error block keeps the one-line message it always had", async () => {
@@ -314,7 +378,10 @@ describe("runWrangler", () => {
       account: null,
       bin: "pithy-no-such-binary-xyz",
     }).catch((e: unknown) => e)) as PithyError;
-    expect(error).toBeInstanceOf(InternalError);
+    // A program that is not there is a precondition, exit 3, and every Worker's (#697).
+    expect(error.payload.code).toBe("core/precondition_failed");
+    expect(exitCodeOf(error.payload)).toBe(3);
+    expect(refusesTheRun(error)).toBe(true);
     expect(error.payload.action).toContain("installed");
   });
 
@@ -330,7 +397,7 @@ describe("runWrangler", () => {
         env: { PATH: join(project, "nothing-here") },
       }).catch((e: unknown) => e)) as PithyError;
 
-      expect(error).toBeInstanceOf(InternalError);
+      expect(error.payload.code).toBe("core/precondition_failed");
       expect(error.payload.action).toContain("bun");
       expect(error.payload.action).not.toContain("Is wrangler installed");
       expect(error.payload.detail).toContain("spawning bun");

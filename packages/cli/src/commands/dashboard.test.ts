@@ -7,19 +7,23 @@ import { controlplane } from "@pithy-sh/core/src/controlPlane/capability";
 import { PithyError } from "@pithy-sh/core/src/error/pithyError";
 import { blankComments } from "@pithy-sh/core/src/text/comments";
 import { type ArgsDef, type CommandDef, parseArgs } from "citty";
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { readSource } from "../ci/sourceFiles";
 import { authorizeDashboard } from "../dashboard/connect";
 import type { DashboardClient, DeviceAuthorization } from "../dashboard/contract";
 import { defaultGrant, grantableScopes } from "../dashboard/grant";
 import { OPEN_PROMPT, offerToOpen } from "../platform/browser";
+import { latchInputMode } from "../terminal/inputMode";
 import type { KeyStream } from "../terminal/keys";
 import { readKeys } from "../terminal/keys";
+import { expectConforms } from "../test-utils/payloadContract";
 import dashboard, {
   announceFor,
   collectScopeFlags,
+  confirmOrRefuse,
   formatConnectReport,
   formatDisconnectReport,
+  formatRevokeKeyReport,
   formatRotateReport,
   formatStatusReport,
   offerIsAnswerable,
@@ -593,5 +597,220 @@ describe("the offer to open the approval page", () => {
 
     expect(token).toBe("ct_1");
     expect(lines).toContain("spawn xdg-open ENOENT");
+  });
+});
+
+/**
+ * **`--yes` answers the two confirmations, and a run that may not ask must pass it (#697).**
+ *
+ * `disconnect` and `revoke-key` each confirm at a terminal, and each used to proceed in silence whenever no
+ * terminal was attached — so `PITHY_NONINTERACTIVE=1`, the switch that means *do not ask me*, quietly
+ * meant *yes*. A confirmation's own default is no, so a run that cannot ask has no default to take: it
+ * fails `input/required`, naming `--yes`, before the registry is opened.
+ */
+describe("the --yes confirmations", () => {
+  const tty = { stdin: process.stdin.isTTY, stdout: process.stdout.isTTY };
+  afterEach(() => {
+    latchInputMode(false);
+    process.stdin.isTTY = tty.stdin;
+    process.stdout.isTTY = tty.stdout;
+    vi.restoreAllMocks();
+  });
+
+  /** Attach a terminal on both ends a prompt uses, so only the latch or `--json` can forbid. */
+  function attachTerminal(): void {
+    process.stdin.isTTY = true;
+    process.stdout.isTTY = true;
+  }
+
+  const question = { message: "Revoke key k1 on prod?", action: "Pass --yes to revoke it without asking." };
+
+  test("--yes answers it: nothing is asked and nothing refused", async () => {
+    latchInputMode(true);
+    const ask = vi.fn(async () => {});
+    await expect(confirmOrRefuse({ ...question, json: true, yes: true, ask })).resolves.toBeUndefined();
+    expect(ask).not.toHaveBeenCalled();
+  });
+
+  test("at a terminal, with nothing forbidding it, the person is asked", async () => {
+    attachTerminal();
+    const ask = vi.fn(async () => {});
+    await confirmOrRefuse({ ...question, json: false, yes: false, ask });
+    expect(ask).toHaveBeenCalledOnce();
+  });
+
+  test.each([
+    ["PITHY_NONINTERACTIVE or --no-input", true, false],
+    ["--json", false, true],
+  ])("under %s, without --yes, it fails input/required naming --yes", async (_name, latched, json) => {
+    attachTerminal();
+    latchInputMode(latched);
+    const ask = vi.fn(async () => {});
+    const failure = await confirmOrRefuse({ ...question, json, yes: false, ask }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PithyError);
+    expect((failure as PithyError).payload).toMatchObject({ code: "input/required", flag: "--yes", ...question });
+    expect(ask).not.toHaveBeenCalled();
+  });
+
+  test("with no terminal at all, without --yes, it is refused rather than taken as yes", async () => {
+    process.stdin.isTTY = false;
+    process.stdout.isTTY = false;
+    const failure = await confirmOrRefuse({ ...question, json: false, yes: false, ask: async () => {} }).catch(
+      (error: unknown) => error,
+    );
+    expect((failure as PithyError).payload).toMatchObject({ code: "input/required", flag: "--yes" });
+  });
+
+  /**
+   * The command, not just the helper: run each subcommand in-process with input forbidden and a terminal
+   * attached, and read the refusal it reports. The gate is the first thing the body does, so nothing here
+   * reaches a registry — a command that skipped it would fail on the missing project instead.
+   */
+  test.each([
+    ["disconnect", { env: "prod", yes: false, local: true }, "Disconnect the management client from prod?"],
+    ["revoke-key", { env: "prod", yes: false, "key-id": "k1" }, "Revoke key k1 on prod?"],
+  ])("%s refuses under the switch, naming --yes, before it opens anything", async (name, args, message) => {
+    attachTerminal();
+    latchInputMode(true);
+    const written: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      written.push(String(chunk));
+      return true;
+    });
+    vi.spyOn(process, "exit").mockImplementation((code) => {
+      throw new Error(`exit ${code}`);
+    });
+    const run = subCommands()[name]?.run;
+    await expect(
+      run?.({ args: { ...args, json: true, open: false, _: [] }, rawArgs: [], cmd: {} } as never),
+    ).rejects.toThrow(/^exit /);
+    const line = JSON.parse(written.join("").trim()) as { error: Record<string, unknown> };
+    expect(line.error).toMatchObject({ code: "input/required", flag: "--yes", message });
+  });
+});
+
+/**
+ * Every subcommand's `--json` line, written by the function each one writes it with, held to the schema
+ * `pithy schema dashboard` publishes (#697). The device flow and the D1 registry are the other half of
+ * these commands and have their own suites; what is asserted here is the line an agent parses.
+ */
+describe("pithy dashboard --json conforms to its published payloads", () => {
+  const id = "5f1f1c3e-6b2a-4d9f-8f2a-1c9d0e5b7a31";
+
+  test("connect, proven and not", async () => {
+    const report = {
+      environment: "prod",
+      connectionId: id,
+      issuer: "https://app.pithy.sh",
+      workerUrl: "https://api.example.com",
+      scopes: ["manifest:read"],
+      keyId: "key_1",
+      status: "connected" as const,
+      updated: false,
+    };
+    await expectConforms("dashboard connect", () => formatConnectReport(report, { json: true }));
+    await expectConforms("dashboard connect", () =>
+      formatConnectReport(
+        { ...report, status: "unreachable", detail: "Nothing answered.", keyId: null, updated: true },
+        { json: true },
+      ),
+    );
+  });
+
+  test("rotate", async () => {
+    const report = { environment: "prod", connectionId: id, keyId: "key_2", previousKeyIds: ["key_1"] };
+    await expectConforms("dashboard rotate", () =>
+      formatRotateReport({ ...report, status: "connected" }, { json: true }),
+    );
+    await expectConforms("dashboard rotate", () =>
+      formatRotateReport({ ...report, status: "needs_reconnect", detail: "No answer." }, { json: true }),
+    );
+  });
+
+  test("disconnect", async () => {
+    await expectConforms("dashboard disconnect", () =>
+      formatDisconnectReport(
+        { environment: "prod", connectionId: null, removed: false, dashboardNotified: false },
+        { json: true },
+      ),
+    );
+    await expectConforms("dashboard disconnect", () =>
+      formatDisconnectReport(
+        { environment: "prod", connectionId: id, removed: true, dashboardNotified: false, detail: "Offline." },
+        { json: true },
+      ),
+    );
+  });
+
+  test("revoke-key, with the connection it left and with none", async () => {
+    const connection = {
+      id,
+      environment: "prod",
+      issuer: "https://app.pithy.sh",
+      workerUrl: "https://api.example.com",
+      basePath: "/control-plane",
+      managementOrigin: null,
+      scopes: ["manifest:read"],
+      keys: [
+        {
+          keyId: "key_1",
+          publicKey: JWK,
+          validFrom: new Date("2026-01-01T00:00:00Z"),
+          validUntil: null,
+          revokedAt: new Date("2026-02-01T00:00:00Z"),
+        },
+      ],
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+      updatedAt: new Date("2026-02-01T00:00:00Z"),
+    };
+    await expectConforms("dashboard revoke-key", () =>
+      formatRevokeKeyReport({ environment: "prod", keyId: "key_1", revoked: true, connection }, { json: true }),
+    );
+    await expectConforms("dashboard revoke-key", () =>
+      formatRevokeKeyReport({ environment: "prod", keyId: "nope", revoked: false, connection: null }, { json: true }),
+    );
+  });
+
+  test("status, connected and not", async () => {
+    await expectConforms("dashboard status", () =>
+      formatStatusReport(
+        {
+          environment: "prod",
+          connected: true,
+          connectionId: id,
+          issuer: "https://app.pithy.sh",
+          workerUrl: "https://api.example.com",
+          scopes: ["manifest:read"],
+          keys: [
+            {
+              keyId: "key_1",
+              live: true,
+              ageDays: 3,
+              validFrom: "2026-01-01T00:00:00.000Z",
+              validUntil: null,
+              revokedAt: null,
+            },
+          ],
+          status: "unverified",
+        },
+        { json: true },
+      ),
+    );
+    await expectConforms("dashboard status", () =>
+      formatStatusReport(
+        {
+          environment: "dev",
+          connected: false,
+          connectionId: null,
+          issuer: null,
+          workerUrl: null,
+          scopes: [],
+          keys: [],
+          status: "unreachable",
+          detail: "Nothing answered.",
+        },
+        { json: true },
+      ),
+    );
   });
 });

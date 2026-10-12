@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { basename } from "node:path";
+import { z } from "zod";
 import type { WorkerTarget } from "./workers";
 
 /**
@@ -37,14 +38,26 @@ import type { WorkerTarget } from "./workers";
  * unrelated, and a prefix strip turns `board`/`board-worker` into nonsense. The directory is a fact on
  * disk; the deployed name is a string in a config file.
  */
-export interface WorkerIdentity {
-  /** The `apps/` directory. What `--worker` names, and what sibling paths are relative to. */
-  worker: string;
-  /** The deployed script name, from `wrangler.jsonc`. What Cloudflare shows. */
-  deployedAs: string;
-}
+export const WorkerIdentity = z
+  .object({
+    worker: z
+      .string()
+      .describe("The Worker's `apps/` directory. What `--worker` names, and what sibling paths are relative to."),
+    deployedAs: z.string().describe("The Worker's deployed script name, from `wrangler.jsonc`. What Cloudflare shows."),
+  })
+  .describe("Both names of one Worker: its directory and its deployed script.");
+export type WorkerIdentity = z.infer<typeof WorkerIdentity>;
 
 /** Both names for `target`, for a `--json` payload. */
 export function workerIdentity(target: Pick<WorkerTarget, "name" | "dir">): WorkerIdentity {
   return { worker: basename(target.dir), deployedAs: target.name };
+}
+
+/**
+ * A Worker as `--worker` is documented to take it, and as every `Known:` list and `choices` names it: the
+ * apps/ directory (#697). The deployed script name resolves too, but it is not what a remedy names — a Worker
+ * whose `wrangler.jsonc` says `demo-api` is still `apps/api`.
+ */
+export function workerDirName(worker: { dir: string }): string {
+  return basename(worker.dir);
 }

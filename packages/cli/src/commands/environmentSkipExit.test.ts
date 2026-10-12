@@ -17,7 +17,9 @@ import type { CommandDef } from "citty";
 import { beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import { scaffoldProject } from "../project/scaffold";
 import { readWranglerConfig, writeWranglerConfig } from "../project/wrangler";
+import { EXIT } from "../terminal/exitClass";
 import { linkKitPackages } from "../test-utils/linkKit";
+import { expectConforms } from "../test-utils/payloadContract";
 
 /**
  * **Requirement 4 of pithy-sh/pithy#512, driven rather than grepped: a run in which every environment was
@@ -478,10 +480,10 @@ describe("a run in which every environment was skipped", () => {
     expect(fanOutCommands()).toEqual(["email", "media", "payments", "storage", "support", "testers"]);
   });
 
-  test.each(fanOutCommands())("pithy %s provision exits 1 and names every skipped environment", async (command) => {
+  test.each(fanOutCommands())("pithy %s provision exits 3 and names every skipped environment", async (command) => {
     const run = await runProvision(command, false);
 
-    expect(run.exitCode).toBe(1);
+    expect(run.exitCode).toBe(EXIT.precondition);
     expect(run.stdout).toContain(
       "  staging  skipped — env.staging has no DB database_id. Run pithy provision --env staging.",
     );
@@ -501,14 +503,16 @@ describe("a run in which every environment was skipped", () => {
     async (command) => {
       const run = await runProvision(command, true);
 
-      expect(run.exitCode).toBe(1);
+      expect(run.exitCode).toBe(EXIT.precondition);
       const report = JSON.parse(run.stdout) as { command: string; skippedEnvironments: { env: string }[] };
       expect(report.command).toBe(`${command} provision`);
       // Per-environment structure, not one aggregate — the report must answer "did production get its worker".
       expect(report.skippedEnvironments.map((entry) => entry.env)).toEqual(["staging", "prod"]);
       const failure = JSON.parse(run.stderr) as { error: { code: string; message: string } };
-      expect(failure.error.code).toBe("validation/invalid_input");
+      expect(failure.error.code).toBe("core/precondition_failed");
       expect(failure.error.message).toBe("No environment is ready — staging and prod have no DB database_id.");
+      // The command that rights it, runnable as written (#697).
+      expect((failure.error as { fix?: string }).fix).toBe("pithy provision --env staging --yes");
     },
   );
 
@@ -527,6 +531,16 @@ describe("a run in which every environment was skipped", () => {
    * Requirement 3, at the command level rather than at the orchestrator's: the project-global resource is
    * created on the first run however many environments skip. It must not wait for prod.
    */
+  /** The line is still the published shape when it carries nothing but skips (#697). */
+  test("every all-skipped provision --json line conforms to its published payload", async () => {
+    await expectConforms("email provision", (await runProvision("email", true)).stdout);
+    await expectConforms("media provision", (await runProvision("media", true)).stdout);
+    await expectConforms("payments provision", (await runProvision("payments", true)).stdout);
+    await expectConforms("storage provision", (await runProvision("storage", true)).stdout);
+    await expectConforms("support provision", (await runProvision("support", true)).stdout);
+    await expectConforms("testers provision", (await runProvision("testers", true)).stdout);
+  });
+
   test("email provision still creates the suppression database, and makes no routing rule", async () => {
     await runProvision("email", false);
 
@@ -593,6 +607,16 @@ describe("a run in which one environment was ready", () => {
     expect(report.command).toBe(`${command} provision`);
     expect(report.skippedEnvironments.map((entry) => entry.env)).toEqual(["prod"]);
     expect(run.stderr).toBe("");
+  });
+
+  /** Each one held to the schema `pithy schema` publishes for it (#697), from this real run. */
+  test("every provision --json line conforms to its published payload", async () => {
+    await expectConforms("email provision", (await runProvision("email", true)).stdout);
+    await expectConforms("media provision", (await runProvision("media", true)).stdout);
+    await expectConforms("payments provision", (await runProvision("payments", true)).stdout);
+    await expectConforms("storage provision", (await runProvision("storage", true)).stdout);
+    await expectConforms("support provision", (await runProvision("support", true)).stdout);
+    await expectConforms("testers provision", (await runProvision("testers", true)).stdout);
   });
 
   test("support provision deploys staging and makes the routing rule", async () => {
@@ -714,7 +738,7 @@ describe("a --worker that does not compose the capability", () => {
 
       const run = await runProvision(command, true, { worker: "web" });
 
-      expect(run.exitCode).toBe(1);
+      expect(run.exitCode).toBe(EXIT.usage);
       const failure = JSON.parse(run.stderr) as { error: { message: string } };
       expect(failure.error.message).toBe(`web does not compose the ${command} capability.`);
       expect(recorded.calls).toEqual([]);

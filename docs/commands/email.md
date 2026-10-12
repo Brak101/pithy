@@ -103,6 +103,7 @@ One line, one object. The `command` field is the space-separated subcommand name
 | key | type | meaning |
 |---|---|---|
 | `command` | `"email provision"` | The subcommand that produced this line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `suppressionDatabaseId` | string | The D1 id of the project's shared suppression database, created or reused |
 | `environments` | array of `"staging" \| "prod"` | The environments an email worker was deployed for |
 | `skippedEnvironments` | `object[]` | One entry per environment nothing was provisioned for |
@@ -113,13 +114,14 @@ One line, one object. The `command` field is the space-separated subcommand name
 | `routing.created` | boolean | True only when this run created the rule. False when it already existed |
 | `routing.skipped` | boolean | True when the routing flags were absent or incomplete, or when no environment was ready, so no rule was made |
 
-When **every** environment was skipped the line above is still written to stdout — the per-environment structure is the answer, and losing it to the error line would make `--json` less use than the text — and an `{"error":…}` line follows on stderr with exit 1.
+When **every** environment was skipped the line above is still written to stdout — the per-environment structure is the answer, and losing it to the error line would make `--json` less use than the text — and an `{"error":…}` line follows on stderr with exit 3 and its `fix`.
 
 `pithy email deprovision`
 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"email deprovision"` | The subcommand that produced this line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `env` | string | The one environment torn down — the value of `--env` |
 | `suppressionDeleted` | boolean | Whether `--suppression` was passed, and therefore whether the shared suppression database was deleted |
 
@@ -128,18 +130,19 @@ When **every** environment was skipped the line above is still written to stdout
 | key | type | meaning |
 |---|---|---|
 | `command` | `"email test"` | The subcommand that produced this line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `template` | string | The template id that was rendered — the value of `--template` |
 | `to` | string | The recipient the sample was sent to |
 | `from` | string | The address it was sent from: `--from` when given, otherwise the configured `fromAddress` |
 | `messageId` | string | The id Cloudflare assigned the message. **Absent from the line** when the API returned none — the key is omitted rather than emitted as null |
 
-A failing run writes `{"error":{…}}` to stderr instead and exits 1 — the same public payload the HTTP surface encodes, with `detail` stripped.
+A failing run writes `{"error":{…}}` to stderr instead and exits by its kind (`docs/CLI.md` §3.8) — the same public payload the HTTP surface encodes, with `detail` stripped, plus `exit`, `retryable` and, where the cause is known, `fix`.
 
 ## Errors
 
 Each is a `PithyError`: the problem, then the action.
 
-**The capability is not configured.** No Worker's `pithy.config.ts` composes `email`.
+**The capability is not configured.** No Worker's `pithy.config.ts` composes `email`. It is `core/precondition_failed`, exit 3. With one Worker its `fix` is `pithy add email --with-prerequisites` — email declares `secrets` — and with several there is no `fix`, because nothing says which Worker should compose it (`docs/CLI.md` §3.8).
 
 ```
 The email capability is not configured.
@@ -160,13 +163,13 @@ The CF Secrets Store id is missing.
 Run pithy add secrets to record SECRETS_STORE_ID (the email worker binds its link-signing key from it).
 ```
 
-**The project has no name.** The suppression database is found by name and reused, so a guessed name would adopt another project's opt-out list.
+**The project has no name.** The suppression database is found by name and reused, so a guessed name would adopt another project's opt-out list. It is `core/precondition_failed`, exit 3: the call is right and the project is missing what it depends on.
 
 ```
 pithy.config.ts has no `name`.
 ```
 
-**No environment is ready.** Nothing was provisioned, so this exits 1 rather than reporting a success for a run that did nothing. A run where *some* environment was ready exits 0 and reports the rest as skipped.
+**No environment is ready.** Nothing was provisioned, so this exits 3, `core/precondition_failed`, with `pithy provision --env <first> --yes` as its `fix`, rather than reporting a success for a run that did nothing. A run where *some* environment was ready exits 0 and reports the rest as skipped.
 
 ```
 No environment is ready — staging and prod have no DB database_id.
@@ -221,7 +224,7 @@ Production is untouched — no worker, no resources, exit 0. Run `pithy provisio
 
 ```
 $ pithy email provision --routing-zone 0a1b2c3d --inbound-address bounce@bounce.example.com --app-worker acme-prod --json
-{"command":"email provision","suppressionDatabaseId":"3f7c…","environments":["staging"],"skippedEnvironments":[{"env":"prod","reason":"env.prod has no DB database_id.","action":"Run pithy provision --env prod."}],"routing":{"created":true,"skipped":false}}
+{"command":"email provision","schemaVersion":1,"suppressionDatabaseId":"3f7c…","environments":["staging"],"skippedEnvironments":[{"env":"prod","reason":"env.prod has no DB database_id.","action":"Run pithy provision --env prod."}],"routing":{"created":true,"skipped":false}}
 ```
 
 Send yourself the magic-link template as your project renders it:
@@ -234,12 +237,12 @@ Done.
 
 ```
 $ pithy email test --to sam@example.com --template magicLink --json
-{"command":"email test","template":"magicLink","to":"sam@example.com","from":"hello@acme.com","messageId":"msg-4821"}
+{"command":"email test","schemaVersion":1,"template":"magicLink","to":"sam@example.com","from":"hello@acme.com","messageId":"msg-4821"}
 ```
 
 Take staging's worker down and keep the opt-out list:
 
 ```
 $ pithy email deprovision --env staging --json
-{"command":"email deprovision","env":"staging","suppressionDeleted":false}
+{"command":"email deprovision","schemaVersion":1,"env":"staging","suppressionDeleted":false}
 ```
