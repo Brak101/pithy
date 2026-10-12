@@ -1,13 +1,16 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { Plan } from "./plan/plan";
+import { EXIT } from "./terminal/exitClass";
+import { expectConforms } from "./test-utils/payloadContract";
 
 const run = promisify(execFile);
 const bin = join(import.meta.dirname, "bin.ts");
@@ -195,14 +198,15 @@ let refusing: Awaited<ReturnType<typeof fakeCloudflare>>;
 /** Run the real CLI in the scaffolded project, and give back both streams and the exit code. */
 async function cli(
   args: string[],
-  options: { baseUrl: string } = { baseUrl: "" },
+  options: { baseUrl: string; credentials?: boolean } = { baseUrl: "" },
 ): Promise<{ code: number; stdout: string; stderr: string }> {
+  const credentials = options.credentials ?? true;
   const env = {
     ...process.env,
     // Never the operator's own. This directory holds live Cloudflare credentials on a real machine.
     PITHY_CONFIG_DIR: config,
-    CLOUDFLARE_ACCOUNT_ID: "acct-replay",
-    CLOUDFLARE_API_TOKEN: "cfat-fake",
+    CLOUDFLARE_ACCOUNT_ID: credentials ? "acct-replay" : "",
+    CLOUDFLARE_API_TOKEN: credentials ? "cfat-fake" : "",
     CLOUDFLARE_BASE_URL: options.baseUrl,
     REPLAY_ROLL_LOG: join(dir, ROLL_LOG),
     REPLAY_ISSUED_LOG: join(dir, ISSUED_LOG),
@@ -217,6 +221,34 @@ async function cli(
 }
 
 /** Every line the rotator has issued so far. Empty when it has never been called. */
+/** The same run as {@link cli}, with `input` piped to stdin — how a value reaches `create` and `update` unprompted. */
+function cliWithInput(
+  args: string[],
+  input: string,
+  options: { baseUrl: string },
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const env = {
+    ...process.env,
+    PITHY_CONFIG_DIR: config,
+    CLOUDFLARE_ACCOUNT_ID: "acct-replay",
+    CLOUDFLARE_API_TOKEN: "cfat-fake",
+    CLOUDFLARE_BASE_URL: options.baseUrl,
+  };
+  return new Promise((done) => {
+    const child = spawn("bun", [bin, ...args], { cwd: app, env, stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    child.on("close", (code) => done({ code: code ?? 1, stdout, stderr }));
+    child.stdin.end(input);
+  });
+}
+
 async function issued(): Promise<string[]> {
   return readFile(join(dir, ISSUED_LOG), "utf8")
     .then((text) => text.split("\n").filter(Boolean))
@@ -337,6 +369,44 @@ describe("pithy secrets rotate, with the real binary", () => {
     expect(refusing.dispatched.length).toBe(dispatches);
   }, 60_000);
 
+  test("a dry run under --json carries the shared plan, and still reaches nothing (#697)", async () => {
+    const before = await rolls();
+    const dispatches = refusing.dispatched.length;
+    const result = await cli(
+      ["secrets", "rotate", "REPLAY_PROVIDER_TOKEN", "--env", "prod", "--dry-run", "--json"],
+      refusing,
+    );
+    expect(result.code).toBe(0);
+    await expectConforms("secrets rotate", result.stdout);
+    const payload = JSON.parse(result.stdout.trim()) as { dryRun: boolean; plan: Plan };
+    expect(payload.dryRun).toBe(true);
+    expect(Plan.parse(payload.plan).secrets).toEqual([
+      { name: "REPLAY_PROVIDER_TOKEN", env: "prod", action: "rotate", where: expect.any(String) },
+    ]);
+    expect(payload.plan.notes[0]).toBe("Rolls the credential at its issuer first, then stores the new value.");
+    expect(await rolls()).toBe(before);
+    expect(refusing.dispatched.length).toBe(dispatches);
+  }, 60_000);
+
+  /**
+   * **A dry run makes the refusals the run makes before it rolls (`docs/CLI.md` §1.2).** It reaches no account,
+   * so it cannot ask a store whether it would take the value — but missing credentials are read off this
+   * machine, the run refuses on them before the issuer is called, and a plan for a run that would be refused
+   * is a promise nobody can keep.
+   */
+  test("a dry run with no credentials is refused as the run is, and reaches nothing", async () => {
+    const before = await rolls();
+    const args = ["secrets", "rotate", "REPLAY_PROVIDER_TOKEN", "--env", "prod", "--json"];
+    const planned = await cli([...args, "--dry-run"], { baseUrl: refusing.baseUrl, credentials: false });
+    const real = await cli(args, { baseUrl: refusing.baseUrl, credentials: false });
+    expect(planned.stdout).toBe("");
+    expect(planned.code).toBe(EXIT.precondition);
+    const error = (JSON.parse(planned.stderr.trim()) as { error: { code: string; message: string } }).error;
+    expect(error).toMatchObject({ code: "core/precondition_failed", message: "Cloudflare credentials are missing." });
+    expect(error).toEqual((JSON.parse(real.stderr.trim()) as { error: unknown }).error);
+    expect(await rolls()).toBe(before);
+  }, 60_000);
+
   /**
    * **The reason this file exists.**
    *
@@ -361,8 +431,9 @@ describe("pithy secrets rotate, with the real binary", () => {
     expect(result.stderr).toContain("pithy secrets update REPLAY_PROVIDER_TOKEN --env prod");
     // The declaration's own documentation URL, composed rather than guessed.
     expect(result.stderr).toContain("https://developers.cloudflare.com/api/resources/user/");
-    // 3, not 1. `1` means the previous credential is still live; this state is the one thing that is not.
-    expect(result.code).toBe(3);
+    // 5, not 1. `1` means the previous credential is still live; this state is the one thing that is not,
+    // and no automated retry fixes it — a person has to (#697).
+    expect(result.code).toBe(EXIT.person);
     // **One roll against three store attempts.** A second here is the defect the retry was meant to
     // prevent, arriving by way of the retry: a third credential issued and the second one lost.
     expect(await rolls()).toBe(before + 1);
@@ -375,7 +446,9 @@ describe("pithy secrets rotate, with the real binary", () => {
     const result = await cli(["secrets", "rotate", "REPLAY_PROVIDER_TOKEN", "--env", "prod", "--json"], refusing);
     expect(JSON.parse(result.stdout.trim())).toEqual({
       command: "secrets rotate",
+      schemaVersion: 1,
       name: "REPLAY_PROVIDER_TOKEN",
+      dryRun: false,
       rotations: [
         {
           name: "REPLAY_PROVIDER_TOKEN",
@@ -390,7 +463,9 @@ describe("pithy secrets rotate, with the real binary", () => {
     expect((JSON.parse(result.stderr.trim()) as { error: { code: string } }).error.code).toBe(
       "secrets/rotation_unrecorded",
     );
-    expect(result.code).toBe(3);
+    expect(result.code).toBe(EXIT.person);
+    // Held to the schema `pithy schema secrets rotate` publishes (#697) — the failure's line as much as a success's.
+    await expectConforms("secrets rotate", result.stdout);
   }, 120_000);
 
   test("a local secret whose store refuses is an ordinary failure — exit 1, previous value still live", async () => {
@@ -403,7 +478,7 @@ describe("pithy secrets rotate, with the real binary", () => {
     const before = await rolls();
     const result = await cli(["secrets", "rotate", "NOT_DECLARED", "--env", "prod", "--json"], refusing);
     expect((JSON.parse(result.stderr.trim()) as { error: { code: string } }).error.code).toBe("core/not_found");
-    expect(result.code).toBe(1);
+    expect(result.code).toBe(EXIT.precondition);
     expect(await rolls()).toBe(before);
   }, 60_000);
 
@@ -439,4 +514,40 @@ describe("pithy secrets rotate, with the real binary", () => {
       ).resolves.toBe("absent");
     }
   }, 180_000);
+});
+
+/**
+ * **Every `pithy secrets` write and the listing, from the real binary, held to the schemas `pithy schema
+ * secrets` publishes (#697).** The same fake Workflows API answers each write; nothing reaches an account.
+ */
+describe("pithy secrets --json conforms to its published payloads, with the real binary", () => {
+  test("ls, create, update, rotate and rm", async () => {
+    const listed = await cli(["secrets", "ls", "--json"]);
+    expect(listed.code).toBe(0);
+    await expectConforms("secrets ls", listed.stdout);
+
+    const created = await cliWithInput(
+      ["secrets", "create", "REPLAY_OAUTH_SECRET", "--env", "staging", "--json"],
+      "gho_replay_value\n",
+      staging,
+    );
+    expect(created.stderr).toBe("");
+    await expectConforms("secrets create", created.stdout);
+
+    const updated = await cliWithInput(
+      ["secrets", "update", "REPLAY_OAUTH_SECRET", "--env", "staging", "--json"],
+      "gho_replay_value_two\n",
+      staging,
+    );
+    expect(updated.stderr).toBe("");
+    await expectConforms("secrets update", updated.stdout);
+
+    const rotated = await cli(["secrets", "rotate", "REPLAY_SESSION_KEY", "--env", "staging", "--json"], staging);
+    expect(rotated.code).toBe(0);
+    await expectConforms("secrets rotate", rotated.stdout);
+
+    const removed = await cli(["secrets", "rm", "REPLAY_OAUTH_SECRET", "--env", "staging", "--json"], staging);
+    expect(removed.code).toBe(0);
+    await expectConforms("secrets rm", removed.stdout);
+  }, 240_000);
 });

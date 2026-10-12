@@ -85,6 +85,54 @@ const InvalidInputPublic = z
   })
   .describe("Input failed validation at a boundary (400).");
 
+const InputRequiredPublic = z
+  .object({
+    code: z
+      .literal("input/required")
+      .describe(
+        "A run that may not prompt reached a question with no answer. `PITHY_NONINTERACTIVE=1`, `--no-input` and `--json` each forbid a prompt; this is what one turns into, so an agent is told what to pass rather than left waiting on a question nobody will answer.",
+      ),
+    status: z.literal(400).describe("Bad Request — the call left out something it has to say."),
+    flag: z
+      .string()
+      .nullable()
+      .describe(
+        "The flag that answers the question, as it is typed (`--worker`). `null` when no flag can: only a person, or a document piped to stdin, answers it.",
+      ),
+    choices: z
+      .array(z.string().describe("One value the flag takes."))
+      .optional()
+      .describe("Every value the flag takes, when the set is known. Absent when it is open, such as a name."),
+    ...publicFields,
+  })
+  .describe("A run that may not prompt needed an answer it was not given (400).");
+
+const PreconditionFailedPublic = z
+  .object({
+    code: z
+      .literal("core/precondition_failed")
+      .describe(
+        "The call is well formed, and the state it needs is not there yet: no credentials, an environment that is not provisioned, a resource nothing has created. Distinct from `validation/invalid_input` because the remedy is a different step run first, not a different call.",
+      ),
+    status: z.literal(412).describe("Precondition Failed — the request is valid, and what it depends on is missing."),
+    ...publicFields,
+  })
+  .describe("The state this request depends on is not there yet (412).");
+
+const PersonRequiredPublic = z
+  .object({
+    code: z
+      .literal("core/person_required")
+      .describe(
+        "The step is one only a person may take: a typed confirmation phrase, or a command that is manual by design. Distinct from `input/required` because no flag value an automated caller could choose is the right answer — the right move is to stop and ask.",
+      ),
+    status: z
+      .literal(403)
+      .describe("Forbidden — the caller may not take this step for a person, however the call is phrased."),
+    ...publicFields,
+  })
+  .describe("A step only a person may take (403).");
+
 const InvalidTokenPublic = z
   .object({
     code: z.literal("auth/invalid_token").describe("The bearer/session credential is missing, expired, or invalid."),
@@ -1555,6 +1603,9 @@ const TestersNotConfiguredPublic = z
 export const KitPublicErrorPayload = z
   .discriminatedUnion("code", [
     InvalidInputPublic,
+    InputRequiredPublic,
+    PreconditionFailedPublic,
+    PersonRequiredPublic,
     InvalidTokenPublic,
     ForbiddenPublic,
     AuthProviderUnavailablePublic,
@@ -1690,6 +1741,11 @@ export const KitPublicErrorPayload = z
 // The full members: each public member plus the operator-only `action` and `detail`. Built as explicit consts
 // (not mapped) so the `code`-literal discriminated-union types survive for `Extract` narrowing.
 const InvalidInput = InvalidInputPublic.extend(internalFields).describe(InvalidInputPublic.description ?? "");
+const InputRequired = InputRequiredPublic.extend(internalFields).describe(InputRequiredPublic.description ?? "");
+const PreconditionFailed = PreconditionFailedPublic.extend(internalFields).describe(
+  PreconditionFailedPublic.description ?? "",
+);
+const PersonRequired = PersonRequiredPublic.extend(internalFields).describe(PersonRequiredPublic.description ?? "");
 const InvalidToken = InvalidTokenPublic.extend(internalFields).describe(InvalidTokenPublic.description ?? "");
 const Forbidden = ForbiddenPublic.extend(internalFields).describe(ForbiddenPublic.description ?? "");
 const AuthProviderUnavailable = AuthProviderUnavailablePublic.extend(internalFields).describe(
@@ -2053,6 +2109,9 @@ const SupportReplyFailed = SupportReplyFailedPublic.extend(internalFields).descr
 export const KitErrorPayload = z
   .discriminatedUnion("code", [
     InvalidInput,
+    InputRequired,
+    PreconditionFailed,
+    PersonRequired,
     InvalidToken,
     Forbidden,
     AuthProviderUnavailable,

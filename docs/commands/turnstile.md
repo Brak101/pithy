@@ -53,18 +53,21 @@ Idempotent: a re-run reuses an existing production widget rather than creating a
 
 `deprovision` deletes the production widget for each declared mode, deletes the managed secret and the dev secret, blanks each mode's `prod` sitekey in `pithy.config.ts`, and removes any stranded sitekey var. The test sitekeys stay: they are Cloudflare's published constants. It is the inverse of `provision` and the first half of the repair for a lost production secret.
 
+**A Worker that composes no turnstile has nothing to deprovision**, and `deprovision` says so and exits 0: `api does not compose turnstile. Nothing to deprovision.`, or `"modes": []` under `--json`. The modes it deletes are that Worker's own declaration, never a sibling's, so there is no widget it could name — `pithy remove`'s answer to a capability that is not there. Only `provision` refuses a Worker without the capability.
+
 ## `--json`
 
 One line, one object, one shape per subcommand. The `command` field carries the space-separated form (`turnstile provision`), not the dotted one.
 
 ```
 $ pithy turnstile provision --json
-{"command":"turnstile provision","modes":["visible"],"widgets":[{"mode":"visible","sitekey":"0x4AAA…","created":true}],"productionSecretWritten":true,"sitekeys":{"visible":{"dev":"1x00000000000000000000AA","staging":"1x00000000000000000000AA","prod":"0x4AAA…"}},"strandedVarsRemoved":[{"name":"TURNSTILE_SITEKEY_VISIBLE","environment":"prod"}],"configFile":"apps/web/pithy.config.ts","redeployRequired":true,"environmentsWithoutSitekeys":[]}
+{"command":"turnstile provision","schemaVersion":1,"modes":["visible"],"widgets":[{"mode":"visible","sitekey":"0x4AAA…","created":true}],"productionSecretWritten":true,"sitekeys":{"visible":{"dev":"1x00000000000000000000AA","staging":"1x00000000000000000000AA","prod":"0x4AAA…"}},"strandedVarsRemoved":[{"name":"TURNSTILE_SITEKEY_VISIBLE","environment":"prod"}],"configFile":"apps/web/pithy.config.ts","redeployRequired":true,"environmentsWithoutSitekeys":[]}
 ```
 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"turnstile provision"` | The subcommand that produced the line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `modes` | `("visible" \| "invisible")[]` | The widget modes the config declares, and that this run acted on |
 | `widgets` | `object[]` | One entry per production widget — see below |
 | `widgets[].mode` | `"visible" \| "invisible"` | Which widget this entry is |
@@ -79,24 +82,27 @@ $ pithy turnstile provision --json
 
 ```
 $ pithy turnstile deprovision --json
-{"command":"turnstile deprovision","modes":["visible","invisible"]}
+{"command":"turnstile deprovision","schemaVersion":1,"modes":["visible","invisible"]}
 ```
 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"turnstile deprovision"` | The subcommand that produced the line |
-| `modes` | `("visible" \| "invisible")[]` | The widget modes torn down |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
+| `modes` | `("visible" \| "invisible")[]` | The widget modes torn down. Empty when the Worker composes no turnstile, and nothing was |
 
 ## Errors
 
-Each one is a `PithyError` — the problem, then the action. Under `--json` they arrive on stderr as `{"error":{…}}`, and the process exits 1.
+Each one is a `PithyError` — the problem, then the action. Under `--json` they arrive on stderr as `{"error":{…}}`, with `exit`, `retryable` and, where the cause is known, `fix`, and the process exits by its kind — 2 for a call to fix, 3 for something to set up first, 4 to retry, 5 for a person (`docs/CLI.md` §3.8).
 
-**The Worker does not compose turnstile.** The target — `--worker`, or the project's only Worker — has no `turnstile(...)` registration. The modes are never read from a sibling.
+**The Worker does not compose turnstile.** `provision` only. The target — `--worker`, or the project's only Worker — has no `turnstile(...)` registration. The modes are never read from a sibling.
 
 ```
 <worker> does not compose the turnstile capability.
-Add `turnstile({ ... })` to <worker>'s pithy.config.ts (run `pithy add turnstile`), or name the Worker that composes it with --worker.
+Add `turnstile({ ... })` to <worker>'s pithy.config.ts (run `pithy add turnstile --worker <worker>`), or name the Worker that composes it with --worker.
 ```
+
+Named with `--worker`, it is a usage error, exit 2: another `--worker` is the fix. The project's only Worker, unnamed, is `core/precondition_failed`, exit 3, with `pithy add turnstile --worker <worker> --with-prerequisites` as its `fix`, `<worker>` being the Worker's `apps/` directory. `--with-prerequisites` is there because turnstile declares prerequisites in its manifest; a `fix` runs with nobody to ask.
 
 **No widgets are declared.** The capability is composed, but its `widgets` block is empty, so there is nothing to provision.
 
@@ -148,7 +154,7 @@ Declare it in the Worker's pithy.config.ts — `domains: { prod: { pattern: "app
 
 **Several Workers, no `--worker`.** The same resolution error `pithy add` raises, naming the Workers it found.
 
-**The project has no name.** It scopes both the widget names and the dispatcher's target, and it is never guessed: a wrong one reuses another project's widget on provision and deletes a neighbor's on teardown.
+**The project has no name.** It scopes both the widget names and the dispatcher's target, and it is never guessed: a wrong one reuses another project's widget on provision and deletes a neighbor's on teardown. It is `core/precondition_failed`, exit 3: the call is right and the project is missing what it depends on.
 
 ## Examples
 

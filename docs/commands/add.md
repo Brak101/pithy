@@ -7,7 +7,7 @@ Install a capability, wire it into one Worker's config and bindings, and run tha
 ## Synopsis
 
 ```
-pithy add <capability> [--worker <name>] [--with-prerequisites] [--set key=value]… [--eject [--force]] [--json]
+pithy add <capability> [--worker <name>] [--with-prerequisites] [--set key=value]… [--eject [--force]] [--dry-run] [--json]
 pithy add --list [--json]
 ```
 
@@ -22,6 +22,7 @@ pithy add --list [--json]
 | `--eject` | boolean | `false` | Copy the capability's source into your repo and repoint the wiring at it |
 | `--force` | boolean | `false` | With `--eject`, overwrite an existing local copy. Discards your edits |
 | `--with-prerequisites` | boolean | `false` | Compose the capabilities this one requires, if this Worker does not compose them yet |
+| `--dry-run` | boolean | `false` | Show the plan and write nothing. Installs nothing, migrates nothing, mints nothing |
 | `--json` | boolean | `false` | Machine-readable output |
 
 ## What it does
@@ -42,11 +43,11 @@ Each one is a real `pithy add`: its package installed, its config and bindings w
 
 - **A terminal.** One question, for the whole cascade: `auth requires secrets, email. Compose them too?` A nested prerequisite is never asked about again — one intent, one question. Declining refuses the run.
 - **`--with-prerequisites`.** Composes them without asking. The deterministic answer, and the one to put in a script.
-- **Anything else** — `--json`, no TTY, an agent — is **refused**, exit 1, naming the exact commands in the order they must run. Nothing is wired: an install has happened, because that is how the manifest was readable, and the config is untouched.
+- **Anything else** — `--json`, `--no-input`, `PITHY_NONINTERACTIVE=1`, no TTY, an agent — is **refused** `input/required` with `"flag": "--with-prerequisites"`, exit 2, naming the exact commands in the order they must run. Declining at the prompt is a different refusal, `validation/invalid_input`: somebody was asked and said no. Nothing is wired: an install has happened, because that is how the manifest was readable, and the config is untouched.
 
 ```
 $ pithy add auth --json
-{"error":{…,"message":"auth requires secrets and email, which board does not compose.","action":"Run pithy add auth --with-prerequisites, or compose them first: pithy add secrets, then pithy add email."}}
+{"error":{"code":"input/required","status":400,"flag":"--with-prerequisites","message":"auth requires secrets and email, which board does not compose.","action":"Run pithy add auth --with-prerequisites, or compose them first: pithy add secrets, then pithy add email."}}
 ```
 
 Composing something nobody asked for is not a thing to do behind an adopter's back. Reporting `Done.` on a project that cannot boot is worse. A prompt where there is someone to ask and a flag where there is not is how the rest of this CLI settles that (§`--worker`, `pithy init`'s domains).
@@ -65,7 +66,7 @@ What is left out is left out because wrangler would refuse the file: a `vectoriz
 
 **Scaffold the config options.** Values come from `--set` first, then from a prompt when a human is attached. An option whose default is an object or an array is left as the manifest scaffolds it — a secrets registry is not something anyone types at a prompt.
 
-**An option with no default is required.** That is the whole declaration: a capability that states a default has an answer the kit is willing to pick, and one that states none has an answer only you can give. A prompt asks it with nothing to accept by pressing enter, and a run with no human is refused unless it carries `--set key=value`. `payments.billingSubject` is the first — whether an entitlement is held by a person or a company, which lands in a column and a UNIQUE index — and nothing guesses it. An option that also states its choices is asked as a list, and `--set` refuses anything outside them.
+**An option with no default is required.** That is the whole declaration: a capability that states a default has an answer the kit is willing to pick, and one that states none has an answer only you can give. A prompt asks it with nothing to accept by pressing enter, and a run with no human is refused `input/required` unless it carries `--set key=value` — `"flag": "--set"`, with every `key=value` the first unanswered option takes in `choices`. `payments.billingSubject` is the first — whether an entitlement is held by a person or a company, which lands in a column and a UNIQUE index — and nothing guesses it. An option that also states its choices is asked as a list, and `--set` refuses anything outside them.
 
 **Eject, if asked.** Before the migrations, because eject repoints the config import at the local copy and promotes the capability's runtime dependencies into your project, and the migrate step has to load the config with everything it imports present. That install is named as it starts, the same way.
 
@@ -77,24 +78,29 @@ What is left out is left out because wrangler would refuse the file: a `vectoriz
 
 **The project needs a `name`.** It leads every resource name `add` proposes, and it claims the database the closing dev migration writes to. A project without one is told to set it before anything is installed, rather than left half-configured around an unowned database.
 
-**Which Worker.** `--worker` names it. A single-Worker project needs no ceremony. A project with several never guesses: it prompts a human, and raises an actionable error for anyone else — an agent driving `--json` is told what to pass rather than hanging on a question it cannot answer.
+**Which Worker.** `--worker` names it. A single-Worker project needs no ceremony. A project with several never guesses: it prompts a human, and fails `input/required` for anyone else, naming `--worker` and every Worker in `choices` — an agent driving `--json`, `--no-input` or `PITHY_NONINTERACTIVE=1` is told what to pass rather than hanging on a question it cannot answer.
+
+**`--dry-run` is the add, made in a copy.** The whole flow above runs — the same prerequisite refusal, the same required options, the same config, binding, entry, seam and manifest writes — against a private copy of the project under the system temporary directory, and the plan is what changed there: each file with its diff, so the bytes a person reviews are the bytes the add writes. The copy is gone before the command exits. Four steps are not made, and the plan says what each would do instead: the install names the command it would run, and declares the package in the copy's root `package.json` at `^<installed>` so the Worker's own declaration is the real one; the dev migrations are a note, because which are pending is known only once the wiring is on disk; the dev secrets the add would mint are listed under `secrets`, without a value; and an `--eject` copy is one directory created rather than a diff of every file in the package. No account is reached and nothing is audited.
+
+The manifest has to be installed, because it is what says what a capability wires and installing it is the one step a plan cannot make in a copy. A capability that is not installed is refused, exit 3, naming the install command.
 
 Idempotent. A second `pithy add auth` changes nothing. Adding the same capability to a second Worker reuses the installed package and writes only that Worker's config and bindings.
 
 ## `--json`
 
-One line, one object. Two shapes: one for `--list`, one for a real add.
+One line, one object. Two shapes: one for `--list`, one for an add — real, or under `--dry-run` planned.
 
 ### `pithy add --list --json`
 
 ```
 $ pithy add --list --json
-{"command":"add","capabilities":[{"name":"auth","package":"@pithy-sh/auth","whenToEnable":"Authentication and session management.","installed":false}, …],"manifestFaults":[]}
+{"command":"add","schemaVersion":1,"capabilities":[{"name":"auth","package":"@pithy-sh/auth","whenToEnable":"Authentication and session management.","installed":false}, …],"manifestFaults":[]}
 ```
 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"add"` | The command that produced the line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `capabilities` | array | The built-in catalog, in catalog order, each entry tagged with whether this project has it installed |
 | `capabilities[].name` | string | The capability name — the `pithy add <name>` argument |
 | `capabilities[].package` | string | The npm package it ships in. `@pithy-sh/<name>` for all but `controlplane`, which ships inside `@pithy-sh/core` |
@@ -110,18 +116,20 @@ A faulted package is reported rather than refused: one broken manifest must not 
 
 ```
 $ pithy add secrets --json
-{"command":"add","capability":"secrets","worker":"board","deployedAs":"replay-board","package":"@pithy-sh/secrets","packageManager":"npm","databases":[{"database":"app","binding":"DB","results":[{"migrationName":"0300_auth_0001_init","direction":"Up","status":"Success"}]}],"kvNamespaces":[],"notes":["SECRETS_STORE_ID is not recorded, and there are no Cloudflare credentials to resolve it with. Run pithy init, then pithy add secrets again.", …]}
+{"command":"add","schemaVersion":1,"capability":"secrets","worker":"board","deployedAs":"replay-board","package":"@pithy-sh/secrets","packageManager":"npm","databases":[{"database":"app","binding":"DB","results":[{"migrationName":"0300_auth_0001_init","direction":"Up","status":"Success"}]}],"kvNamespaces":[],"notes":["SECRETS_STORE_ID is not recorded, and there are no Cloudflare credentials to resolve it with. Run pithy init, then pithy add secrets again.", …]}
 ```
 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"add"` | The command that produced the line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
+| `dryRun` | boolean | Whether this was `--dry-run`. Nothing was written when it is `true`, and every other key is what the add would report |
 | `capability` | string | The capability's name, taken from the manifest rather than from the argument |
 | `worker` | string | The `apps/` directory that was wired. What `--worker` accepts, and what every path in this payload is relative to |
 | `deployedAs` | string | The same Worker's deployed script name, from `wrangler.jsonc`. What the Cloudflare dashboard shows |
 | `package` | string | The npm package the capability ships in |
 | `packageManager` | `"npm" \| "pnpm" \| "yarn" \| "bun"` | The project's package manager, detected from its lockfile. Reported whether or not an install ran — it is a fact about the project, not a record of a spawn |
-| `databases` | array | The dev migration run, one entry per database this Worker's registry touched |
+| `databases` | array | The dev migration run, one entry per database this Worker's registry touched. Empty under `--dry-run`, which runs none |
 | `databases[].database` | string | The database name — a capability's `databases` key |
 | `databases[].binding` | string | The D1 binding it resolves to in this Worker's `wrangler.jsonc` |
 | `databases[].results` | array | The migrations this Worker's capabilities contributed, and how each fared |
@@ -140,12 +148,23 @@ $ pithy add secrets --json
 | `eject.path` | string | The Worker-relative directory the source was copied into, `capabilities/<cap>` |
 | `eject.promotedDependencies` | string[] | The `name@version` dependencies promoted into your project. Workspace-internal ones are excluded |
 | `eject.forced` | boolean | Whether an existing local copy was overwritten (`--force`) |
+| `plan` | object | Present only under `--dry-run`: what the add would write, in the shape every `--dry-run` shares (`docs/CLI.md` §1.2). `files` carries each file's diff; `secrets` the dev secrets it would mint; `notes` the migrate it would run |
+| `next` | object[] | The step this add left required, in the order to run them, and absent otherwise — never empty (`docs/CLI.md` §1.2). `pithy provision --env <env> --yes` for a declared environment a provision had readied before the add — a resource for every binding, and a D1 or KV id a provision wrote — that gained a binding without one, since deploy refuses that stanza and provisioning both creates and migrates; otherwise `pithy migrate --env <env>` for a provisioned environment with migrations it has not applied, counted from its whole ledger. A production environment gets no provision step, because its provision needs a person's `--confirm` phrase. Read only when this add applied a migration in `dev`, with credentials, and not offline. Never under `--dry-run` |
+| `next[].command` | string | The command to run next, whole, as typed at a shell |
+| `next[].why` | string | Why it is required, in one sentence |
 
 `kvNamespaces` is empty when the capability needs no KV, when no project name was resolved, and on a re-run — a binding already present is left alone.
 
+### `pithy add <capability> --dry-run --json`
+
+```
+$ pithy add audit --dry-run --json
+{"command":"add","schemaVersion":1,"dryRun":true,"capability":"audit","worker":"board","deployedAs":"replay-board","package":"@pithy-sh/audit","packageManager":"bun","databases":[],"kvNamespaces":[],"notes":[],"prerequisites":[],"plan":{"files":[{"path":"apps/board/package.json","action":"edit","changes":[],"diff":"@@ -6,6 +6,7 @@\n …"},{"path":"apps/board/pithy.config.ts","action":"edit","changes":[],"diff":"@@ -1,3 +1,4 @@\n+import { audit } from \"@pithy-sh/audit/src/index\";\n …"},{"path":"apps/board/wrangler.jsonc","action":"edit","changes":[],"diff":"…"},{"path":"package.json","action":"edit","changes":["Runs bun add @pithy-sh/audit here, which also writes the lockfile."],"diff":"…"}],"resources":[],"migrations":[],"secrets":[],"data":[],"notes":["Then applies board's pending dev migrations to the local database.","Delivers the project's dev secrets to each Worker's .dev.vars and to the local SECRETS store."]}}
+```
+
 ## Errors
 
-Each one is a `PithyError`: the problem, then the action. Under `--json` it is a single `{"error":{…}}` line on stderr and exit 1.
+Each one is a `PithyError`: the problem, then the action. Under `--json` it is a single `{"error":{…}}` line on stderr, with `exit`, `retryable` and, where the cause is known, `fix`, and the process exits by its kind — 2 for a call to fix, 3 for something to set up first, 4 to retry, 5 for a person (`docs/CLI.md` §3.8).
 
 **No capability named.**
 
@@ -159,7 +178,7 @@ Run pithy add --list to see what's available.
 
 ```
 $ pithy add audit --json
-{"error":{"code":"validation/invalid_input","status":400,"issues":[],"message":"This project has several workers, so which one to wire is ambiguous.","action":"Pass --worker <name>. Known: relay-deck, relay-tally."}}
+{"error":{"code":"input/required","status":400,"flag":"--worker","choices":["relay-deck","relay-tally"],"message":"This project has several workers, so which one to wire is ambiguous.","action":"Pass --worker <name>. Known: relay-deck, relay-tally."}}
 ```
 
 **A `--worker` that names nothing.**
@@ -194,11 +213,11 @@ secrets option "registry" is not settable from the command line.
 Edit registry in the worker's pithy.config.ts — pithy add scaffolds it empty.
 ```
 
-**A required option nobody answered**, in a run that cannot be asked. Exit 1, and the action names the flag and every value it takes.
+**A required option nobody answered**, in a run that cannot be asked. Exit 2, and the action names the flag and every value it takes.
 
 ```
 $ pithy add payments --json
-{"error":{"code":"validation/invalid_input","status":400,"issues":[],"message":"payments needs a value for billingSubject, and nothing in this run names one.","action":"Pass --set billingSubject=user or --set billingSubject=organization."}}
+{"error":{"code":"input/required","status":400,"flag":"--set","choices":["billingSubject=user","billingSubject=organization"],"message":"payments needs a value for billingSubject, and nothing in this run names one.","action":"Pass --set billingSubject=user or --set billingSubject=organization."}}
 ```
 
 **A choice whose other half is code.** Some values compose only alongside a function — `pithy add` renders JSON into `pithy.config.ts`, not behavior. Where the kit knows what that function's file looks like, it writes one: the choice is taken, a seam module is scaffolded beside it, and the Worker refuses to boot until you have finished the module.
@@ -227,11 +246,19 @@ payments option "billingSubject" does not take "team".
 Pass one of: user, organization.
 ```
 
-**A prerequisite this Worker does not compose**, in a run that cannot be asked. Exit 1, and the commands come back in dependency order.
+**A prerequisite this Worker does not compose**, in a run that cannot be asked. Exit 2, and the commands come back in dependency order.
 
 ```
 $ pithy add auth --json
-{"error":{"code":"validation/invalid_input","status":400,"issues":[],"message":"auth requires secrets and email, which board does not compose.","action":"Run pithy add auth --with-prerequisites, or compose them first: pithy add secrets, then pithy add email."}}
+{"error":{"code":"input/required","status":400,"flag":"--with-prerequisites","message":"auth requires secrets and email, which board does not compose.","action":"Run pithy add auth --with-prerequisites, or compose them first: pithy add secrets, then pithy add email."}}
+```
+
+**A dry run of a capability that is not installed.** Exit 3: the plan is read from the manifest, and installing it is the one step a dry run cannot make in a copy.
+
+```
+$ pithy add auth --dry-run
+@pithy-sh/auth is not installed, so there is no manifest to plan auth from.
+Install it with bun add @pithy-sh/auth, then run pithy add auth --dry-run again.
 ```
 
 **A capability whose manifest is not there**, when the install did not run or did not land. `No capability named "<name>" is installed.` — with `Run pithy add <name> to install it.`
@@ -271,6 +298,21 @@ Minted a dev email-link-signing-key into ~/.config/pithy/replay/secrets.jsonc. L
 Minted a dev auth-session-secret into ~/.config/pithy/replay/secrets.jsonc. Local only.
 Deployed environments need pithy secrets create auth-session-secret.
 Done.
+```
+
+See what an add would change before it changes anything.
+
+```
+$ pithy add audit --dry-run
+Would wire audit into board.
+Would edit apps/board/package.json.
+Would edit apps/board/pithy.config.ts.
+Would edit apps/board/wrangler.jsonc.
+Would edit package.json.
+  Runs bun add @pithy-sh/audit here, which also writes the lockfile.
+Then applies board's pending dev migrations to the local database.
+Delivers the project's dev secrets to each Worker's .dev.vars and to the local SECRETS store.
+Dry run. Nothing written.
 ```
 
 Name the Worker in a project with several.

@@ -4,9 +4,11 @@
 import { parseArgs } from "node:util";
 import { ValidationError } from "@pithy-sh/core/src/error/pithyError";
 import type { ArgsDef, CommandDef } from "citty";
+import { readBooleanToken } from "./booleanToken";
 import { HIDDEN_ROOT_FLAGS } from "./commands/alias";
+import { aliasNames, camelSpelling, flagAliases, isPositional } from "./contract/args";
 import { findSubCommand, type SubCommand } from "./dispatch";
-import { malformedPrettyFlag, ROOT_FLAGS, wantsPretty } from "./rootFlags";
+import { malformedNoInputFlag, malformedPrettyFlag, ROOT_FLAGS, wantsPretty } from "./rootFlags";
 
 /**
  * **Every flag an invocation carries is a flag its command declares.** (#594)
@@ -51,57 +53,20 @@ import { malformedPrettyFlag, ROOT_FLAGS, wantsPretty } from "./rootFlags";
  */
 export const GLOBAL_FLAGS: readonly string[] = [...ROOT_FLAGS, ...HIDDEN_ROOT_FLAGS];
 
-/** One arg's declared aliases, in the spelling a caller types: a single letter takes one dash, a word takes two. */
-function aliasFlags(alias: unknown): string[] {
-  return aliasNames(alias).map((name) => (name.length === 1 ? `-${name}` : `--${name}`));
-}
-
-/** One arg's declared aliases, bare. citty accepts a string or an array. */
-function aliasNames(alias: unknown): string[] {
-  const names = typeof alias === "string" ? [alias] : Array.isArray(alias) ? alias : [];
-  return names.filter((name): name is string => typeof name === "string");
-}
-
-/**
- * The camelCase spelling of a kebab-case arg name, or the name unchanged when it has no dash.
- *
- * citty registers `camelCase(name)` and `kebabCase(name)` as aliases of **every** arg it parses, so
- * `--withPrerequisites` reaches the same value as `--with-prerequisites`. This transform is narrow on
- * purpose — it handles lowercase kebab and nothing else — and `docs/catalog.test.ts` holds every arg name
- * in the CLI to that shape, so the narrow version is complete rather than merely convenient. The kebab
- * direction is a no-op over that domain, which is why only this one exists.
- */
-function camelSpelling(name: string): string {
-  return name.replace(/-([a-z0-9])/g, (_, char: string) => char.toUpperCase());
-}
-
 /**
  * Every flag one command's parser answers to — what the docs catalog publishes, and what this check accepts.
  *
- * Three spellings beyond the declared name, each of them citty's rather than ours:
- *
- * - **Declared aliases**, long and short.
- * - **The camelCase form.** citty aliases every arg to its camel and kebab spellings, so
- *   `--withPrerequisites` works.
- * - **`--no-<name>` on a boolean.** citty strips a `--no-` prefix from any argument before parsing, and
- *   this CLI documents the result: `ui.ts`'s own description offers `--no-auth for the bare SPA`, and
- *   `docs/commands/ui.md` puts `[--auth | --no-auth]` in its synopsis. Booleans only: citty would also
- *   answer `--no-env`, but that is a quirk of its parser, not a flag anybody declared, so it is refused.
+ * The declared name, then every other spelling citty answers, in the one order `contract/args.ts` gives
+ * them: the camelCase form (`--withPrerequisites`), declared aliases (long and short), and `--no-<name>` on
+ * a boolean. `pithy schema` publishes the same spellings grouped under their names, from the same function,
+ * so the three lists cannot disagree.
  *
  * A **positional** is not a flag and is left out: it carries no `--`.
  */
 export function flagsOf(args: ArgsDef | undefined): string[] {
-  const flags: string[] = [];
-  for (const [name, def] of Object.entries(args ?? {})) {
-    const arg = def as { type?: string; alias?: unknown };
-    if (arg.type === "positional") continue;
-    flags.push(`--${name}`);
-    const camel = camelSpelling(name);
-    if (camel !== name) flags.push(`--${camel}`);
-    flags.push(...aliasFlags(arg.alias));
-    if (arg.type === "boolean") flags.push(`--no-${name}`);
-  }
-  return flags;
+  return Object.entries(args ?? {})
+    .filter(([, def]) => !isPositional(def))
+    .flatMap(([name, def]) => [`--${name}`, ...flagAliases(name, def).map((alias) => alias.flag)]);
 }
 
 /** What {@link undeclaredFlags} found: the command, what it was given that it does not take, and what it does. */
@@ -249,8 +214,11 @@ export async function refuseUndeclaredFlags(root: CommandDef, argv: readonly str
   const plural = found.undeclared.length > 1;
   throw new ValidationError({
     message: `Unknown flag${plural ? "s" : ""}: ${found.undeclared.join(", ")}.`,
+    // A command with none of its own still takes the global ones, so "no flags" would be wrong (#697).
     action:
-      found.declared.length === 0 ? `${command} takes no flags.` : `${command} takes ${found.declared.join(", ")}.`,
+      found.declared.length === 0
+        ? `${command} takes only the global flags, which \`pithy schema --json\` lists.`
+        : `${command} takes ${found.declared.join(", ")}.`,
     issues: found.undeclared.map((flag) => ({
       path: [flag],
       code: "unrecognized_keys",
@@ -263,12 +231,40 @@ export async function refuseUndeclaredFlags(root: CommandDef, argv: readonly str
  * Whether the invocation asked for `--json`, so a refusal answers in the shape the caller will parse.
  *
  * Read off the raw tokens rather than off a parse, because the refusal is exactly the case where the parse
- * is in question: `pithy doctor --json --bogus` asked for one machine-readable line, and gets it.
+ * is in question: `pithy doctor --json --bogus` asked for one machine-readable line, and gets it. Read as citty
+ * reads it (`booleanToken.ts`), so a refusal and the command it refuses never disagree about the shape:
+ * `--json --no-json` is a text run.
  */
 export function asksForJson(argv: readonly string[]): boolean {
-  const separator = argv.indexOf("--");
-  const flags = separator === -1 ? argv : argv.slice(0, separator);
-  return flags.some((token) => token === "--json" || (token.startsWith("--json=") && token !== "--json=false"));
+  return readBooleanToken(argv, "json").value === true;
+}
+
+/**
+ * The first `--<name>` token citty would read other than as it is written, or `undefined`: a value that is neither
+ * `true` nor `false`, which citty reads as on, or `--no-<name>=<value>`, which citty does not read at all.
+ */
+function misreadToken(argv: readonly string[], name: string): string | undefined {
+  const read = readBooleanToken(argv, name);
+  return read.negatedValue ?? read.malformed;
+}
+
+/** The refusal for a token {@link misreadToken} found, naming the four spellings that are read as written. */
+function misreadRefusal(token: string, name: string): ValidationError {
+  const [typed] = token.split("=") as [string];
+  return new ValidationError({
+    message: `${token} is not a spelling --${name} takes.`,
+    action: `Write --${name}, --no-${name}, --${name}=true or --${name}=false.`,
+    issues: [{ path: [typed], code: "invalid_value", message: `--${name} takes true or false.` }],
+  });
+}
+
+/**
+ * Refuse a `--json` spelling citty would read other than as written (#697 review). `--json=maybe` is on to citty and
+ * `--no-json=false` is nothing to it, so a run that let either through would answer a question nobody asked.
+ */
+export function refuseJsonFlag(argv: readonly string[]): void {
+  const token = misreadToken(argv, "json");
+  if (token !== undefined) throw misreadRefusal(token, "json");
 }
 
 /**
@@ -308,5 +304,55 @@ export function refusePrettyFlags(argv: readonly string[]): void {
     message: `${flag} needs --json. It formats that line and nothing else.`,
     action: `Add --json, or drop ${flag}.`,
     issues: [{ path: [flag], code: "unrecognized_keys", message: `${flag} is only read alongside --json.` }],
+  });
+}
+
+/** Whether the invocation asked for `--events`, read as citty reads it (`booleanToken.ts`). */
+function asksForEvents(argv: readonly string[]): boolean {
+  return readBooleanToken(argv, "events").value === true;
+}
+
+/**
+ * Refuse `--events` without `--json`, or with a value it cannot mean (#697).
+ *
+ * **`--events` turns the one `--json` document into a stream of progress records closed by it**, so without
+ * `--json` there is no stream for it to shape — the same reasoning as {@link refusePrettyFlags}, and checked
+ * in the same place, before anything runs. Only `deploy` and `provision` declare it; on every other command it
+ * is refused as undeclared before this rule is asked. Their contracts publish the rule as a `requires` group.
+ */
+export function refuseEventsFlag(argv: readonly string[]): void {
+  const read = readBooleanToken(argv, "events");
+  // Not read at all by citty, whatever its value, so it is named as a spelling rather than as a value.
+  if (read.negatedValue !== undefined) throw misreadRefusal(read.negatedValue, "events");
+  if (read.malformed !== undefined) {
+    const [name] = read.malformed.split("=") as [string];
+    throw new ValidationError({
+      message: `${read.malformed} is not a value ${name} takes.`,
+      action: `Write ${name} on its own, or ${name}=true or ${name}=false.`,
+      issues: [{ path: [name], code: "invalid_value", message: `${name} takes true or false.` }],
+    });
+  }
+  if (!asksForEvents(argv) || asksForJson(argv)) return;
+  throw new ValidationError({
+    message: "--events needs --json.",
+    action: "Add --json, or drop --events.",
+    issues: [{ path: ["--events"], code: "unrecognized_keys", message: "--events is only read alongside --json." }],
+  });
+}
+
+/**
+ * Refuse a `--no-input` carrying a value it cannot mean (#697). `--no-input=1` quietly read as "not
+ * typed" would leave a prompt open for the agent that typed it to stop one.
+ *
+ * Unlike `--pretty`, it needs no `--json`: forbidding prompts is a statement about the run, not about
+ * a format. Here beside {@link refusePrettyFlags} for the same dependency direction.
+ */
+export function refuseNoInputFlag(argv: readonly string[]): void {
+  const malformed = malformedNoInputFlag(argv);
+  if (malformed === undefined) return;
+  throw new ValidationError({
+    message: `${malformed} is not a value --no-input takes.`,
+    action: "Write --no-input on its own, or --no-input=true or --no-input=false.",
+    issues: [{ path: ["--no-input"], code: "invalid_value", message: "--no-input takes true or false." }],
   });
 }

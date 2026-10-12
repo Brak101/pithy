@@ -4,7 +4,8 @@
 import type { CommandDef } from "citty";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { main } from "../main";
-import type { UiSyncReport } from "../ui/flow";
+import { expectConforms, runCaptured } from "../test-utils/payloadContract";
+import type { UiAddReport, UiSyncReport } from "../ui/flow";
 import ui from "./ui";
 
 /** What the stubbed `runUiSync` answers. Rewritten per test; the command is the subject, not the flow. */
@@ -18,11 +19,27 @@ const stub = vi.hoisted(() => ({
     unstyled: [],
     notFoundHandling: "single-page-application",
   } as UiSyncReport,
+  add: {
+    worker: "board",
+    framework: "react",
+    auth: true,
+    payments: false,
+    organization: false,
+    created: ["src/main.tsx"],
+    skipped: ["src/styles.css"],
+    unstyled: [],
+    runWorkerFirst: ["/auth/*"],
+    packageManager: "bun",
+    dependencies: ["react"],
+    devDependencies: ["vite"],
+    scripts: ["dev"],
+  } as UiAddReport,
 }));
 
 vi.mock("../ui/flow", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../ui/flow")>()),
   runUiSync: async () => stub.report,
+  runUiAdd: async () => stub.add,
 }));
 
 vi.mock("./add", async (importOriginal) => ({
@@ -49,8 +66,16 @@ describe("ui command", () => {
     expect(Object.keys(ui.subCommands ?? {})).toEqual(["add", "sync", "list"]);
   });
 
-  test("add takes a framework positional, --worker, one flag per screen set, and --json", () => {
-    expect(Object.keys(args("add"))).toEqual(["framework", "worker", "auth", "payments", "organization", "json"]);
+  test("add takes a framework positional, --worker, one flag per screen set, --dry-run and --json", () => {
+    expect(Object.keys(args("add"))).toEqual([
+      "framework",
+      "worker",
+      "auth",
+      "payments",
+      "organization",
+      "dry-run",
+      "json",
+    ]);
     expect(args("add").framework).toMatchObject({ type: "positional", required: true });
     expect(args("add").worker).toMatchObject({ type: "string" });
     expect(args("add").json).toMatchObject({ type: "boolean", default: false });
@@ -148,5 +173,35 @@ describe("ui sync --check turns a finding into an exit code", () => {
     const { exit, output } = await runSync(false);
     expect(exit).toBeUndefined();
     expect(output).toContain("divider");
+  });
+});
+
+/** All three, through the real commands, held to the schema `pithy schema ui` publishes (#697). */
+describe("pithy ui --json conforms to its published payloads", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  test("add, sync and list", async () => {
+    await expectConforms("ui add", await runCaptured("ui add", ["react", "--json"]));
+    await expectConforms("ui sync", await runCaptured("ui sync", ["--json"]));
+    await expectConforms("ui list", await runCaptured("ui list", ["--json"]));
+  });
+
+  /** The install it left required, as `next`, and no key when it wrote no dependency (#697). */
+  test("add names the install when it wrote dependencies, and carries no next when it wrote none", async () => {
+    const wrote = JSON.parse((await runCaptured("ui add", ["react", "--json"])).join(""));
+    expect(wrote.next).toEqual([
+      { command: "bun install", why: "ui add wrote 2 packages into package.json, and the build needs them installed." },
+    ]);
+    const before = stub.add;
+    stub.add = { ...before, dependencies: [], devDependencies: [] };
+    try {
+      const none = await runCaptured("ui add", ["react", "--json"]);
+      expect(Object.hasOwn(JSON.parse(none.join("")), "next")).toBe(false);
+      await expectConforms("ui add", none);
+    } finally {
+      stub.add = before;
+    }
   });
 });

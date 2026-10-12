@@ -7,7 +7,7 @@ Scaffold a front end into an existing Worker and wire it end to end — Vite, th
 ## Synopsis
 
 ```
-pithy ui add <framework> [--worker <name>] [--auth | --no-auth] [--json]
+pithy ui add <framework> [--worker <name>] [--auth | --no-auth] [--dry-run] [--json]
 pithy ui sync [--worker <name>] [--check] [--json]
 pithy ui list [--json]
 ```
@@ -20,7 +20,8 @@ pithy ui list [--json]
 | `--worker <name>` | `add`, `sync` | resolved — see Resolving the Worker | The Worker under `apps/` to scaffold into, or to re-derive |
 | `--check` | `sync` | `false` | Report the drift, write nothing, exit non-zero on a shadowed route — the CI gate |
 | `--auth` / `--no-auth` | `add` | see The auth screens | Scaffold the sign-in screens, or leave them out |
-| `--json` | all three | `false` | One line of machine-readable output. Implies non-interactive: `pithy ui` never prompts when `--json` is set |
+| `--dry-run` | `add` | `false` | Show the plan and write nothing. Every refusal still applies |
+| `--json` | all three | `false` | One line of machine-readable output. Implies non-interactive: `pithy ui` never prompts when `--json` is set, nor under `--no-input` or `PITHY_NONINTERACTIVE=1` |
 
 **There are no provider flags.** No `--google`, no `--github`, no `--turnstile`. Which social providers exist, and whether a humanity check gates sign-in, is already declared in that Worker's `pithy.config.ts`. A flag would be a second source of truth, frozen at scaffold time, that drifts the moment someone enables a provider in config. The scaffolded screens read the composed config at runtime instead (see `docs/UI.md`), so enabling a provider stays a one-line config edit and a redeploy — no CLI run, no file to regenerate, nothing to keep in step.
 
@@ -30,7 +31,7 @@ pithy ui list [--json]
 
 ### Resolving the Worker
 
-`ui add` and `ui sync` wire exactly one Worker, so they take `--worker <name>` and follow the same rule as `add` and `remove` (`docs/CLI.md` §1.1): with a single Worker under `apps/` the flag is optional and that Worker is used; with several, the CLI prompts at a terminal and **fails with an actionable error under `--json`** rather than guessing. Scaffolding a front end into the wrong Worker would put an `assets` stanza and an asset-routing allowlist on a script that serves no browser.
+`ui add` and `ui sync` wire exactly one Worker, so they take `--worker <name>` and follow the same rule as `add` and `remove` (`docs/CLI.md` §1.1): with a single Worker under `apps/` the flag is optional and that Worker is used; with several, the CLI prompts at a terminal and **fails `input/required`, naming `--worker`, when it may not ask** (`--json`, `--no-input`, `PITHY_NONINTERACTIVE=1`) rather than guessing. Scaffolding a front end into the wrong Worker would put an `assets` stanza and an asset-routing allowlist on a script that serves no browser.
 
 `ui list` takes no `--worker`: it reports the framework stubs `ui add` can scaffold, not the Workers that already carry one. For the per-Worker view — which Workers exist, which autostart, which port each holds — use `pithy worker list`.
 
@@ -109,6 +110,20 @@ The array form of `run_worker_first` is what sets `has_static_routing`, and that
 
 **The project's root `tsconfig.json` — the client's two programs, appended to `references`.** A program nothing references is a program nothing checks, and `pithy ui add` used to leave exactly that: two tsconfigs beside the Worker's, both invisible to `bun run typecheck`. They are appended after the Worker's own, so `tsc -b` reports in layout order, and a re-run adds nothing. **Extended, never created** — a project scaffolded before `docs/CLI.md` §1.3 existed has Workers whose programs are not `composite`, and `tsc -b` refuses a reference to one of those outright, so writing the file would hand that adopter a typecheck that cannot pass.
 
+### `pithy ui add --dry-run`
+
+The same scaffold and the same wiring, written into a private copy of the project under the system temporary directory, and the plan is the difference: every file it would create, and each of the four documents it would edit, with its diff. The copy is gone before the command exits, and the project is byte-identical. Everything the run decides first still decides — a Worker that already has a front end is refused, and the screens follow the same flags and the same composition — so the report beside the plan is the one the real run gives, `created`, `unstyled` and `runWorkerFirst` included. The plan shape is the one every `--dry-run` shares (`docs/CLI.md` §1.2).
+
+```
+$ pithy ui add react --worker api --no-auth --dry-run
+Would scaffold a react front end into api.
+Would create apps/api/index.html.
+…
+Would edit apps/api/wrangler.jsonc.
+Would edit tsconfig.json.
+Dry run. Nothing written.
+```
+
 ### `pithy ui sync`
 
 `run_worker_first` is derived from the route table, and the route table changes whenever a route is mounted: by `pithy add <capability>`, by `pithy remove <capability>`, and by the adopter writing one into their own app capability. **That last one runs no command**, which is how the list goes stale without anyone touching it. `pithy ui sync` re-derives it and rewrites that one key.
@@ -133,26 +148,28 @@ One line, one object, one shape per subcommand. The `command` field is the subco
 
 ```
 $ pithy ui add react --worker api --json
-{"command":"ui.add","worker":"api","deployedAs":"pithy-app-api","framework":"react","auth":true,"created":["client-env.d.ts","index.html","src/client.tsx","src/pithy-config.tsx","src/pithy-screens.css","src/router.tsx","src/routes/app/home.tsx","src/routes/pithy/callback.tsx","src/routes/pithy/otp.tsx","src/routes/pithy/sign-in.tsx","src/session.tsx","src/styles.css","src/turnstile.tsx","tsconfig.client.json","tsconfig.node.json","vite.config.ts"],"skipped":[],"unstyled":[],"runWorkerFirst":["/auth","/auth/*","/health","/health/*"],"packageManager":"bun","dependencies":["react","react-dom"],"devDependencies":["@cloudflare/vite-plugin","@pithy-sh/vite","@types/react","@types/react-dom","@vitejs/plugin-react","vite"],"scripts":["dev","build","preview"]}
+{"command":"ui.add","schemaVersion":1,"dryRun":false,"worker":"api","deployedAs":"pithy-app-api","framework":"react","auth":true,"created":["client-env.d.ts","index.html","src/client.tsx","src/pithy-config.tsx","src/pithy-screens.css","src/router.tsx","src/routes/app/home.tsx","src/routes/pithy/callback.tsx","src/routes/pithy/otp.tsx","src/routes/pithy/sign-in.tsx","src/session.tsx","src/styles.css","src/turnstile.tsx","tsconfig.client.json","tsconfig.node.json","vite.config.ts"],"skipped":[],"unstyled":[],"runWorkerFirst":["/auth","/auth/*","/health","/health/*"],"packageManager":"bun","dependencies":["react","react-dom"],"devDependencies":["@cloudflare/vite-plugin","@pithy-sh/vite","@types/react","@types/react-dom","@vitejs/plugin-react","vite"],"scripts":["dev","build","preview"]}
 ```
 
 `worker` is the `apps/` directory the front end was written into; `deployedAs` is the Worker's deployed script name. **That split holds across every command**, and it is the one thing to know about reading this output: `worker` is what `--worker` accepts and what every path in the same payload is relative to, while `deployedAs` is what the Cloudflare dashboard shows. A run reporting the deployed name (`<project>-<worker>`) beside directory-relative paths described a directory that does not exist, which is what the two fields exist to prevent. `created` and `skipped` are worker-relative and sorted; together they are every file the template declares, so a backfilling run reports the untouched ones rather than staying silent about them. `unstyled` is the second claim: **wrote the screens** and **the screens are styled** are two things, and only the first was ever reported. It is read off the stylesheets as they stand on disk after the write, not off the template, because a stylesheet the adopter has since edited is the case it exists for. `dependencies`, `devDependencies` and `scripts` name only what this run added.
 
 ```
 $ pithy ui sync --worker api --json
-{"command":"ui.sync","worker":"api","deployedAs":"pithy-app-api","before":["/auth","/auth/*","/health","/health/*"],"after":["/auth","/auth/*","/health","/health/*","/leaderboard","/leaderboard/*"],"changed":true,"uncovered":[],"notFoundHandling":"single-page-application"}
+{"command":"ui.sync","schemaVersion":1,"worker":"api","deployedAs":"pithy-app-api","before":["/auth","/auth/*","/health","/health/*"],"after":["/auth","/auth/*","/health","/health/*","/leaderboard","/leaderboard/*"],"changed":true,"uncovered":[],"notFoundHandling":"single-page-application"}
 ```
 
 `before` and `after` are the allowlist either side of the run, so a CI job can log the delta without recomputing it. `changed` covers everything the call can have moved — the allowlist, or a `not_found_handling` it had to write because the stanza carried none. `uncovered` names the routes the list **in the file** does not cover: always empty after a write, and under `--check` it is the finding, the one thing that fails the exit. `notFoundHandling` is reported because SPA routing depends on it and `sync` does not overwrite a value the adopter chose.
 
 ```
 $ pithy ui list --json
-{"command":"ui.list","stubs":[{"id":"react","description":"React 19 SPA on Vite, served by the worker as static assets"}]}
+{"command":"ui.list","schemaVersion":1,"stubs":[{"id":"react","description":"React 19 SPA on Vite, served by the worker as static assets"}]}
 ```
 
 | key | type | meaning |
 |---|---|---|
 | `command` | string | The subcommand's dotted name: `ui.add`, `ui.sync`, or `ui.list`. |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
+| `dryRun` | boolean | `add`. Whether this was `--dry-run`. Nothing was written when it is `true`, and every other key is what the run would report. |
 | `worker` | string | `add`, `sync`. The `apps/` directory the front end was written into, and what every path in the same payload is relative to. |
 | `deployedAs` | string | `add`, `sync`. The Worker's deployed script name — what the Cloudflare dashboard shows. |
 | `framework` | string | `add`. The stub that was scaffolded. |
@@ -165,6 +182,8 @@ $ pithy ui list --json
 | `dependencies` | string[] | `add`. Only what this run added. |
 | `devDependencies` | string[] | `add`. Only what this run added. |
 | `scripts` | string[] | `add`. Only what this run added. |
+| `plan` | object | `add`, under `--dry-run` only. What it would write, in the shape every `--dry-run` shares (`docs/CLI.md` §1.2): each file created or edited, with its diff. |
+| `next` | object[] | `add` only. `[{ command, why }]`: the project's install (`bun install`, `pnpm install`, …) when this run wrote dependencies into the Worker's `package.json`, because the build fails without them. Absent when it wrote none, and under `--dry-run`; never empty (`docs/CLI.md` §1.2). |
 | `before` | string[] | `sync`. The allowlist before the run. |
 | `after` | string[] | `sync`. The allowlist after it. |
 | `changed` | boolean | `sync`. Whether the call moved anything — the allowlist, or a `not_found_handling` it had to write. |
@@ -174,35 +193,41 @@ $ pithy ui list --json
 
 ## Errors
 
-Each one is a `PithyError` — the problem, then the action (`docs/CLI.md` §3.3).
+Each one is a `PithyError` — the problem, then the action (`docs/CLI.md` §3.3) — and the process exits by its kind (`docs/CLI.md` §3.8): 2 for a call to fix, 3 for something in the way that has to change first. `pithy ui sync --check` exits 1 when it finds something, because its report is the answer, and Ctrl-C at the screens prompt exits 130.
 
-**Unknown framework.**
+**Unknown framework.** Exit 2.
 
 ```
 $ pithy ui add svelte --worker api
-Unknown UI framework: svelte.
-Run `pithy ui add react` — react is the only stub Pithy ships.
+No UI stub named "svelte".
+Run pithy ui list to see the frameworks you can add. Known: react.
 ```
 
-**A UI is already there.**
+**A UI is already there.** Exit 3.
 
 ```
 $ pithy ui add react --worker api
-apps/api already has a UI.
-Run `pithy ui sync --worker api` to re-derive its asset routing.
+api already has a react front end.
+Add screens by dropping files into src/routes/app/. Run pithy ui sync to re-derive its route allowlist.
 ```
 
-The check is the manifest's `ui` block, not the presence of files. The stub is scaffolded once; a second `add` would create nothing and imply otherwise.
+The check is the manifest's `ui` block, not the presence of files. The stub is scaffolded once; a second `add` would create nothing and imply otherwise. A Worker carrying a different stub is refused the same way, exit 3: one Worker, one front end.
 
-**`--auth` without the auth capability.**
+**A template file already on disk.** Exit 3. Pithy never overwrites a file it did not just write, so a first scaffold that finds one names every such file and writes nothing.
+
+**`--auth` without the auth capability.** Exit 3, `core/precondition_failed`, with `pithy add auth --worker api --with-prerequisites` as its `fix`, since auth declares `secrets` and `email`: the Worker is missing what the screens depend on.
 
 ```
 $ pithy ui add react --worker api --auth
-apps/api does not compose the auth capability.
-Run `pithy add auth --worker api`, then re-run `pithy ui add react --worker api`.
+The auth screens need the auth capability, and api doesn't compose it.
+Run pithy add auth --worker api first, or leave them out with --no-auth.
 ```
 
-**Several Workers, no `--worker`, under `--json`.** The resolution error from 7.2 — the same one `pithy add` raises, naming the Workers it found.
+**`pithy ui sync` on a Worker with no front end.** Exit 3, and the action is `pithy ui add react --worker <name>`.
+
+**Several Workers, no `--worker`, where nobody may be asked.** The resolution error from 7.2 — the same `input/required` refusal `pithy add` raises, naming the Workers it found. Exit 2.
+
+**`pithy ui sync --check` finding an uncovered route or an unstyled screen.** Exit 1. Not an error line: the report above is the finding.
 
 ## Examples
 

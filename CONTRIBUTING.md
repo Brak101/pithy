@@ -24,6 +24,14 @@ Use `/ship`. It takes a `Ready` issue and carries it to a merged PR — TDD impl
 
 Mechanics live in the shared `ship` skill, in the workspace checkout alongside this repository. What it does *here* — the changeset, the `Security:` line, the worktree commands, the gates — is in `.claude/project.md`.
 
+## Issues from outside the team
+
+File one on a form: **Bug report** or **Feature request**. Blank issues are off, because the form asks what a maintainer needs to reproduce a bug: the version, the OS and shell, the command and its output. CI covers Linux closely and Windows only in part, so the platform decides who can reproduce it.
+
+**A vulnerability is never an issue.** Report it privately, as `SECURITY.md` says.
+
+Each form sets the issue type, `Bug` or `Feature`, and applies `needs-triage`; every new issue lands on the board at `Inbox`. **What kind of issue it is goes in the type, never a label.** The org defines `Bug`, `Feature`, `Task` and `Epic`, and an issue has exactly one, so `bug`, `enhancement` and `documentation` are no longer applied. Labels are for what can overlap: `needs-triage`, `good first issue`, `help wanted`. The label means the issue arrived on a form and nobody has evaluated it yet; the team files through `/refine`, which skips the forms. `/refine` removes it at `Ready`. Nothing removes it on close, so the triage list is `is:open label:needs-triage`. `packages/cli/src/ci/contributorIntake.test.ts` holds the forms, their types, the blank-issue setting and the disclosure link to that. It cannot hold an issue filed through the API, which skips the forms and arrives unlabeled.
+
 ## Pull requests from outside the team
 
 Welcome. A pull request merges into `main` when three things hold, and GitHub enforces all of them:
@@ -36,7 +44,7 @@ Welcome. A pull request merges into `main` when three things hold, and GitHub en
 
 **A change under `.github/` is read line by line.** A pull request's CI runs the workflows on its own branch, so a green `CI` proves only what those workflows checked. The review is what makes it mean the rest.
 
-Link the issue your change closes (`Closes #N`), add a test that fails without the change, and add a changeset when it ships in a package (§Releases). A fix for a platform CI does not fully cover — macOS, or Windows beyond the small set below — needs the command, the shell and the output before and after, because your machine is the only one that has proved it.
+The pull request template asks for each of these. Link the issue your change closes (`Closes #N`; a partial fix says `Refs #N`, which links without closing), add a test that fails without the change, and add a changeset when it ships in a package (§Releases). A fix for a platform CI does not fully cover — macOS, or Windows beyond the small set below — needs the command, the shell and the output before and after, because your machine is the only one that has proved it.
 
 **Windows has a small test set of its own.** CI runs the suite on Linux, and `packages/cli`'s `*.windows.test.ts` on a Windows runner instead, never on Linux, whenever the CLI or anything it depends on changes. A test belongs in that set when it has to touch the real platform to prove anything: a real `.cmd`, a real `%APPDATA%`, a filename Windows refuses. A test that passes `"win32"` into a function runs everywhere already, and stays where it is. Each file in the set calls `requireWindows()` from `src/test-utils/windows.ts`, so it fails rather than passes anywhere else. Run it with `node --run test:windows` from `packages/cli`, on Windows.
 
@@ -56,6 +64,8 @@ gh api -X POST repos/pithy-sh/pithy/rulesets --input .github/rulesets/main.json 
 The [Pithy board](https://github.com/orgs/pithy-sh/projects/1) tracks each issue's **Status** across its life:
 
 `Inbox → Ready` (owned by `/refine`) `→ In Progress → Done` (owned by `/ship`). Those four are the whole set — the field has no other options.
+
+A new issue is added at `Inbox` by the board's own workflows: **Auto-add to project** (`is:issue`) and **Item added to project**, which sets Status. They are project settings, made in the board's UI; the API cannot create them. An issue filed from outside also carries `needs-triage` (§Issues from outside the team).
 
 ## Setup
 
@@ -139,14 +149,14 @@ Two exceptions, and both are the same exception. A document a **test reads off d
 
 ### The docs catalog
 
-The site's own check asks whether every `pithy add <name>` on a page names a real capability, every CLI flag it cites exists in that command's parser, and every error code it quotes exists in the kit. It reads `docs/catalog.generated.json`, which this repository writes from the values themselves — the capability catalog, the composed citty tree, `KitErrorPayload`.
+The site's own check asks whether every `pithy add <name>` on a page names a real capability, every CLI flag it cites exists in that command's parser, and every error code it quotes exists in the kit. It reads `docs/catalog.generated.json`, which this repository writes from the values themselves — the capability catalog, the composed citty tree, `KitErrorPayload`. Its commands, flags and error codes are a projection of what `pithy schema --json` publishes from the installed binary (`packages/cli/src/contract/describe.ts`), so the two cannot disagree; the catalog keeps its flat shapes because the site reads them by name, and `pithy schema` carries the structure.
 
 ```bash
 bun run docs-catalog           # rewrite it
 bun packages/cli/src/docs/writeCatalog.ts --check   # what CI runs
 ```
 
-**`commands` answers whether a flag exists, not whether a page may name it**, and a flag check that ignores the difference reports correct pages as wrong. A command page cites other commands' flags (`deploy.md` writes `pithy provision --env <name> --yes` while explaining what deploy refuses), quotes flags belonging to no Pithy command at all (`git rev-parse --git-common-dir`), and — most often — documents flags that deliberately **do not exist**: `secrets.md` argues at length that there is no `--all`, `vector.md` that `reset` takes no `--yes`, `turnstile.md` that there is no `--mode`. So match `<command> --flag` as a pair, and expect the absences to be the loudest thing on the page. `globalFlags` covers the six the walk cannot see, hidden pair included.
+**`commands` answers whether a flag exists, not whether a page may name it**, and a flag check that ignores the difference reports correct pages as wrong. A command page cites other commands' flags (`deploy.md` writes `pithy provision --env <name> --yes` while explaining what deploy refuses), quotes flags belonging to no Pithy command at all (`git rev-parse --git-common-dir`), and — most often — documents flags that deliberately **do not exist**: `secrets.md` argues at length that there is no `--all`, `vector.md` that `reset` takes no `--yes`, `turnstile.md` that there is no `--mode`. So match `<command> --flag` as a pair, and expect the absences to be the loudest thing on the page. `globalFlags` covers the flags the walk cannot see, hidden pair included.
 
 It is committed, so a consumer that neither is this repository nor installs it can read it with no build step — and committed means it can go stale, which is what the `--check` in CI's verify job is for. A stale export does not fail the site's check; it makes every page pass against a kit that has moved.
 

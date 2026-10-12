@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CfAccount } from "@pithy-sh/cloudflare/src/client/accounts";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { type CloudflareConfigOptions, cloudflareEnv } from "../cloudflare/config";
+import { AGENTS_FILE, CLAUDE_FILE, CLAUDE_POINTER, renderAgentsBlock } from "../project/agentInstructions";
+import { expectConforms, runCaptured } from "../test-utils/payloadContract";
 import {
   askCloudflareAccount,
   askEnvironments,
@@ -458,5 +460,57 @@ describe("a listing that could not be made is not an empty listing", () => {
     expect(said).toContain("Cloudflare could not be reached, so the account list is unknown.");
     expect(said).toContain("verified by nothing");
     expect(said).not.toContain("This token sees no Cloudflare account");
+  });
+});
+
+/** A real scaffold, through the real command, held to the schema `pithy schema init` publishes (#697). */
+test("pithy init --json conforms to its published payload", async () => {
+  const target = await mkdtemp(join(tmpdir(), "pithy-init-json-"));
+  try {
+    await expectConforms("init", await runCaptured("init", ["--dir", target, "--name", "acme", "--json"]));
+  } finally {
+    vi.restoreAllMocks();
+    await rm(target, { recursive: true, force: true });
+  }
+});
+
+/**
+ * The agent instructions (#697): `init` writes the Pithy block into `AGENTS.md` and points `CLAUDE.md`
+ * at it — creating each when the target has none, and merging into each when a cloned repository brought
+ * its own. `project/agentInstructions.test.ts` holds the merge itself; these hold the command to calling it.
+ */
+describe("pithy init — agent instructions", () => {
+  test("a fresh target gets AGENTS.md with the block and a CLAUDE.md pointing at it, and --json says so", async () => {
+    const target = join(dir, "fresh");
+    const written = await runCaptured("init", ["--dir", target, "--name", "acme", "--json"]);
+    const payload = JSON.parse(written.join("")) as Record<string, unknown>;
+    expect(payload.agents).toEqual({ path: AGENTS_FILE, state: "added", reason: null });
+    expect(payload.claude).toEqual({ path: CLAUDE_FILE, state: "added", reason: null });
+    expect(await readFile(join(target, AGENTS_FILE), "utf8")).toBe(`${renderAgentsBlock()}\n`);
+    expect(await readFile(join(target, CLAUDE_FILE), "utf8")).toBe(`${CLAUDE_POINTER}\n`);
+  });
+
+  test("a cloned repo's own AGENTS.md and CLAUDE.md keep every byte, and gain the block and the line", async () => {
+    const target = join(dir, "cloned");
+    await mkdir(target, { recursive: true });
+    await writeFile(join(target, AGENTS_FILE), "# Agents\n\nRun the tests.\n");
+    await writeFile(join(target, CLAUDE_FILE), "# Rules\n\nNo emoji.\n");
+    await runCaptured("init", ["--dir", target, "--name", "acme", "--json"]);
+    expect(await readFile(join(target, AGENTS_FILE), "utf8")).toBe(
+      `# Agents\n\nRun the tests.\n\n${renderAgentsBlock()}\n`,
+    );
+    expect(await readFile(join(target, CLAUDE_FILE), "utf8")).toBe(`# Rules\n\nNo emoji.\n\n${CLAUDE_POINTER}\n`);
+  });
+
+  test("a person reads one line per file, before Done.", async () => {
+    const target = join(dir, "spoken");
+    const written = (await runCaptured("init", ["--dir", target, "--name", "acme"])).join("");
+    const lines = written.split("\n");
+    const done = lines.indexOf("Done.");
+    expect(done).toBeGreaterThan(-1);
+    expect(lines.indexOf("AGENTS.md: Pithy block added.")).toBeGreaterThan(-1);
+    expect(lines.indexOf("AGENTS.md: Pithy block added.")).toBeLessThan(done);
+    expect(lines.indexOf("CLAUDE.md: points at AGENTS.md.")).toBeLessThan(done);
+    expect(lines.indexOf("CLAUDE.md: points at AGENTS.md.")).toBeGreaterThan(-1);
   });
 });

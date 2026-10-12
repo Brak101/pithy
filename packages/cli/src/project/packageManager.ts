@@ -3,6 +3,7 @@
 
 import { access, readFile, realpath } from "node:fs/promises";
 import { join, relative } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { InternalError } from "@pithy-sh/core/src/error/pithyError";
 import { execCommand } from "../platform/command";
 import { startStep } from "../terminal/progress";
@@ -165,7 +166,8 @@ const spawnInstall: InstallRunner = async (command, args, cwd) => {
     throw new InternalError({
       message: `${command} ${args.join(" ")} failed.`,
       action: `Install the package by hand: ${command} ${args.join(" ")}.`,
-      detail: cause instanceof Error ? cause.message : String(cause),
+      // The installer's captured output, without its color: a `--json` error line carries it (#697).
+      detail: stripVTControlCharacters(cause instanceof Error ? cause.message : String(cause)),
     });
   }
 };
