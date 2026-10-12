@@ -480,9 +480,15 @@ function unique(values: readonly string[]): string[] {
   return [...new Set(values)];
 }
 
-/** Is the key required on this side? `optin` is what `z.input` reads; `optout` is what `z.output` reads. */
+/**
+ * Is the key required on this side? `optin` is what `z.input` reads; `optout` is what `z.output` reads.
+ *
+ * Required is the field being unset, not it being anything but `"optional"`: Zod 4.6 marks a `.default()`
+ * key's input `"defaulted"`, which `z.input` still reads as optional, and a test against `"optional"`
+ * alone read every defaulted column as required going in.
+ */
 function requiredOn(schema: ZodSchema, side: Side): boolean {
-  return (side === "input" ? schema._zod.optin : schema._zod.optout) !== "optional";
+  return (side === "input" ? schema._zod.optin : schema._zod.optout) === undefined;
 }
 
 /** The sentence a refused value carries, phrased for the side that refuses it. */

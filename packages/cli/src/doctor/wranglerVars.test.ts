@@ -49,11 +49,11 @@ const SAMPLES: Record<string, { value: unknown; binding: string }> = {
   ai_search_namespaces: { value: [{ binding: "SEARCH_NS", namespace: "n" }], binding: "SEARCH_NS" },
   ai_search: { value: [{ binding: "SEARCH", instance_name: "s" }], binding: "SEARCH" },
   agent_memory: { value: [{ binding: "MEMORY", namespace: "n" }], binding: "MEMORY" },
-  websearch: { value: { binding: "WEB" }, binding: "WEB" },
   hyperdrive: { value: [{ binding: "HYPER", id: "h" }], binding: "HYPER" },
   services: { value: [{ binding: "COLLAB", service: "collab" }], binding: "COLLAB" },
   analytics_engine_datasets: { value: [{ binding: "EVENTS" }], binding: "EVENTS" },
   browser: { value: { binding: "BROWSER" }, binding: "BROWSER" },
+  analytics: { value: { binding: "ANALYTICS" }, binding: "ANALYTICS" },
   ai: { value: { binding: "AI" }, binding: "AI" },
   images: { value: { binding: "IMAGES" }, binding: "IMAGES" },
   media: { value: { binding: "MEDIA" }, binding: "MEDIA" },
@@ -63,6 +63,7 @@ const SAMPLES: Record<string, { value: unknown; binding: string }> = {
   mtls_certificates: { value: [{ binding: "CERT", certificate_id: "c" }], binding: "CERT" },
   dispatch_namespaces: { value: [{ binding: "DISPATCH" }], binding: "DISPATCH" },
   pipelines: { value: [{ binding: "PIPE" }], binding: "PIPE" },
+  k2: { value: [{ binding: "EVENTS_OUT", stream: "s" }], binding: "EVENTS_OUT" },
   secrets_store_secrets: {
     value: [{ binding: "SIGNING_KEY", store_id: "s", secret_name: "k" }],
     binding: "SIGNING_KEY",
@@ -93,6 +94,8 @@ const NOT_BINDINGS: Record<string, string> = {
   connect: "outbound sockets, addressed by host and port",
   tail_consumers: "Workers that receive this one's logs, named by service",
   streaming_tail_consumers: "Workers that receive this one's logs, named by service",
+  exports:
+    "the classes this Worker exports, keyed by class; a Workflow export's `name` is the Workflow's, not a binding",
 };
 
 describe("bindingsIn", () => {
@@ -290,21 +293,24 @@ function interfaceFields(declarations: string, name: string): { name: string; te
 }
 
 /**
- * The fields the samples and lists do not account for: every field whose type names a `binding` needs a
- * sample, and every field whose objects are named by a required `name` is either spelled that way in
- * {@link BINDING_NAMED_BY_NAME} or excused in {@link NOT_BINDINGS}.
+ * The fields the samples and lists do not account for: a field excused in {@link NOT_BINDINGS} is skipped,
+ * every other field whose type names a `binding` needs a sample, and every field whose objects are named by
+ * a required `name` is spelled that way in {@link BINDING_NAMED_BY_NAME}.
  */
 function ungated(fields: readonly { name: string; text: string }[]): string[] {
   const missing: string[] = [];
   for (const field of fields) {
     // A stanza is read with the reader the whole config is — the sample test above holds it to that.
     if (STANZAS.has(field.name)) continue;
+    // A named exception is one whichever test would flag it. `exports` needs this: its `WorkflowExport`
+    // is `Pick<WorkflowBinding, …>`, and the inliner reads the whole of `WorkflowBinding`, `binding` and all.
+    if (NOT_BINDINGS[field.name]) continue;
     const bindingField = /\bbinding\??: string/.test(field.text);
     // The Worker's own top-level `name` is not an entry's; every other `name: string` in the text is.
     const own = field.name === "name" ? field.text.replace(/^ {4}name:.*$/m, "") : field.text;
     const nameField = /(^|[^\w?])name: string/.test(own);
     if (bindingField && !SAMPLES[field.name]) missing.push(field.name);
-    else if (!bindingField && nameField && !NOT_BINDINGS[field.name]) {
+    else if (!bindingField && nameField) {
       if (!BINDING_NAMED_BY_NAME.has(field.name) || !SAMPLES[field.name]) missing.push(field.name);
     }
   }

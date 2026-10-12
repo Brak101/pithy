@@ -43,7 +43,7 @@ import { ENVIRONMENT_VAR } from "@pithy-sh/core/src/worker/identity";
  * In wrangler's own order, which is the order they appear in `EnvironmentNonInheritable` — so a diff
  * against a later wrangler reads as an insertion rather than a reshuffle.
  *
- * Read from `wrangler@4.125.0`. Changing this by hand without a wrangler bump is how it was wrong before;
+ * Read from `wrangler@4.149.0`, which added `analytics` and `k2` and dropped `websearch`. Changing this by hand without a wrangler bump is how it was wrong before;
  * `wranglerInheritance.test.ts` is what says so.
  */
 export const NOT_INHERITED_BY_ENVIRONMENTS: readonly string[] = [
@@ -64,11 +64,11 @@ export const NOT_INHERITED_BY_ENVIRONMENTS: readonly string[] = [
   "ai_search_namespaces",
   "ai_search",
   "agent_memory",
-  "websearch",
   "hyperdrive",
   "services",
   "analytics_engine_datasets",
   "browser",
+  "analytics",
   "ai",
   "images",
   "media",
@@ -80,6 +80,7 @@ export const NOT_INHERITED_BY_ENVIRONMENTS: readonly string[] = [
   "streaming_tail_consumers",
   "dispatch_namespaces",
   "pipelines",
+  "k2",
   "secrets_store_secrets",
   "artifacts",
   "unsafe_hello_world",
