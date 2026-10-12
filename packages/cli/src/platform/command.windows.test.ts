@@ -131,11 +131,17 @@ describe("the helper on a Windows host", () => {
   });
 
   test("the win32 resolution reads the env a call site passes, Path and all", () => {
-    // Same fact as the helper test above, asserted at the pure-resolution seam on the real
-    // environment: `{ ...process.env }` spells the variable `Path`, a case-sensitive `env.PATH`
-    // reads `undefined`, and a resolver that misses it resolves `cmd` to nothing.
-    const env = { ...process.env };
-    expect(Object.keys(env).some((entry) => entry === "Path")).toBe(true);
+    // The fact the fix is written against, constructed rather than assumed: a call site's
+    // `{ ...process.env, … }` copy preserves Windows' own spelling — `Path`, not `PATH` — and a
+    // case-sensitive `env.PATH` on that object reads `undefined`, resolving `cmd` to nothing.
+    const env: NodeJS.ProcessEnv = {};
+    for (const [key, value] of Object.entries(process.env)) {
+      // Windows' spelling of the two variables this resolution reads, whatever this shell exports.
+      const name = key.toUpperCase() === "PATH" ? "Path" : key.toUpperCase() === "PATHEXT" ? "PathExt" : key;
+      if (value !== undefined) env[name] = value;
+    }
+    expect(env.Path).toBeDefined();
+    expect(env.PATH).toBeUndefined(); // the shape the fix exists for: PATH as a key is not there
     const resolved = resolveCommand("cmd", ["/c", "echo"], { env });
     expect(resolved.shell).toBe(false); // found on PATH as an .exe — spawned directly, at its absolute path
     expect(resolved.command.toLowerCase()).toBe("c:\\windows\\system32\\cmd.exe");
