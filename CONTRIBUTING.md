@@ -30,7 +30,7 @@ File one on a form: **Bug report** or **Feature request**. Blank issues are off,
 
 **A vulnerability is never an issue.** Report it privately, as `SECURITY.md` says.
 
-Every form applies `needs-triage`, and every new issue lands on the board at `Inbox`. The label means the issue arrived on a form and nobody has evaluated it yet; the team files through `/refine`, which skips the forms. `/refine` removes it at `Ready`. Nothing removes it on close, so the triage list is `is:open label:needs-triage`. `packages/cli/src/ci/contributorIntake.test.ts` holds the forms, the blank-issue setting and the disclosure link to that. It cannot hold an issue filed through the API, which skips the forms and arrives unlabeled.
+Each form sets the issue type, `Bug` or `Feature`, and applies `needs-triage`; every new issue lands on the board at `Inbox`. **What kind of issue it is goes in the type, never a label.** The org defines `Bug`, `Feature`, `Task` and `Epic`, and an issue has exactly one, so `bug`, `enhancement` and `documentation` are no longer applied. Labels are for what can overlap: `needs-triage`, `good first issue`, `help wanted`. The label means the issue arrived on a form and nobody has evaluated it yet; the team files through `/refine`, which skips the forms. `/refine` removes it at `Ready`. Nothing removes it on close, so the triage list is `is:open label:needs-triage`. `packages/cli/src/ci/contributorIntake.test.ts` holds the forms, their types, the blank-issue setting and the disclosure link to that. It cannot hold an issue filed through the API, which skips the forms and arrives unlabeled.
 
 ## Pull requests from outside the team
 

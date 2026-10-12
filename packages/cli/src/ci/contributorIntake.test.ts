@@ -14,7 +14,9 @@ import { beforeAll, describe, expect, test } from "vitest";
  * it. A template added without it files issues nobody is told to evaluate, and turning blank issues back
  * on lets a reporter skip the forms on the web. Both fail silently, so this gate holds them:
  *
- * 1. **Every issue form applies `needs-triage`.**
+ * 1. **Every issue form applies `needs-triage`, and sets an issue type.** What kind of issue it is goes in
+ *    the type, never a label: one per issue, so nothing is both a bug and a feature. Labels are for what
+ *    can overlap, so a form that applies `bug`, `enhancement` or `documentation` fails here.
  * 2. **Blank issues are off, and the only contact link a reporter sees is private disclosure.**
  * 3. **The pull request template asks for the issue it closes**, by a keyword GitHub acts on.
  * 4. **`SECURITY.md` names the same private advisory link.**
@@ -24,7 +26,7 @@ import { beforeAll, describe, expect, test } from "vitest";
  * Labeling by `author_association` would need an `issues: opened` workflow, which #707 left out.
  *
  * The files are read as text. There is no YAML parser in this monorepo (`mcp/yaml.ts` says why), and each
- * form keeps `labels:` as one flow sequence on one line on purpose, so a line read is the whole read.
+ * form keeps `type:` and `labels:` on one line each on purpose, so a line read is the whole read.
  */
 
 /** The repository root. This file lives at `packages/cli/src/ci/`. */
@@ -35,6 +37,12 @@ const PR_TEMPLATE = resolve(REPO_ROOT, ".github", "pull_request_template.md");
 const SECURITY = resolve(REPO_ROOT, "SECURITY.md");
 
 const TRIAGE_LABEL = "needs-triage";
+/** The issue types the `pithy-sh` org defines: `gh api orgs/pithy-sh/issue-types`. A form naming any other fails to file. */
+const ISSUE_TYPES = ["Bug", "Feature", "Task", "Epic"];
+
+/** The labels that once said what kind of issue it was. The issue type says that now. */
+const KIND_LABELS = ["bug", "enhancement", "documentation"];
+
 const ADVISORY_URL = "https://github.com/pithy-sh/pithy/security/advisories/new";
 
 /** The labels a form applies, from its one-line `labels: [a, "b"]`. `undefined` when it has none. */
@@ -45,6 +53,11 @@ function formLabels(form: string): string[] | undefined {
     .split(",")
     .map((label) => label.trim().replace(/^(["'])(.*)\1$/, "$2"))
     .filter((label) => label.length > 0);
+}
+
+/** The issue type a form sets, from its top-level `type:`. `undefined` when it sets none. */
+function formType(form: string): string | undefined {
+  return /^type:\s*(["']?)([^"'#\s][^"'#]*?)\1\s*(#.*)?$/m.exec(form)?.[2];
 }
 
 /** Each contact link's `url:`, whether it opens its list item or follows `name:`. */
@@ -76,6 +89,17 @@ describe("the label reader", () => {
   });
 });
 
+describe("the type reader", () => {
+  test("takes a bare or quoted type, past a trailing comment", () => {
+    expect(formType("type: Bug\n")).toBe("Bug");
+    expect(formType('type: "Feature" # set on submit\n')).toBe("Feature");
+  });
+
+  test("ignores a field's nested type", () => {
+    expect(formType("body:\n  - type: textarea\n")).toBeUndefined();
+  });
+});
+
 describe("the link reader", () => {
   test("takes a url that follows its name and one that opens its list item", () => {
     expect(contactUrls("  - name: A\n    url: https://a\n  - url: https://b\n    name: B\n")).toEqual([
@@ -103,6 +127,23 @@ describe("contributor intake", () => {
     for (const file of forms) {
       const labels = formLabels(await readFile(resolve(TEMPLATES, file), "utf8"));
       expect(labels, file).toContain(TRIAGE_LABEL);
+    }
+  });
+
+  test("every issue form sets an issue type the org defines", async () => {
+    for (const file of forms) {
+      const type = formType(await readFile(resolve(TEMPLATES, file), "utf8"));
+      expect(ISSUE_TYPES, file).toContain(type);
+    }
+  });
+
+  test("no issue form says what kind of issue it is with a label", async () => {
+    for (const file of forms) {
+      const labels = formLabels(await readFile(resolve(TEMPLATES, file), "utf8")) ?? [];
+      expect(
+        labels.filter((label) => KIND_LABELS.includes(label)),
+        file,
+      ).toEqual([]);
     }
   });
 
