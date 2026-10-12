@@ -34,7 +34,7 @@ import {
 import { heldReservations } from "../feature/prune";
 import { currentBranch, defaultGit } from "../feature/worktree";
 import { openUrl as openUrlDefault } from "../platform/browser";
-import { killTree, spawnCommand } from "../platform/command";
+import { spawnCommand } from "../platform/command";
 import { composeFor } from "../project/composeFor";
 import { allCapabilities } from "../project/config";
 import { detectPackageManager, execArgs } from "../project/packageManager";
@@ -587,12 +587,7 @@ export async function startDev(options: StartDevOptions): Promise<DevHandle> {
   const isAlive = options.isAlive ?? isAliveDefault;
   const sleep = options.sleep ?? realSleep;
   const hasSetsid = options.hasSetsid ?? process.platform !== "win32";
-  // POSIX: signal the process group, which reaches the workers under the leader. Windows: the tree
-  // kill (`command.ts`), measured necessary — a plain kill ends the cmd.exe launcher and leaves its
-  // grandchild on the port. Node's Windows signals are TerminateProcess anyway, so both of ours land
-  // as the forceful variant of the tree walk; the grace window above the SIGKILL is the session's
-  // patience, not the OS's.
-  const kill = options.kill ?? (hasSetsid ? (pid, signal) => process.kill(pid, signal) : (pid) => killTree(pid, true));
+  const kill = options.kill ?? ((pid, signal) => process.kill(pid, signal));
   const stdout = options.stdout ?? ((text: string) => void process.stdout.write(text));
   const stderr = options.stderr ?? ((text: string) => void process.stderr.write(text));
   const readDevLogins = options.readDevLogins ?? readDevLoginsDefault;

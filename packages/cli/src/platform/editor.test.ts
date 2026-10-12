@@ -213,7 +213,7 @@ describe("runEditor", () => {
     await runEditor(editor, "/tmp/replay/secrets.edit.jsonc", {
       platform: "linux",
       spawn: (command, args, options) => {
-        calls.push({ command, args, shell: options.shell });
+        calls.push({ command, args, shell: Boolean(options.shell) });
         return child(0);
       },
     });
@@ -290,7 +290,7 @@ describe("runEditor", () => {
     await runEditor(editor, "/tmp/a b/secrets.jsonc", {
       platform: "linux",
       spawn: (_command, args, options) => {
-        calls.push({ args, shell: options.shell });
+        calls.push({ args, shell: Boolean(options.shell) });
         return child(0);
       },
     });

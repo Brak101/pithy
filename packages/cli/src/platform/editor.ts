@@ -214,7 +214,6 @@ export async function runEditor(editor: ResolvedEditor, file: string, options: R
   return new Promise<number>((resolve, reject) => {
     const child = spawnEditor(target.command, target.args, {
       stdio: "inherit",
-      shell: target.shell,
       windowsVerbatimArguments: target.verbatim,
     });
     child.on("error", (cause: Error) => {

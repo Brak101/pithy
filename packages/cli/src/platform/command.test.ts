@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
+import { ValidationError } from "@pithy-sh/core/src/error/pithyError";
 import { describe, expect, test } from "vitest";
-import { escapeWord, execCommand, quoteForCmd, resolveCommand, spawnCommand } from "./command";
+import { cmdShell, escapeWord, execCommand, quoteForCmd, resolveCommand, spawnCommand } from "./command";
 
 /**
  * #698. The Windows half of the resolution is exercised through the same seams `editor.ts` uses, so the
@@ -31,7 +32,6 @@ function shimEnv(root: string): { env: NodeJS.ProcessEnv; exists: (file: string)
 const shellLine = (line: string) => ({
   command: "cmd.exe",
   args: ["/d", "/s", "/c", `"${line}"`],
-  shell: false,
   verbatim: true,
 });
 
@@ -67,7 +67,6 @@ describe("resolveCommand — win32", () => {
     expect(resolved).toEqual({
       command: wjoin("C:\\bin", "tool.exe"),
       args: ["dev", "--port", "8787"],
-      shell: false,
       verbatim: false,
     });
   });
@@ -84,7 +83,7 @@ describe("resolveCommand — win32", () => {
       env: { PATH: dir, PATHEXT: ".COM;.EXE;.BAT;.CMD" },
       fileExists: (file) => files.has(file),
     });
-    expect(resolved).toEqual({ command: wjoin(dir, "tool.exe"), args: [], shell: false, verbatim: false });
+    expect(resolved).toEqual({ command: wjoin(dir, "tool.exe"), args: [], verbatim: false });
   });
 
   test("a .bat is a shim too — the same shape as the .cmd", () => {
@@ -117,20 +116,18 @@ describe("resolveCommand — win32", () => {
       env: { PATH: "C:\\empty", PATHEXT: ".EXE;.CMD" },
       fileExists: () => false,
     });
-    expect(resolved).toEqual({ command: "tool", args: ["add"], shell: false, verbatim: false });
+    expect(resolved).toEqual({ command: "tool", args: ["add"], verbatim: false });
   });
 
   test("a name that already carries a path is a location, not a lookup", () => {
     expect(resolveCommand("C:\\Program Files\\nodejs\\node.exe", ["-v"], { ...WIN, fileExists: () => false })).toEqual({
       command: "C:\\Program Files\\nodejs\\node.exe",
       args: ["-v"],
-      shell: false,
       verbatim: false,
     });
     expect(resolveCommand("./local/tool", [], { ...WIN, fileExists: () => false })).toEqual({
       command: "./local/tool",
       args: [],
-      shell: false,
       verbatim: false,
     });
   });
@@ -139,12 +136,16 @@ describe("resolveCommand — win32", () => {
     // A worker's `dev.command` of `node_modules\\.bin\\vite.cmd` is a location the caller named — and a
     // `.cmd` handed to `spawn` without a shell is the EINVAL throw, which escapes `startWorker` and ends
     // a `pithy dev` session over one worker. However it was spelled, a batch file takes the shell.
-    expect(resolveCommand("npm.cmd", ["install"], { ...WIN, fileExists: () => false })).toEqual(
-      shellLine(`npm.cmd ^"install^"`),
-    );
-    expect(resolveCommand("node_modules\\.bin\\vite.cmd", ["dev"], { ...WIN, fileExists: () => false })).toEqual(
-      shellLine(String.raw`node_modules\.bin\vite.cmd ^"dev^"`),
-    );
+    expect(
+      resolveCommand("npm.cmd", ["install"], { ...WIN, env: { PATH: "C:\\tools" }, fileExists: () => false }),
+    ).toEqual(shellLine(`npm.cmd ^"install^"`));
+    expect(
+      resolveCommand("node_modules\\.bin\\vite.cmd", ["dev"], {
+        ...WIN,
+        env: { PATH: "C:\\tools" },
+        fileExists: () => false,
+      }),
+    ).toEqual(shellLine(String.raw`node_modules\.bin\vite.cmd ^"dev^"`));
   });
 
   test("PATH and PATHEXT are found by name regardless of case", () => {
@@ -160,7 +161,8 @@ describe("resolveCommand — win32", () => {
 
   test("COMSPEC is honored, by name regardless of case", () => {
     // The shell to run is the one the environment names (`ComSpec` is Windows' spelling), the same
-    // lookup rule as PATH. The fallback is bare `cmd.exe`, which every Windows PATH carries.
+    // lookup rule as PATH. The fallback is a full path, not a bare name: a bare `cmd.exe` is looked
+    // up in the working directory before PATH, and the working directory is the project's.
     const dir = "C:\\tools";
     const resolved = resolveCommand("tool", [], {
       ...WIN,
@@ -170,6 +172,26 @@ describe("resolveCommand — win32", () => {
     expect(resolved.command).toBe("C:\\windows\\system32\\cmd.exe");
     expect(resolved.verbatim).toBe(true);
   });
+
+  test("the shell fallback is SystemRoot\\System32, by name regardless of case", () => {
+    const { env, exists } = shimEnv("C:\\tools");
+    expect(
+      resolveCommand("tool", [], { ...WIN, env: { ...env, SystemRoot: "C:\\windows" }, fileExists: exists }).command,
+    ).toBe(String.raw`C:\windows\System32\cmd.exe`);
+    // An empty COMSPEC is no shell: it falls back like a missing one.
+    expect(
+      resolveCommand("tool", [], { ...WIN, env: { ...env, COMSPEC: "", Systemroot: "C:\\WIN" }, fileExists: exists })
+        .command,
+    ).toBe(String.raw`C:\WIN\System32\cmd.exe`);
+  });
+
+  test("an argument carrying a double quote is refused on the cmd.exe path", () => {
+    // npm's shims forward `%*`, and the `.cmd` re-parses that text with a tokenizer that does not
+    // know `\"`: an escaped quote closes the quoting, and a `&` behind it runs as a command. The
+    // refusal is the fix — no caller has a legitimate quote in argv.
+    expect(() => cmdShell("npm.cmd", ['a"&b'], { PATH: "C:\\tools" })).toThrow(ValidationError);
+    expect(() => cmdShell("npm.cmd", ["clean"], { PATH: "C:\\tools" })).not.toThrow();
+  });
 });
 
 describe("resolveCommand — everywhere else", () => {
@@ -177,13 +199,11 @@ describe("resolveCommand — everywhere else", () => {
     expect(resolveCommand("npm", ["add", "zod"], { platform: "linux", fileExists: () => true })).toEqual({
       command: "npm",
       args: ["add", "zod"],
-      shell: false,
       verbatim: false,
     });
     expect(resolveCommand("npm", [], { platform: "darwin", fileExists: () => true })).toEqual({
       command: "npm",
       args: [],
-      shell: false,
       verbatim: false,
     });
   });
@@ -192,7 +212,6 @@ describe("resolveCommand — everywhere else", () => {
     expect(resolveCommand("node_modules/.bin/vite.cmd", ["dev"], { platform: "linux" })).toEqual({
       command: "node_modules/.bin/vite.cmd",
       args: ["dev"],
-      shell: false,
       verbatim: false,
     });
   });
@@ -270,8 +289,8 @@ describe("the .cmd guard the helper exists to satisfy", () => {
     const { env, exists } = shimEnv("C:\\tools");
     for (const resolved of [
       resolveCommand("tool", [], { ...WIN, env, fileExists: exists }),
-      resolveCommand("npm.cmd", [], { ...WIN }),
-      resolveCommand("x\\vite.cmd", [], { ...WIN }),
+      resolveCommand("npm.cmd", [], { ...WIN, env: { PATH: "C:\\tools" } }),
+      resolveCommand("x\\vite.cmd", [], { ...WIN, env: { PATH: "C:\\tools" } }),
     ]) {
       expect(resolved.command).toBe("cmd.exe");
       expect(resolved.verbatim).toBe(true);

@@ -1,17 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
-import {
-  type ChildProcess,
-  type ExecFileOptions,
-  execFile,
-  type SpawnOptions,
-  spawn,
-  spawnSync,
-} from "node:child_process";
+import { type ChildProcess, type ExecFileOptions, execFile, type SpawnOptions, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { win32 } from "node:path";
 import { promisify } from "node:util";
+import { ValidationError } from "@pithy-sh/core/src/error/pithyError";
 
 /**
  * Resolve and start a child process by command name the way a shell would — against `PATH` and, on
@@ -71,12 +65,10 @@ export interface CommandEnvironment {
 export interface ResolvedCommand {
   command: string;
   args: string[];
-  /** Hand to `spawn`/`execFile` as `shell`. True only for the identity-with-shell spelling (editor's POSIX path never uses it). */
-  shell: boolean;
   /**
    * Hand to `spawn`/`execFile` as `windowsVerbatimArguments`: the argv was assembled for `cmd.exe`
    * by {@link cmdShell} and is already quoted — Node must pass it through untouched. True exactly
-   * when `command` is `cmd.exe`.
+   * when the spawn is a `cmd.exe` launcher.
    */
   verbatim: boolean;
 }
@@ -87,7 +79,7 @@ const SHELL_RUNNABLE = new Set([".cmd", ".bat"]);
 /** Resolve `command` + `args` for a spawn. {@link spawnCommand} and {@link execCommand} apply it; a test reads it. */
 export function resolveCommand(command: string, args: string[], options: CommandEnvironment = {}): ResolvedCommand {
   const platform = options.platform ?? process.platform;
-  if (platform !== "win32") return { command, args, shell: false, verbatim: false };
+  if (platform !== "win32") return { command, args, verbatim: false };
   const env = options.env ?? process.env;
   // Already a batch file, by bare name (`npm.cmd`) or by path (`node_modules\\.bin\\vite.cmd`): it runs
   // through cmd.exe however it was named, and cmd.exe does the lookup. It cannot reach `spawn` bare —
@@ -95,10 +87,10 @@ export function resolveCommand(command: string, args: string[], options: Command
   // worker's `dev.command`.
   if (SHELL_RUNNABLE.has(extensionOf(command))) return cmdShell(command, args, env);
   // Any other name with a path in it is already a location, and the spawn resolves it.
-  if (command.includes("/") || command.includes("\\")) return { command, args, shell: false, verbatim: false };
+  if (command.includes("/") || command.includes("\\")) return { command, args, verbatim: false };
   const file = findOnPath(command, env, options.fileExists ?? existsSync);
-  if (file === null) return { command, args, shell: false, verbatim: false };
-  if (!SHELL_RUNNABLE.has(extensionOf(file))) return { command: file, args, shell: false, verbatim: false };
+  if (file === null) return { command, args, verbatim: false };
+  if (!SHELL_RUNNABLE.has(extensionOf(file))) return { command: file, args, verbatim: false };
   return cmdShell(file, args, env);
 }
 
@@ -110,11 +102,27 @@ export function resolveCommand(command: string, args: string[], options: Command
  * and escaped by {@link escapeWord}/{@link quoteForCmd}.
  */
 export function cmdShell(command: string, args: string[], env: NodeJS.ProcessEnv = process.env): ResolvedCommand {
+  // An argument holding a `"` is refused, not escaped. The outer line survives an escaped quote, but
+  // npm's shims forward `%*`, and the `.cmd` re-parses that text with a tokenizer that does not know
+  // `\"`: the quote closes at the escaped `"`, and whatever follows the `&` behind it runs as a
+  // command. This is why cross-spawn double-escapes for npm shims; a third quoting pass inside our
+  // quoting pass buys a shape no shim in the wild forwards cleanly. No caller has a legitimate
+  // `"` — argv here comes from the adopter's config and `@pithy-sh` package metadata, never from an
+  // outsider — so the one argument that cannot cross dies at the door with a name, not as a
+  // re-parse.
+  for (const arg of args) {
+    if (arg.includes('"')) {
+      throw new ValidationError({
+        message: `An argument to ${command} contains a double quote, which cmd.exe shims cannot forward safely.`,
+        action: 'Remove the " from that argument and run this again.',
+        detail: `argument '${arg}' carries a quote through a cmd.exe shim chain`,
+      });
+    }
+  }
   const line = [escapeWord(command), ...args.map(quoteForCmd)].join(" ");
   return {
     command: comSpec(env),
     args: ["/d", "/s", "/c", `"${line}"`],
-    shell: false,
     verbatim: true,
   };
 }
@@ -200,7 +208,7 @@ function findOnPath(name: string, env: NodeJS.ProcessEnv, fileExists: (path: str
 function environmentValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
   const direct = env[name];
   if (direct !== undefined) return direct;
-  const key = Object.keys(env).find((entry) => entry.toUpperCase() === name);
+  const key = Object.keys(env).find((entry) => entry.toUpperCase() === name.toUpperCase());
   return key === undefined ? undefined : env[key];
 }
 
@@ -213,28 +221,17 @@ function extensionOf(file: string): string {
 
 /**
  * The shell to run batch files under: `COMSPEC` when the environment names one (Windows spells it
- * `ComSpec`, and every call site's env is a case-mangled copy), and `cmd.exe` otherwise — a name
- * every Windows PATH carries. An empty `COMSPEC` is no shell: it falls back like a missing one.
+ * `ComSpec`, and every call site's env is a case-mangled copy), and `SystemRoot\System32\cmd.exe`
+ * otherwise. The fallback is a full path because a bare `cmd.exe` is looked up in the *working
+ * directory* before `PATH` — the project directory here, which is attacker-adjacent territory a
+ * system shell should never be searched inside of. An empty `COMSPEC` is no shell: it falls back
+ * like a missing one.
  */
 function comSpec(env: NodeJS.ProcessEnv): string {
-  return environmentValue(env, "COMSPEC") || "cmd.exe";
-}
-
-/**
- * Stop a process **and its children** on Windows. `taskkill /T` walks the tree (its `/F` variant is the
- * SIGKILL of it; without `/F` it asks, the SIGTERM of it).
- *
- * The dev orchestrator exists because POSIX has process groups: a detached child leads one, and
- * `kill(-pid)` reaches `workerd` under `wrangler` under the runner. Windows has nothing of the kind —
- * `spawn(..., { detached: true })` creates a *new console*, not a group — and the children it starts
- * now run under a `cmd.exe` launcher, which forwards argv and owns a grandchild. Measured on a
- * Windows host: `kill(pid, SIGTERM)` and `kill(pid, SIGKILL)` both end `cmd.exe` and leave the
- * grandchild listening on the pinned port, which is a server with no session and a dev run that
- * cannot restart. The tree kill is what closes it, and the walk's spawner rule reads this call the
- * same way it reads the spawn above: a mechanism, counted at its callers.
- */
-export function killTree(pid: number, force: boolean): void {
-  spawnSync("taskkill", force ? ["/T", "/F", "/PID", String(pid)] : ["/T", "/PID", String(pid)], { stdio: "ignore" });
+  const comSpecValue = environmentValue(env, "COMSPEC");
+  if (comSpecValue) return comSpecValue;
+  const systemRoot = environmentValue(env, "SystemRoot");
+  return systemRoot ? win32.join(systemRoot, "System32", "cmd.exe") : "cmd.exe";
 }
 
 /** The characters `cmd.exe` reads as syntax: http://www.robvanderwoude.com/escapechars.php. */

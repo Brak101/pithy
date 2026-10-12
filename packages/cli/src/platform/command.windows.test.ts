@@ -5,9 +5,10 @@ import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ValidationError } from "@pithy-sh/core/src/error/pithyError";
 import { describe, expect, test } from "vitest";
 import { requireWindows } from "../test-utils/windows";
-import { execCommand, resolveCommand } from "./command";
+import { execCommand, resolveCommand, spawnCommand } from "./command";
 
 requireWindows();
 
@@ -94,6 +95,20 @@ describe("the helper on a Windows host", () => {
     }
   });
 
+  test("a quoted argument is refused before the shim runs", async () => {
+    // The reviewer's `a"&b`: the outer cmd line survives the escape, but the shim forwards `%*` and
+    // the `.cmd` re-parse does not know `\"` — the quote closes and the `&b` runs as a command. The
+    // refusal (#699 review round 3) fires at resolution, on this host's real path, and the recorder
+    // proves the child never started.
+    await newDir("quote-refusal");
+    try {
+      await writeShim("@echo off\r\necho ran\r\n");
+      expect(() => spawnCommand("tool", ['a"&b'], { env: childEnv(), cwd: dir })).toThrow(ValidationError);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("a .cmd named by path spawns through the helper, not at the EINVAL", async () => {
     // A worker's `dev.command` is a path, and a `.cmd` handed to `spawn` without a shell throws —
     // the resolution's shell branch is what a `pithy dev` session with a `vite.cmd` worker depends on.
@@ -143,7 +158,7 @@ describe("the helper on a Windows host", () => {
     expect(env.Path).toBeDefined();
     expect(env.PATH).toBeUndefined(); // the shape the fix exists for: PATH as a key is not there
     const resolved = resolveCommand("cmd", ["/c", "echo"], { env });
-    expect(resolved.shell).toBe(false); // found on PATH as an .exe — spawned directly, at its absolute path
+    expect(resolved.verbatim).toBe(false); // found on PATH as an .exe — spawned directly, at its absolute path
     expect(resolved.command.toLowerCase()).toBe("c:\\windows\\system32\\cmd.exe");
   });
 });
