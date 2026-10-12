@@ -15,14 +15,14 @@ requireWindows();
 /**
  * **What a `.cmd` takes to run on Windows, from Node** — the fact #698 and every fix for it build on.
  *
- * This does not drive the CLI's package-manager spawn, which is still broken on Windows (#698); the fix for
- * that brings its own `*.windows.test.ts`, and this job is what runs it.
+ * This drives the CLI's package-manager spawn resolution (#698) and the editor, which share one shell
+ * shape; `platform/command.windows.test.ts` is its sibling for the resolution itself.
  *
  * The package managers and most editors are `.cmd` shims on Windows. Since the April 2024 fix for
  * CVE-2024-27980, Node refuses to spawn a `.cmd` or `.bat` without a shell, so the obvious repair — spawn
  * `npm.cmd` instead of `npm` — fails with `EINVAL` on every Node the CLI supports. Running one through
  * `cmd.exe` works, and every argument then has to survive `cmd.exe` re-splitting the command line, which
- * is what `runEditor`'s quoting is for (`docs/ACCEPTED-LIMITS.md` §Windows runs the editor through a shell).
+ * is what `runEditor`'s quoting is for (`docs/ACCEPTED-LIMITS.md` §Windows runs `.cmd` files through a shell).
  *
  * The shim lives in a directory with a space in its name, because a Windows home directory with a space
  * in it is the common case and the quoting is exactly what breaks there.

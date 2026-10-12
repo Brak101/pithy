@@ -1,7 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
-import { type ChildProcess, type ExecFileOptions, execFile, type SpawnOptions, spawn } from "node:child_process";
+import {
+  type ChildProcess,
+  type ExecFileOptions,
+  execFile,
+  type SpawnOptions,
+  spawn,
+  spawnSync,
+} from "node:child_process";
 import { existsSync } from "node:fs";
 import { win32 } from "node:path";
 import { promisify } from "node:util";
@@ -211,6 +218,23 @@ function extensionOf(file: string): string {
  */
 function comSpec(env: NodeJS.ProcessEnv): string {
   return environmentValue(env, "COMSPEC") || "cmd.exe";
+}
+
+/**
+ * Stop a process **and its children** on Windows. `taskkill /T` walks the tree (its `/F` variant is the
+ * SIGKILL of it; without `/F` it asks, the SIGTERM of it).
+ *
+ * The dev orchestrator exists because POSIX has process groups: a detached child leads one, and
+ * `kill(-pid)` reaches `workerd` under `wrangler` under the runner. Windows has nothing of the kind —
+ * `spawn(..., { detached: true })` creates a *new console*, not a group — and the children it starts
+ * now run under a `cmd.exe` launcher, which forwards argv and owns a grandchild. Measured on a
+ * Windows host: `kill(pid, SIGTERM)` and `kill(pid, SIGKILL)` both end `cmd.exe` and leave the
+ * grandchild listening on the pinned port, which is a server with no session and a dev run that
+ * cannot restart. The tree kill is what closes it, and the walk's spawner rule reads this call the
+ * same way it reads the spawn above: a mechanism, counted at its callers.
+ */
+export function killTree(pid: number, force: boolean): void {
+  spawnSync("taskkill", force ? ["/T", "/F", "/PID", String(pid)] : ["/T", "/PID", String(pid)], { stdio: "ignore" });
 }
 
 /** The characters `cmd.exe` reads as syntax: http://www.robvanderwoude.com/escapechars.php. */
