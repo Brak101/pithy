@@ -680,10 +680,11 @@ export function childProcessReport(
     const seamCalls: CallSite[] = [];
     if (policy.commandSpawner !== undefined && module.file !== policy.commandSpawner) {
       const text = references.get(module.file) ?? module.code;
+      const bareText = blankStrings(text);
       for (const seam of COMMAND_SEAMS) {
         for (const local of localReferences(text, imports.get(module.file) ?? [], policy.commandSpawner, seam)) {
-          for (const at of occurrences(text, local)) {
-            const after = text.slice(at + local.length);
+          for (const at of occurrences(bareText, local)) {
+            const after = bareText.slice(at + local.length);
             const opened = /^\s*\(/.exec(after);
             if (opened === null) continue;
             seamCalls.push({

@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { NotFoundError, ValidationError } from "@pithy-sh/core/src/error/pithyError";
-import { quoteForCmd } from "./command";
+import { resolveCommand } from "./command";
 
 /**
  * The one place Pithy decides what "open this in your editor" means (#157).
@@ -164,7 +164,7 @@ export interface EditorProcess {
 export type SpawnEditor = (
   command: string,
   args: readonly string[],
-  options: { stdio: "inherit"; shell: boolean },
+  options: { stdio: "inherit"; shell: boolean; windowsVerbatimArguments: boolean },
 ) => EditorProcess;
 
 /** What {@link runEditor} needs beyond the editor itself. */
@@ -173,6 +173,8 @@ export interface RunEditorOptions {
   platform?: NodeJS.Platform;
   /** How to spawn, defaulting to `node:child_process`'s `spawn`. */
   spawn?: SpawnEditor;
+  /** Existence probe for the command resolution, defaulting to the real filesystem (see `command.ts`). */
+  fileExists?: (path: string) => boolean;
 }
 
 /**
@@ -188,21 +190,30 @@ export interface RunEditorOptions {
  *
  * **Windows goes through a shell, and that is not laziness.** Every GUI editor there is a `.cmd` shim —
  * `code.cmd`, `subl.cmd` — and Node refuses to spawn one directly (it has since the argument-injection
- * fix). With `shell: true` the whole command line becomes one string that `cmd.exe /d /s /c` re-splits,
- * so anything with a space in it has to carry its own quotes: the file lives under
- * `%APPDATA%\pithy\<project>\`, and a Windows home directory with a space in it is the common case, not
- * the exotic one. `/s` strips exactly the outermost pair, so the inner quotes survive to cmd's own
- * splitting. A `"` cannot appear in a Windows path at all, so there is nothing left to escape.
+ * fix). The spawn is the one shape the CLI runs every `.cmd` in (#698): `cmd.exe /d /s /c "<line>"`
+ * with verbatim arguments, the command word caret-escaped and every argument quoted whole — the file
+ * lives under `%APPDATA%\pithy\<project>\`, and a Windows home directory with a space in it is the
+ * common case, not the exotic one. `/s` strips exactly the outermost pair, so the quoting survives to
+ * cmd's own splitting. One shell, one escaping, `platform/command.ts` owns both.
  */
 export async function runEditor(editor: ResolvedEditor, file: string, options: RunEditorOptions = {}): Promise<number> {
   const platform = options.platform ?? process.platform;
   const spawnEditor = options.spawn ?? defaultSpawn;
-  const windows = platform === "win32";
-  const command = windows ? quoteForCmd(editor.command) : editor.command;
-  const args = windows ? [...editor.args, quoteForCmd(file)] : [...editor.args, file];
+  // The same resolution every package-manager spawn runs through (#698): on Windows, `code.cmd` is a
+  // `.cmd` shim, so the resolution hands back the cmd.exe /d /s /c form with the file quoted and
+  // caret-armed — one shell shape in the CLI, one escaping, one place to keep it honest. On POSIX the
+  // resolution is identity and the editor's own args stream straight through.
+  const target = resolveCommand(editor.command, [...editor.args, file], {
+    platform,
+    fileExists: options.fileExists,
+  });
 
   return new Promise<number>((resolve, reject) => {
-    const child = spawnEditor(command, args, { stdio: "inherit", shell: windows });
+    const child = spawnEditor(target.command, target.args, {
+      stdio: "inherit",
+      shell: target.shell,
+      windowsVerbatimArguments: target.verbatim,
+    });
     child.on("error", (cause: Error) => {
       reject(
         new NotFoundError(
@@ -326,4 +337,8 @@ function raiseNoWait(editor: ResolvedEditor, flag: string): never {
 
 /** The real spawn, kept behind the seam so a test never starts a process. */
 const defaultSpawn: SpawnEditor = (command, args, options) =>
-  spawn(command, [...args], { stdio: options.stdio, shell: options.shell });
+  spawn(command, [...args], {
+    stdio: options.stdio,
+    shell: options.shell,
+    windowsVerbatimArguments: options.windowsVerbatimArguments,
+  });

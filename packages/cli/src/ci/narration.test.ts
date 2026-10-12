@@ -47,14 +47,15 @@ import { isTestFile, readSource, sourcePaths } from "./sourceFiles";
  *
  * **Not every child needs a step, and there are two exceptions.** A child whose executable is written as the
  * literal `"git"`, `"lsof"` or `"ps"` is a bounded local query — git's metadata, the process table — judged at
- * the call site, so the same `execFile` with `"npm"` beside it is held. And a `spawn` in one of two named
- * modules that hand the child's streams on rather than collecting them — the editor that owns the terminal
- * and the browser opener that detaches — is not captured. Only `spawn` there: an `execFile` in any of them
- * is held like anywhere else.
- * The shared command spawner (`platform/command.ts`, #698) is exempt by a different rule: the spawn *inside*
- * it is the mechanism, not a call site, and every `spawnCommand`/`execCommand` call in its callers is
- * counted as a spawn where it is written. The spawner's exemption exempts one file; it exempts nobody
- * who calls it.
+ * the call site, so the same `execFile` with `"npm"` beside it is held. And a streams-on spawn in one of
+ * three named modules — the editor that owns the terminal, the browser opener that detaches, and the dev
+ * orchestrator that pipes each worker's streams to the terminal and the session log — is not captured.
+ * Streams-on means the `spawn` primitive, and its #698 spelling through the shared command spawner,
+ * `spawnCommand`: an `execFile` in any of them is held like anywhere else, and so is every captured
+ * child in the spawner's other callers, each counted at its own call site.
+ * The spawner itself (`platform/command.ts`) is exempt by a third rule: the spawn *inside* it is the
+ * mechanism, not a call site, and every `spawnCommand`/`execCommand` call in its callers is counted as
+ * a spawn where it is written. The spawner's exemption exempts one file; it exempts nobody who calls it.
  *
  * **Where silence is reported.** A declaration that reaches a child without a step passes that on to whatever
  * names it, so the defect surfaces where a run begins: a `pithy <command>` module, or `bin.ts` and `main.ts`,
@@ -126,10 +127,15 @@ const WRAP = /\bwithErrorReporting\s*\(/;
 /** What needs no step. Each entry is argued in the docblock above. */
 const POLICY: ChildProcessPolicy = {
   boundedExecutables: new Set(["git", "lsof", "ps"]),
-  uncapturedModules: new Set(["platform/browser.ts", "platform/editor.ts"].map((path) => resolve(CLI_SRC, path))),
+  uncapturedModules: new Set(
+    ["platform/browser.ts", "platform/editor.ts", "dev/orchestrator.ts"].map((path) => resolve(CLI_SRC, path)),
+  ),
   progressModule: resolve(CLI_SRC, "terminal", "progress.ts"),
   // The shared command spawner (#698): its seam calls are spawns **at their call sites**, counted in
   // each caller rather than exempted as a module, so the next caller cannot borrow the exemption.
+  // The streams-on exemption then reads the seam call exactly as it read the raw `spawn` it replaced:
+  // the dev orchestrator pipes its workers' streams to the terminal and the session log, which is why
+  // `dev/orchestrator.ts` joins the list — the child streams, so it needs no step.
   commandSpawner: resolve(CLI_SRC, "platform", "command.ts"),
 };
 
@@ -188,7 +194,6 @@ describe("a long command narrates itself", () => {
       "packages/cli/src/feature/ports.ts",
       "packages/cli/src/feature/worktree.ts",
       "packages/cli/src/platform/browser.ts",
-      "packages/cli/src/platform/command.ts",
       "packages/cli/src/platform/editor.ts",
       "packages/cli/src/project/deploy.ts",
       "packages/cli/src/project/packageManager.ts",
@@ -200,7 +205,8 @@ describe("a long command narrates itself", () => {
   test("each exception still describes a module that starts a child", () => {
     for (const file of POLICY.uncapturedModules) {
       expect(
-        report.calls.get(file)?.some((call) => call.primitive === "spawn"),
+        // Streams-on, in either spelling: the raw `spawn`, and its #698 seam `spawnCommand`.
+        report.calls.get(file)?.some((call) => call.primitive === "spawn" || call.primitive === "spawnCommand"),
         shown(file),
       ).toBe(true);
     }
