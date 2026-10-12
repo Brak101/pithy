@@ -109,6 +109,8 @@ const SPAWNS: Readonly<Record<string, string>> = {
   'feature/ports.ts "git"': "Reads the branch a feature's port block belongs to.",
   'feature/worktree.ts "git"': "Creates and removes the worktree a feature branch lives in.",
   "platform/browser.ts command": "The one browser opener. The command is this platform's, from `openCommand`.",
+  "platform/command.ts target.command":
+    "The shared command spawner's own spawn (#698) — the mechanism every `spawnCommand`/`execCommand` call above runs through. Counted once, as the mechanism; the callers' census rows above are the real call sites, and a seam call is held to this census at its own file.",
   "platform/editor.ts command":
     "The one editor launcher. The command is `$VISUAL`, `$EDITOR`, or the platform default.",
   "project/deploy.ts command": "Runs wrangler to deploy, through the project's own package manager.",
@@ -128,6 +130,9 @@ const POLICY = {
   boundedExecutables: new Set<string>(),
   uncapturedModules: new Set<string>(),
   progressModule: resolve(CLI_SRC, "terminal", "progress.ts"),
+  // The shared command spawner (#698): a seam call is a spawn at its call site, so census rows name
+  // the callers, not just the mechanism inside the spawner.
+  commandSpawner: resolve(CLI_SRC, "platform", "command.ts"),
 };
 
 /** Every shipped module under `packages/cli/src` outside `ci/`, comments blanked. */

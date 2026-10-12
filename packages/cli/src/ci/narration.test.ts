@@ -47,11 +47,14 @@ import { isTestFile, readSource, sourcePaths } from "./sourceFiles";
  *
  * **Not every child needs a step, and there are two exceptions.** A child whose executable is written as the
  * literal `"git"`, `"lsof"` or `"ps"` is a bounded local query — git's metadata, the process table — judged at
- * the call site, so the same `execFile` with `"npm"` beside it is held. And a `spawn` in one of three named
- * modules that hand the child's streams on rather than collecting them — the editor that owns the terminal,
- * the browser opener that detaches, and the shared command spawner (`platform/command.ts`, whose callers
- * raise the step) — is not captured.
- * Only `spawn` there: an `execFile` in any of them is held like anywhere else.
+ * the call site, so the same `execFile` with `"npm"` beside it is held. And a `spawn` in one of two named
+ * modules that hand the child's streams on rather than collecting them — the editor that owns the terminal
+ * and the browser opener that detaches — is not captured. Only `spawn` there: an `execFile` in any of them
+ * is held like anywhere else.
+ * The shared command spawner (`platform/command.ts`, #698) is exempt by a different rule: the spawn *inside*
+ * it is the mechanism, not a call site, and every `spawnCommand`/`execCommand` call in its callers is
+ * counted as a spawn where it is written. The spawner's exemption exempts one file; it exempts nobody
+ * who calls it.
  *
  * **Where silence is reported.** A declaration that reaches a child without a step passes that on to whatever
  * names it, so the defect surfaces where a run begins: a `pithy <command>` module, or `bin.ts` and `main.ts`,
@@ -123,10 +126,11 @@ const WRAP = /\bwithErrorReporting\s*\(/;
 /** What needs no step. Each entry is argued in the docblock above. */
 const POLICY: ChildProcessPolicy = {
   boundedExecutables: new Set(["git", "lsof", "ps"]),
-  uncapturedModules: new Set(
-    ["platform/browser.ts", "platform/command.ts", "platform/editor.ts"].map((path) => resolve(CLI_SRC, path)),
-  ),
+  uncapturedModules: new Set(["platform/browser.ts", "platform/editor.ts"].map((path) => resolve(CLI_SRC, path))),
   progressModule: resolve(CLI_SRC, "terminal", "progress.ts"),
+  // The shared command spawner (#698): its seam calls are spawns **at their call sites**, counted in
+  // each caller rather than exempted as a module, so the next caller cannot borrow the exemption.
+  commandSpawner: resolve(CLI_SRC, "platform", "command.ts"),
 };
 
 /** Every shipped module under `packages/cli/src` outside `ci/`, comments blanked. */

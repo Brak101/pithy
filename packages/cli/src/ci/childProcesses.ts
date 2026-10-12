@@ -54,8 +54,12 @@ import { resolve } from "node:path";
 /** The primitives a module can obtain from `child_process` that start a child. Anything else it exports does not. */
 export const PRIMITIVES = ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync", "fork"] as const;
 
-/** One of {@link PRIMITIVES}, or Bun's own spawn. */
-export type Primitive = (typeof PRIMITIVES)[number] | "Bun.spawn" | "Bun.spawnSync" | "Bun.$";
+/** One of {@link PRIMITIVES}, Bun's own spawn, or the shared command spawner's two seams (#698). */
+export type Primitive = (typeof PRIMITIVES)[number] | "Bun.spawn" | "Bun.spawnSync" | "Bun.$" | CommandSeam;
+
+/** `platform/command.ts`'s exports: every call of one starts a child at its call site. */
+const COMMAND_SEAMS = ["spawnCommand", "execCommand"] as const;
+export type CommandSeam = (typeof COMMAND_SEAMS)[number];
 
 /** A place a module starts a child, as written. */
 export interface CallSite {
@@ -120,6 +124,15 @@ export interface ChildProcessPolicy {
   readonly uncapturedModules: ReadonlySet<string>;
   /** The module that defines `startStep`. */
   readonly progressModule: string;
+  /**
+   * The shared command spawner (`platform/command.ts`), if the tree has one (#698).
+   *
+   * A call of its `spawnCommand`/`execCommand` — under any local name a module imports it by — **starts a
+   * child at its call site**: the spawn inside the spawner is the mechanism, not a second call site, so
+   * the spawner's own primitives are not counted and every caller is counted in its place. Exempting the
+   * module wholesale instead would exempt whoever calls it next.
+   */
+  readonly commandSpawner?: string;
 }
 
 const SPECIFIER = String.raw`["'\x60](?:node:)?child_process["'\x60]`;
@@ -648,8 +661,6 @@ export function childProcessReport(
 
   for (const module of all.values()) {
     const scan = scanPrimitives(module);
-    if (scan.calls.length > 0) calls.set(module.file, scan.calls);
-    for (const entry of scan.unfollowable) unfollowable.push(`${module.file}: ${entry}`);
     const list = declarations(module);
     byFile.set(module.file, list);
     for (const decl of list) decls.set(`${module.file}#${decl.name}`, decl);
@@ -657,6 +668,33 @@ export function childProcessReport(
     const dynamic = dynamicImports(module, all);
     dynamics.set(module.file, dynamic.found);
     for (const entry of dynamic.unfollowable) unfollowable.push(`${module.file}: ${entry}`);
+
+    // The shared command spawner's seams are spawns **at their call sites** (#698): a module that
+    // imports `spawnCommand`/`execCommand` from `commandSpawner` starts a child where it calls one, the
+    // same as if it spawned `child_process` itself. Counting them at the caller is what keeps every
+    // inventory this walk feeds honest — exempting the spawner module instead exempts every caller it
+    // gains, forever. The spawner's own file is skipped: its `spawn` is the mechanism, not a call site.
+    const seamCalls: CallSite[] = [];
+    if (policy.commandSpawner !== undefined && module.file !== policy.commandSpawner) {
+      const text = references.get(module.file) ?? module.code;
+      for (const seam of COMMAND_SEAMS) {
+        for (const local of localReferences(text, imports.get(module.file) ?? [], policy.commandSpawner, seam)) {
+          for (const at of occurrences(text, local)) {
+            const after = text.slice(at + local.length);
+            const opened = /^\s*\(/.exec(after);
+            if (opened === null) continue;
+            seamCalls.push({
+              primitive: seam,
+              executable: firstArgument(text, at + local.length + opened[0].length - 1),
+              offset: at,
+            });
+          }
+        }
+      }
+    }
+    const moduleCalls = [...scan.calls, ...seamCalls];
+    if (moduleCalls.length > 0) calls.set(module.file, moduleCalls);
+    for (const entry of scan.unfollowable) unfollowable.push(`${module.file}: ${entry}`);
 
     const own = (at: number): Declaration | undefined => list.find((decl) => at >= decl.start && at < decl.end);
     for (const call of scan.calls) {

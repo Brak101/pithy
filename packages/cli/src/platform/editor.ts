@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { NotFoundError, ValidationError } from "@pithy-sh/core/src/error/pithyError";
+import { quoteForCmd } from "./command";
 
 /**
  * The one place Pithy decides what "open this in your editor" means (#157).
@@ -321,11 +322,6 @@ function raiseNoWait(editor: ResolvedEditor, flag: string): never {
     action: `Set ${editor.source}="${base} ${flag}" and run this again.`,
     detail: `editor '${editor.command}' from ${editor.source} carries no wait flag (${flag})`,
   });
-}
-
-/** Wrap a command-line word for `cmd.exe` when it needs it. Windows paths cannot contain a quote. */
-function quoteForCmd(word: string): string {
-  return /\s/.test(word) ? `"${word}"` : word;
 }
 
 /** The real spawn, kept behind the seam so a test never starts a process. */

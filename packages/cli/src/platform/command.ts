@@ -3,7 +3,7 @@
 
 import { type ChildProcess, type ExecFileOptions, execFile, type SpawnOptions, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { delimiter, join } from "node:path";
+import { win32 } from "node:path";
 import { promisify } from "node:util";
 
 /**
@@ -17,27 +17,39 @@ import { promisify } from "node:util";
  * both — each machine runs the file it actually has.
  *
  * A `.cmd`/`.bat` runs through `cmd.exe` (`shell: true`), the way `platform/editor.ts` spawns
- * `code.cmd`, with that file's quoting for that file's reasons: with a shell the whole command line is
- * one string `cmd` re-splits, so every word carries its own quotes — a Windows home directory with a
- * space in it is the common case, not the exotic one, and a `"` cannot appear in a Windows path at all.
- * The words go into the string, not into `spawn`'s `args`: with a shell, Node concatenates an array
- * without escaping it (DEP0190), which is the injection the CVE fix exists to stop. An `.exe` is
- * spawned directly at its absolute path, exactly as it works today. A name that resolves to nothing is
- * passed through untouched: the spawn then fails with an `ENOENT` naming the command, which is the
- * caller's sentence to write, not this module's to pre-empt.
+ * `code.cmd`. With a shell the whole command line is one string `cmd` re-splits, so every word is
+ * quoted and its metacharacters escaped — {@link quoteForCmd}, the qntm/cmd algorithm cross-spawn
+ * ships: `pithy eject` sends registry ranges like `zod@^3.23.8` through here, a project path can
+ * carry `&`, and `%NAME%` expands even inside quotes. The words go into the string, not into
+ * `spawn`'s `args`: with a shell, Node concatenates an array without escaping it (DEP0190), which is
+ * the injection the CVE fix exists to stop. An `.exe` is spawned directly at its absolute path,
+ * exactly as it works today. A name that resolves to nothing is passed through untouched: the spawn
+ * then fails with an `ENOENT` naming the command, which is the caller's sentence to write, not this
+ * module's to pre-empt. A command that is *already* a `.cmd`/`.bat` — a bare `npm.cmd`, or a worker's
+ * `dev.command` of `node_modules\\.bin\\vite.cmd` — takes the shell branch too, however it was named:
+ * handing a `.cmd` to `spawn` without a shell is the EINVAL throw, and one worker's `dev.command` is
+ * not the whole `pithy dev` session's to lose.
  *
- * **One helper, because four call sites is four ways to forget it.** Every spawn of a package manager,
- * a runner, or wrangler goes through {@link spawnCommand} or {@link execCommand} — `pithy add`,
- * `pithy worker add`, `pithy feature create`, the `pithy dev` workers, the `pithy deploy` build and
- * every wrangler call. Off Windows everything is identity: `execvp` already resolves names, and a path
- * is already a path.
+ * `PATH` and `PATHEXT` are read from the environment by name regardless of case, and the win32
+ * branch splits and joins with `path.win32`, not the host's `path`. Both facts come from the call
+ * sites: the wrangler child, the dev workers, and the deploy build each pass a *copy* of
+ * `process.env`, which on Windows spells the variable `Path`. `process.env` matches any case; a
+ * plain object does not, and a lookup that misses finds nothing on PATH and dies with #698's ENOENT
+ * all over again. `path.win32` is what `C:\\tools` means; the host's `path` on a Linux runner splits
+ * it at the `C:`.
+ *
+ * **One helper, because four call sites is four ways to forget it.** Every spawn of a package
+ * manager, a runner, or wrangler goes through {@link spawnCommand} or {@link execCommand} —
+ * `pithy add`, `pithy worker add`, `pithy feature create`, the `pithy dev` workers, the `pithy
+ * deploy` build and every wrangler call. Off Windows everything is identity: `execvp` already
+ * resolves names, and a path is already a path.
  *
  * The seams mirror `editor.ts`'s so the Windows branches are testable from a POSIX host.
  */
 export interface CommandEnvironment {
   /** The platform, defaulting to `process.platform`. Only `win32` resolves; everywhere else is identity. */
   platform?: NodeJS.Platform;
-  /** The environment, defaulting to `process.env` — `PATH` and `PATHEXT` are read from here. */
+  /** The environment, defaulting to `process.env` — `PATH` and `PATHEXT` are read from here, by name, case-insensitively. */
   env?: NodeJS.ProcessEnv;
   /** Existence probe, defaulting to `fs.existsSync`. */
   fileExists?: (path: string) => boolean;
@@ -47,7 +59,7 @@ export interface CommandEnvironment {
 export interface ResolvedCommand {
   command: string;
   args: string[];
-  /** Hand to `spawn`/`execFile` as `shell`. True only when the resolved file is a `.cmd`/`.bat` shim. */
+  /** Hand to `spawn`/`execFile` as `shell`. True only when the command runs as a `.cmd`/`.bat`. */
   shell: boolean;
 }
 
@@ -57,19 +69,27 @@ const SHELL_RUNNABLE = new Set([".cmd", ".bat"]);
 /** Resolve `command` + `args` for a spawn. {@link spawnCommand} and {@link execCommand} apply it; a test reads it. */
 export function resolveCommand(command: string, args: string[], options: CommandEnvironment = {}): ResolvedCommand {
   const platform = options.platform ?? process.platform;
-  // A name with a path in it is already a location, and POSIX resolution comes free with the spawn.
-  if (platform !== "win32" || command.includes("/") || command.includes("\\")) {
+  if (platform !== "win32") return { command, args, shell: false };
+  // Already a batch file, by bare name (`npm.cmd`) or by path (`node_modules\\.bin\\vite.cmd`): it runs
+  // through cmd.exe however it was named, and cmd.exe does the lookup. It cannot reach `spawn` bare —
+  // that is the EINVAL throw, which escapes a per-worker start and ends a `pithy dev` session over one
+  // worker's `dev.command`.
+  if (SHELL_RUNNABLE.has(extensionOf(command))) {
+    return { command: [escapeWord(command), ...args.map(quoteForCmd)].join(" "), args: [], shell: true };
+  }
+  // Any other name with a path in it is already a location, and the spawn resolves it.
+  if (command.includes("/") || command.includes("\\")) {
     return { command, args, shell: false };
   }
   const file = findOnPath(command, options.env ?? process.env, options.fileExists ?? existsSync);
   if (file === null) return { command, args, shell: false };
   if (!SHELL_RUNNABLE.has(extensionOf(file))) return { command: file, args, shell: false };
-  return { command: [file, ...args].map(quoteForCmd).join(" "), args: [], shell: true };
+  return { command: [escapeWord(file), ...args.map(quoteForCmd)].join(" "), args: [], shell: true };
 }
 
 /**
  * Spawn with {@link resolveCommand} applied. A failure to start stays on the child's `error` event —
- * the channel every caller already handles — because resolution removed the one throw path: a `.cmd`
+ * the channel every caller already handles — because resolution removed the throw paths: a `.cmd`
  * never reaches `spawn` without a shell, so there is no synchronous `EINVAL` to escape a per-worker
  * start and end a whole `pithy dev` session over one binary.
  */
@@ -112,26 +132,39 @@ const runProcess = promisify(execFile);
 
 /**
  * The first file on `PATH` that `name` resolves to, in the order `cmd.exe` tries it: each directory
- * by `PATHEXT`, the extensionless file last. Null when nothing exists.
+ * by `PATHEXT`. Null when nothing exists.
  *
- * The extensionless file is tried last on purpose: npm's global bins ship a bash shim with no
- * extension beside the `.cmd`, and that file is not a Windows program — resolving to it would hand
- * `CreateProcess` a shell script.
+ * **No extensionless file is ever chosen, on purpose.** `cmd.exe` does not run one from `PATH`, so
+ * resolving to it hands `CreateProcess` a shell script it cannot execute: npm's global bin dirs ship
+ * a bash shim with no extension beside the `.cmd`, and Git for Windows' `usr\\bin` ahead of `nodejs`
+ * on `PATH` puts a bash `npx` before the real `npx.cmd`. The file that runs is one `cmd.exe` runs.
  */
 function findOnPath(name: string, env: NodeJS.ProcessEnv, fileExists: (path: string) => boolean): string | null {
-  const extensions = (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
+  const extensions = (environmentValue(env, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD")
     .split(";")
     .filter(Boolean)
     .map((extension) => extension.toLowerCase());
-  for (const directory of (env.PATH ?? "").split(delimiter).filter(Boolean)) {
+  for (const directory of (environmentValue(env, "PATH") ?? "").split(win32.delimiter).filter(Boolean)) {
     for (const extension of extensions) {
-      const file = join(directory, `${name}${extension}`);
+      const file = win32.join(directory, `${name}${extension}`);
       if (fileExists(file)) return file;
     }
-    const bare = join(directory, name);
-    if (fileExists(bare) && !SHELL_RUNNABLE.has(extensionOf(bare))) return bare;
   }
   return null;
+}
+
+/**
+ * `env[name]`, where `name` is spelled in capitals, whatever the environment spells it.
+ *
+ * `process.env` on Windows matches any case — the variable arrives as `Path`, not `PATH` — and every
+ * module-level read through this file's seams is a *copy* of it: `{ ...process.env, … }` is an
+ * ordinary object, `env.PATH` on one is `undefined`, and the resolution silently finds nothing.
+ */
+function environmentValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const direct = env[name];
+  if (direct !== undefined) return direct;
+  const key = Object.keys(env).find((entry) => entry.toUpperCase() === name);
+  return key === undefined ? undefined : env[key];
 }
 
 /** The file extension, lowercased, `""` when there is none. */
@@ -141,7 +174,47 @@ function extensionOf(file: string): string {
   return dot === -1 ? "" : base.slice(dot).toLowerCase();
 }
 
-/** Wrap a command-line word for `cmd.exe` when it needs it. Windows paths cannot contain a quote. */
-function quoteForCmd(word: string): string {
-  return /\s/.test(word) ? `"${word}"` : word;
+/** The characters `cmd.exe` reads as syntax: http://www.robvanderwoude.com/escapechars.php. */
+const CMD_META = /([()\][%!^"`<>&|;, *?])/g;
+
+/**
+ * Escape one command **word** — the program itself, not an argument — for `cmd.exe`: metacharacters
+ * take a `^`, and the word is never quoted.
+ *
+ * Cross-spawn's `escapeCommand` is exactly this, and the reason it has no quotes is Node's shell
+ * shape: `spawn(..., { shell: true })` hands `cmd.exe /d /s /c` a line already wrapped in one
+ * outer pair of quotes, and `/s` strips that pair. A quoted command word inside it closes the
+ * wrapper early — a shim under a directory with a space in its name, `C:\Temp\cmdprobe YqZaIz`, is
+ * cut in half and cmd tries to run `C:\Temp\cmdprobe` — while `^ ` escapes the space for cmd's own
+ * tokenizer and the path arrives whole, unquoted. Measured on a Windows host: quoting the command
+ * word fails exactly there; the caret passes.
+ */
+export function escapeWord(word: string): string {
+  return word.replace(CMD_META, "^$1");
+}
+
+/**
+ * Wrap one command-line word for `cmd.exe`: quoted whole, with its metacharacters escaped — the
+ * qntm/cmd algorithm, the one cross-spawn ships, and the reason `runEditor`'s words and a
+ * `pithy add`'s registry ranges survive the same shell.
+ *
+ * `cmd` re-splits the line after Node's `/s` has stripped the outermost quote pair, so a word that
+ * only looks plain is not: `^` disappears (`zod@^3.23.8` arrives as `zod@3.23.8`), `>` redirects,
+ * `%NAME%` expands even inside quotes — a wrangler child's `PATH` is full of them — and `&` starts a
+ * new command, which is how the project `C:\\work\\R&D\\app` runs `app` on its own. An empty word
+ * quoted survives as empty; bare, it vanishes.
+ *
+ * Backslashes before a quote double, the quote escapes, the word is quoted whole, and every
+ * metacharacter — the quotes included, which is what stops an embedded `"` re-opening the word —
+ * takes its `^`.
+ *
+ * **One copy, shared with `editor.ts`**, which spawns `code.cmd` under the same shell. The day one
+ * of them gains an escape the other lacks is the day the two disagree about what a command line is.
+ */
+export function quoteForCmd(word: string): string {
+  const escaped = word
+    .replace(/(?=(\\+?)?)\1"/g, '$1$1\\"')
+    .replace(/(?=(\\+?)?)\1$/, "$1$1")
+    .replace(CMD_META, "^$1");
+  return `"${escaped}"`;
 }

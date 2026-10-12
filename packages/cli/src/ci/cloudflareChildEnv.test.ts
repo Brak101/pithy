@@ -48,8 +48,10 @@ const SEAM = resolve(CLI_SRC, "cloudflare", "childEnv.ts");
  * reach `execFile` through `promisify(execFile)` and invoke the result under a local name — `run(…)`,
  * `execFileAsync(…)` — so a scan for `execFile(` finds nothing in exactly the modules that spawn the
  * most. The import is the one thing every spawner must write, and it cannot be aliased away.
+ * The shared command spawner (#698) is the other spelling of the same fact: a module that calls
+ * `spawnCommand`/`execCommand` starts a child at that call, so a call of either counts as a spawn.
  */
-const SPAWNS = /node:child_process/;
+const SPAWNS = /node:child_process|\b(?:spawnCommand|execCommand)\s*\(/;
 
 /**
  * The seam's two entry points, plus the two things built directly on them.
@@ -82,6 +84,8 @@ const NOT_CLOUDFLARE: Readonly<Record<string, string>> = {
   "feature/ports.ts": "runs `git rev-parse` to key the port registry on the main checkout's root.",
   "feature/worktree.ts": "runs `git worktree` to create and prune a feature's checkout.",
   "platform/browser.ts": "runs the platform's browser opener on a URL the operator was just shown.",
+  "platform/command.ts":
+    "runs the child its caller names — a package manager, a runner, wrangler — under the environment the caller passed. The caller's seam is what composes a credential; this module has none of its own (#698).",
   "platform/editor.ts": "runs the operator's `$EDITOR` on a config file.",
   "project/packageManager.ts":
     "runs a package manager to discover its version, and every install and uninstall the CLI makes (`runPackageManager`).",
