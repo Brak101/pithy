@@ -24,11 +24,48 @@ Use `/ship`. It takes a `Ready` issue and carries it to a merged PR — TDD impl
 
 Mechanics live in the shared `ship` skill, in the workspace checkout alongside this repository. What it does *here* — the changeset, the `Security:` line, the worktree commands, the gates — is in `.claude/project.md`.
 
+## Issues from outside the team
+
+File one on a form: **Bug report** or **Feature request**. Blank issues are off, because the form asks what a maintainer needs to reproduce a bug: the version, the OS and shell, the command and its output. CI covers Linux closely and Windows only in part, so the platform decides who can reproduce it.
+
+**A vulnerability is never an issue.** Report it privately, as `SECURITY.md` says.
+
+Each form sets the issue type, `Bug` or `Feature`, and applies `needs-triage`; every new issue lands on the board at `Inbox`. **What kind of issue it is goes in the type, never a label.** The org defines `Bug`, `Feature`, `Task` and `Epic`, and an issue has exactly one, so `bug`, `enhancement` and `documentation` are no longer applied. Labels are for what can overlap: `needs-triage`, `good first issue`, `help wanted`. The label means the issue arrived on a form and nobody has evaluated it yet; the team files through `/refine`, which skips the forms. `/refine` removes it at `Ready`. Nothing removes it on close, so the triage list is `is:open label:needs-triage`. `packages/cli/src/ci/contributorIntake.test.ts` holds the forms, their types, the blank-issue setting and the disclosure link to that. It cannot hold an issue filed through the API, which skips the forms and arrives unlabeled.
+
+## Pull requests from outside the team
+
+Welcome. A pull request merges into `main` when three things hold, and GitHub enforces all of them:
+
+- **The `CI` check is green**, on a branch that is up to date with `main`. If `main` moves, update your branch and CI runs again.
+- **One maintainer has approved the change.** A push that changes it dismisses an earlier approval, so the approval is of the diff that merges.
+- **Every review conversation is resolved.**
+
+**Your first pull request's CI run waits for a maintainer to approve it.** That is this repository's Actions setting for first-time contributors, not a judgment on the change: the run executes your code, so a maintainer reads the diff first. After that it runs on every push.
+
+**A change under `.github/` is read line by line.** A pull request's CI runs the workflows on its own branch, so a green `CI` proves only what those workflows checked. The review is what makes it mean the rest.
+
+The pull request template asks for each of these. Link the issue your change closes (`Closes #N`; a partial fix says `Refs #N`, which links without closing), add a test that fails without the change, and add a changeset when it ships in a package (§Releases). A fix for a platform CI does not fully cover — macOS, or Windows beyond the small set below — needs the command, the shell and the output before and after, because your machine is the only one that has proved it.
+
+**Windows has a small test set of its own.** CI runs the suite on Linux, and `packages/cli`'s `*.windows.test.ts` on a Windows runner instead, never on Linux, whenever the CLI or anything it depends on changes. A test belongs in that set when it has to touch the real platform to prove anything: a real `.cmd`, a real `%APPDATA%`, a filename Windows refuses. A test that passes `"win32"` into a function runs everywhere already, and stays where it is. Each file in the set calls `requireWindows()` from `src/test-utils/windows.ts`, so it fails rather than passes anywhere else. Run it with `node --run test:windows` from `packages/cli`, on Windows.
+
+The rule is a repository ruleset, committed at `.github/rulesets/main.json` and applied from it. `packages/cli/src/ci/mainRuleset.test.ts` holds that file, and the `CI` job it requires, to the rule. It does not read GitHub, so the live ruleset can drift from the file; `/vet` compares the two before every merge it performs.
+
+Repository admins bypass it — all of it, force push and deletion included. That is how `/ship` commits to `main`, and merges its own pull requests with `--admin`, while the team is solo.
+
+To change the rule, edit the file, then apply it. `gh api repos/pithy-sh/pithy/rulesets` lists the id; with no `main` ruleset listed, create it instead:
+
+```bash
+gh api -X PUT repos/pithy-sh/pithy/rulesets/<id> --input .github/rulesets/main.json   # update
+gh api -X POST repos/pithy-sh/pithy/rulesets --input .github/rulesets/main.json        # create
+```
+
 ## The board
 
 The [Pithy board](https://github.com/orgs/pithy-sh/projects/1) tracks each issue's **Status** across its life:
 
 `Inbox → Ready` (owned by `/refine`) `→ In Progress → Done` (owned by `/ship`). Those four are the whole set — the field has no other options.
+
+A new issue is added at `Inbox` by the board's own workflows: **Auto-add to project** (`is:issue`) and **Item added to project**, which sets Status. They are project settings, made in the board's UI; the API cannot create them. An issue filed from outside also carries `needs-triage` (§Issues from outside the team).
 
 ## Setup
 
