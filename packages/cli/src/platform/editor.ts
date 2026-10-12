@@ -164,7 +164,7 @@ export interface EditorProcess {
 export type SpawnEditor = (
   command: string,
   args: readonly string[],
-  options: { stdio: "inherit"; shell: boolean; windowsVerbatimArguments: boolean },
+  options: { stdio: "inherit"; shell?: boolean; windowsVerbatimArguments: boolean },
 ) => EditorProcess;
 
 /** What {@link runEditor} needs beyond the editor itself. */

@@ -145,7 +145,6 @@ export function spawnCommand(
   const target = resolveCommand(command, args, { platform, env: spawnOptions.env, fileExists });
   return spawn(target.command, target.args, {
     ...spawnOptions,
-    shell: target.shell,
     windowsVerbatimArguments: target.verbatim,
   });
 }
@@ -168,7 +167,6 @@ export async function execCommand(
   // caller here runs under (the CLI's default, the one `promisify(execFile)` was typed against).
   return (await runProcess(target.command, target.args, {
     ...execOptions,
-    shell: target.shell,
     windowsVerbatimArguments: target.verbatim,
   })) as { stdout: string; stderr: string };
 }
