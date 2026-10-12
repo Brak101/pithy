@@ -661,6 +661,9 @@ export function childProcessReport(
 
   for (const module of all.values()) {
     const scan = scanPrimitives(module);
+    // The spawner's own primitives are the mechanism of the seam calls counted below, not census rows —
+    // counting both would make every caller reach a child twice, through a node that narrates nothing.
+    const modulePrimitives = policy.commandSpawner === module.file ? [] : scan.calls;
     const list = declarations(module);
     byFile.set(module.file, list);
     for (const decl of list) decls.set(`${module.file}#${decl.name}`, decl);
@@ -692,15 +695,20 @@ export function childProcessReport(
         }
       }
     }
-    const moduleCalls = [...scan.calls, ...seamCalls];
+    const moduleCalls = [...modulePrimitives, ...seamCalls];
     if (moduleCalls.length > 0) calls.set(module.file, moduleCalls);
     for (const entry of scan.unfollowable) unfollowable.push(`${module.file}: ${entry}`);
 
     const own = (at: number): Declaration | undefined => list.find((decl) => at >= decl.start && at < decl.end);
-    for (const call of scan.calls) {
+    for (const call of moduleCalls) {
       const bounded = /^["']([^"']*)["']$/.exec(call.executable)?.[1];
       if (bounded !== undefined && policy.boundedExecutables.has(bounded)) continue;
-      if (call.primitive === "spawn" && policy.uncapturedModules.has(module.file)) continue;
+      // The streams-on exemption covers `spawn`, and the seam calls spelled from inside a module the
+      // policy lists: `spawnCommand` is `spawn` with resolution in front of it, and a caller that
+      // streams the child's output — the editor, the browser opener — stays as silent-by-design
+      // through the helper as it was raw before #698.
+      const streamsOn = call.primitive === "spawn" || COMMAND_SEAMS.includes(call.primitive as CommandSeam);
+      if (streamsOn && policy.uncapturedModules.has(module.file)) continue;
       const decl = own(call.offset);
       if (!decl) continue;
       reaching.add(`${module.file}#${decl.name}`);
