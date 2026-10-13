@@ -7,8 +7,8 @@ Create an environment's own Cloudflare resources, wire them into every Worker, a
 ## Synopsis
 
 ```
-pithy provision --env <environment> [--yes] [--confirm <phrase>] [--seed] [--json]
-pithy provision --feature [--json]
+pithy provision --env <environment> [--yes] [--confirm <phrase>] [--seed] [--dry-run] [--json [--events]]
+pithy provision --feature [--dry-run] [--json [--events]]
 ```
 
 One job, two spellings. `--env` provisions an environment the root `pithy.config.ts` declares; `--feature` provisions the one this branch gets. **Exactly one of them is required**, and passing both is refused at the flag, before a config is loaded or a Cloudflare client is built.
@@ -65,7 +65,9 @@ So `apps/<worker>/wrangler.jsonc` declared `"database_name": "<project>-staging-
 | `--yes` | `--env` | `false` | Confirm that this creates real Cloudflare resources. Required for every declared environment |
 | `--confirm <phrase>` | `--env` | — | Unlock a production environment non-interactively: `yes, i really want to provision <env>` |
 | `--seed` | `--env` | `false` | Also load seed fixtures once the schema is up. A prepared set run this way is offered the secrets **this run minted** — see below |
+| `--dry-run` | both | `false` | Show the plan and write nothing: the resources it would create or adopt, the config edits, the secrets, the migrations. Needs neither `--yes` nor `--confirm` |
 | `--json` | both | `false` | One line of machine-readable output |
+| `--events` | both | `false` | With `--json`, a progress record per line as the run goes, closed by the `--json` document. Refused without `--json`: `--events needs --json.` `--events=true` and `--events=false` are read too, and any other value is refused, as is `--no-events=<value>`, which the parse does not read. |
 
 `--yes`, `--confirm` and `--seed` say nothing a feature environment does not already do. It is created per pull request and destroyed on merge, so there is nothing to confirm — a gate every pipeline has to pass is a gate that has stopped meaning anything — and it is created empty, so it always seeds.
 
@@ -76,7 +78,7 @@ So `apps/<worker>/wrangler.jsonc` declared `"database_name": "<project>-staging-
 3. **Adopts rather than duplicates.** Every resource is matched by name before it is created, so a re-run is a no-op and a database an adopter made by hand under the right name is taken up rather than shadowed by a second one.
 4. **Writes the ids into each Worker's config**, under `env.<name>` — and a Worker receives only the bindings its own config declares. The D1 entry gets its `database_name` alongside its `database_id`, because `pithy add` proposes the name offline and this is the step that makes the proposal true. The stanza is created when it is absent, so an environment declared after the project was scaffolded needs no hand-editing.
 5. **Writes the `secrets_store_secrets` stanza** for every `cf-secrets-store` secret the Worker's own registry declares, when a Secrets Store id is in hand. `pithy add` deliberately could not write it — the entry needs a `store_id` and a `secret_name` that do not exist until an account has been reached — so a Worker deployed without `SECRETS_ENCRYPTION_KEYS` and failed at its first request. A declared secret whose entry has not been created is reported rather than bound: wrangler refuses a config naming an absent entry, so binding it would turn one missing value into a failed deploy of the whole Worker.
-6. **Creates the secrets that have no decision in them.** A registry entry declares whether its value is *arbitrary* — a signing key, an ingest secret: any random string works, because nothing outside the project has to agree with it. Provisioning mints those and binds them in the same pass. It still stops for a *supplied* secret — an OAuth client secret, a payment rail's key — because a random string there authenticates against nothing. Absence is checked first, always: an existing value is never replaced, and replacing one is rotation, which is a separate and deliberate act. No minted value is printed, logged, or put in an audit event; the run reports that the secret was created and which entry it went to. It is handed to one place: **this run's own seed step**, as `context.mintedThisRun` on a prepared set — `--seed` here, and always on `--feature`. The Secrets Store is write-only from the CLI, so that is the only moment a fixture can seal anything under one of these values, and after the run it is unrecoverable by design. A re-run mints nothing and offers an empty channel; a standalone `pithy seed` mints nothing either. See [`SEED.md`](../SEED.md#what-this-run-just-minted-contextmintedthisrun). A supplied secret gets the line that names the two commands that finish it — `SESSION_SIGNING_KEY has no store entry yet. Run pithy secrets create SESSION_SIGNING_KEY --env staging to supply its value, then pithy secrets provision to write the stanza.` — and an entry the kit *can* compose a value for, including `SECRETS_ENCRYPTION_KEYS`, gets the other one: `Run pithy secrets provision — it creates the store entries and writes the stanza.` Which of the two you get is one decision, taken in one place, and `pithy doctor` prints the same answer for the same finding.
+6. **Creates the secrets that have no decision in them.** A registry entry declares whether its value is *arbitrary* — a signing key, an ingest secret: any random string works, because nothing outside the project has to agree with it. Provisioning mints those and binds them in the same pass. It still stops for a *supplied* secret — an OAuth client secret, a payment rail's key — because a random string there authenticates against nothing. Absence is checked first, always: an existing value is never replaced, and replacing one is rotation, which is a separate and deliberate act. No minted value is printed, logged, or put in an audit event; the run reports that the secret was created and which entry it went to. It is handed to one place: **this run's own seed step**, as `context.mintedThisRun` on a prepared set — `--seed` here, and always on `--feature`. The Secrets Store is write-only from the CLI, so that is the only moment a fixture can seal anything under one of these values, and after the run it is unrecoverable by design. A re-run mints nothing and offers an empty channel; a standalone `pithy seed` mints nothing either. See [`SEED.md`](../SEED.md#what-this-run-just-minted-contextmintedthisrun). A supplied secret gets the line that names the two commands that finish it — ``SESSION_SIGNING_KEY has no store entry yet. Run pithy secrets create SESSION_SIGNING_KEY --env staging to supply its value. `pithy secrets provision` runs against every environment, production included. That is a person's decision, not a fix. It writes the stanza.`` — and an entry the kit *can* compose a value for, including `SECRETS_ENCRYPTION_KEYS`, gets the other one: `` `pithy secrets provision` runs against every environment, production included. That is a person's decision, not a fix. It creates the store entries and writes the stanza. `` Which of the two you get is one decision, taken in one place, and `pithy doctor` prints the same answer for the same finding.
 7. **Retargets `service` bindings** at this environment's copy of the callee, resolved through each Worker's real deploy name rather than its `apps/<name>` directory.
 8. **Binds `SELF`, for a project that administers itself.** A Worker cannot fetch its own hostname: the subrequest loops back through the edge into the Worker it came from and hangs until Cloudflare answers 522, on a route that answers in a second and a half from outside. So a project whose root `pithy.config.ts` says `administersItself: true` gets one more `services` entry in every stanza this writes — `SELF`, pointing at the script that stanza deploys as — and the code calls itself with `env.SELF.fetch(request)`, dispatched inside the runtime with no edge hop. The binding name is `@pithy-sh/core`'s `SELF_BINDING`, so nothing has to agree a string by hand. It is written from the same `name` this step writes, so the two cannot disagree; a re-run retargets in place rather than duplicating; and a project that declares nothing gets no entry and no change to its stanza. **A feature environment is why this is the kit's job rather than a line you add yourself**: its stanza is generated on every `pithy provision --feature`, so a hand-written entry never survives to the deploy, and the script it would have to name is composed from the branch. It is deliberately absent from the report's `services` list, which is one flat set for the whole project: the self entry is per Worker, and N lines with no Worker beside them would say less than the `workers` lines above them already do. **The top-level stanza gets none, and that is the rule rather than an omission**: the 522 is an edge behavior, and `wrangler dev` serves a Worker fetching its own address as an ordinary local request, so a dev run needs no binding and a call site that wants one falls back to an ordinary `fetch` there. `pithy doctor` names a declared self-administering project whose declared stanza lacks it, or whose entry names a script that stanza does not deploy as.
 9. **Migrates**, and seeds when asked. A feature also records a manifest — the resources it created and the Worker script names it wrote — so `pithy feature destroy` deletes exactly what was created and deployed — the one thing a declared environment has no equivalent of, which is [`feature.md`](feature.md)'s subject.
@@ -113,7 +115,7 @@ That pairing is also what makes an interrupted run readable. Provisioning is ide
 
 The migrations and seeds that close a run narrate the same way, in `pithy migrate`'s and `pithy seed`'s own words: `▸ DB (app) for board...`, `▸ Applying 0300_auth_0001_init to DB...`.
 
-Plain lines, printed once, never redrawn — so the history survives in your scrollback and in a CI log, and a non-interactive run gets the same bytes without escape codes. Under `--json` none of it is printed: that output is exactly one line, as it is for every command.
+Plain lines, printed once, never redrawn — so the history survives in your scrollback and in a CI log, and a non-interactive run gets the same bytes without escape codes. Under `--json` none of it is printed: that output is exactly one line, as it is for every command. **Under `--json --events` each step is a JSON record instead**, and the plan is not printed at all — see [`--events`](#--events).
 
 ## A manifest it could not read
 
@@ -166,8 +168,10 @@ A `d1` secret — the auth session secret — is sealed under a master key that 
 
 ```
 auth-session-secret: not created here — they need a deployed manager.
-Run pithy secrets provision to create them.
+`pithy secrets provision` runs against every environment, production included. That is a person's decision, not a fix.
 ```
+
+`pithy secrets provision` deploys every declared environment's manager, production included, so after a `--env staging` run it is named as a person's decision rather than a command to run.
 
 `--feature` creates them the way `pithy secrets provision` does, when the account has a Secrets Store (#643). A feature has its own `SECRETS` database, so it gets its own secrets manager: the run creates the feature's own master key, only if absent, through the provisioner `pithy secrets provision` uses, deploys the feature's manager with its other kit Workers, and then asks that manager to create every `d1` secret the registry says may be generated, through the same `mintDeclaredSecrets` pass. **No token.** A feature's manager binds no Cloudflare API token and rotates nothing, so branch code never holds write access to the account's Secrets Store. Nothing is pending:
 
@@ -188,7 +192,7 @@ A `cf-secrets-store` secret the registry calls arbitrary — the email link-sign
 
 `pithy secrets provision` spans the environments the project **declares**, deploying a manager into each. A branch is not declared, so that command does nothing for one; `pithy provision --feature` is what gives a branch its manager.
 
-`--json` carries the distinction as `pendingSecretsRemedy` — the command that creates them.
+`--json` carries the distinction as `pendingSecretsRemedy` — the command that creates them, or the person's decision it is.
 
 ## Production
 
@@ -198,7 +202,28 @@ A `cf-secrets-store` secret the registry calls arbitrary — the email link-sign
 pithy provision --env prod --yes --confirm "yes, i really want to provision prod"
 ```
 
-The phrase names its environment, so one typed for `staging` cannot be pasted into a command targeting `prod`. Interactively the CLI asks for it; under `--json` it must arrive by flag, so a headless production provision happens only when a human wrote the phrase into the pipeline.
+The phrase names its environment, so one typed for `staging` cannot be pasted into a command targeting `prod`. Interactively the CLI asks for it; under `--json`, `--no-input` or `PITHY_NONINTERACTIVE=1` it must arrive by flag, so a headless production provision happens only when a human wrote the phrase into the pipeline. Without it, or with a wrong one, that run is refused `core/person_required`, exit 5, and the action names `--confirm`: the phrase is a person's to give, so an agent stops and asks rather than trying variations (`docs/CLI.md` §3.8).
+
+## Seeing it first: `--dry-run`
+
+`--dry-run` runs the provisioning itself — the same declines, names, scoped script names, service targets and stanza writer — against a private copy of the project, and against an account it only reads. The plan is what that run changed, in the shape every `--dry-run` shares (`docs/CLI.md` §1.2):
+
+- **Resources.** Each is looked up by name, exactly as the run looks it up. One that exists is `adopt`, with its id; one that does not is `create`, and nothing is created — the copy's config gets a placeholder id such as `<new d1 replay-staging-db>` where the new one would land.
+- **Files.** Each Worker's `wrangler.jsonc` edit, as a diff of the bytes the run writes. For `--feature`, the generated config under `.wrangler/` and the feature's `.pithy-feature.json` record.
+- **Secrets.** Each `cf-secrets-store` secret it would bind, and each it would `mint`, by name and entry. The Secrets Store is asked whether an entry exists and is written nothing. A secret it cannot create stays in `pendingSecrets`, as it does on the run.
+- **Migrations.** A database it would create has applied nothing, so every migration it carries is listed. An adopted one is read for what it has applied, as `pithy migrate --dry-run` reads it.
+- **What it does not run.** `--seed` and `--feature` seed once the schema is up, and the plan says so in a note. `--feature` then deploys its kit Workers, binds each app Worker to them, and creates their indexes and `d1` secrets: each upload is a `resource` with `action` `upload`, and the rest is a note.
+
+It asks for no confirmation and no production phrase, because nothing it does needs one. Every refusal the run makes before its first write still stands, and comes first — missing credentials, a missing declaration, a slug that does not fit, a `service` binding naming a Worker the project does not have, an account the project does not claim. Without `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` there is no plan: the dry run is refused `core/precondition_failed`, exit 3, exactly as the run would be, because a plan the run would refuse is a promise nobody can keep. The text output is the plan's lines, the pending-secret lines, and `Dry run. Nothing written.` in place of `Done.`
+
+```
+$ pithy provision --env staging --dry-run
+Would edit apps/board/wrangler.jsonc.
+Would create d1 replay-staging-db (DB, staging).
+Would adopt kv replay-staging-cache (CACHE, staging).
+Would apply 1000_app_0001_things to app (DB, staging).
+Dry run. Nothing written.
+```
 
 ## Deploy refuses, it does not provision
 
@@ -221,17 +246,18 @@ For a declared environment there is none, deliberately. Staging and production a
 
 ```
 $ pithy provision --env staging --yes --json
-{"command":"provision","env":"staging","resources":[{"kind":"d1","binding":"DB","name":"replay-staging-db","id":"9f0…","created":true}],"workers":[{"worker":"replay-board","name":"replay-staging-board"}],"services":[],"secretBindings":[],"declined":[],"manifestFaults":[],"configs":[{"worker":"replay-board","path":"apps/board/wrangler.jsonc","ids":3}],"committed":true,"pendingSecrets":["auth-session-secret"],"pendingSecretsRemedy":"pithy secrets provision"}
+{"command":"provision","schemaVersion":1,"env":"staging","resources":[{"kind":"d1","binding":"DB","name":"replay-staging-db","id":"9f0…","created":true}],"workers":[{"worker":"replay-board","name":"replay-staging-board"}],"services":[],"secretBindings":[],"declined":[],"manifestFaults":[],"configs":[{"worker":"replay-board","path":"apps/board/wrangler.jsonc","ids":3}],"committed":true,"pendingSecrets":["auth-session-secret"],"pendingSecretsRemedy":"`pithy secrets provision` runs against every environment, production included. That is a person's decision, not a fix.","dryRun":false}
 ```
 
 ```
 $ pithy provision --feature --json
-{"command":"provision","env":"feature","resources":[{"kind":"d1","binding":"DB","name":"replay-f251-one-command--db-d1","id":"3c1…","created":true}],"workers":[{"worker":"replay-board","name":"replay-f251-one-command--board"}],"services":[],"secretBindings":[],"declined":[{"state":"read","worker":"replay-board","declines":[{"state":"honored","name":"SUPPORT_BUCKET","type":"r2","capability":"support","reason":"Attachments are off.","wantedBy":[]}]}],"manifestFaults":[],"configs":[{"worker":"replay-board","path":"apps/board/.wrangler/pithy/wrangler.feature.jsonc","ids":3}],"committed":false,"pendingSecrets":["auth-session-secret"],"pendingSecretsRemedy":"pithy provision --feature with SECRETS_STORE_ID set"}
+{"command":"provision","schemaVersion":1,"env":"feature","resources":[{"kind":"d1","binding":"DB","name":"replay-f251-one-command--db-d1","id":"3c1…","created":true}],"workers":[{"worker":"replay-board","name":"replay-f251-one-command--board"}],"services":[],"secretBindings":[],"declined":[{"state":"read","worker":"replay-board","declines":[{"state":"honored","name":"SUPPORT_BUCKET","type":"r2","capability":"support","reason":"Attachments are off.","wantedBy":[]}]}],"manifestFaults":[],"configs":[{"worker":"replay-board","path":"apps/board/.wrangler/pithy/wrangler.feature.jsonc","ids":3}],"committed":false,"pendingSecrets":["auth-session-secret"],"pendingSecretsRemedy":"pithy provision --feature with SECRETS_STORE_ID set","dryRun":false}
 ```
 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"provision"` | The command that produced the line. The same for both modes |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `env` | `string` | The environment provisioned — a declared name, or `feature` |
 | `resources` | `object[]` | Every resource, in provision order |
 | `resources[].kind` | `"d1" \| "kv" \| "r2"` | The Cloudflare resource type |
@@ -276,7 +302,37 @@ $ pithy provision --feature --json
 | `featureSecrets[].created` | `string[]` | `["feature"]` when this run created it; empty when it was already there |
 | `hosts` | `object[]` | `--feature` only: every kit Worker the feature stood up for itself, one row each, as `pithy deploy --json` reports `kit` |
 | `routesDropped` | `object[]` | `--feature` only, and only when there were any: each Worker's route patterns the feature stanza gave up, as `{ worker, routes }` |
-| `pendingSecretsRemedy` | `string \| null` | The command that does create them. `"pithy secrets provision"` for `--env`; `"pithy provision --feature with SECRETS_STORE_ID set"` for `--feature`, whose own run creates them once it has a Secrets Store. A pipeline branches on this rather than on the mode |
+| `bindingsDropped` | `object[]` | `--feature` only, and only when there were any: each Worker's `durable_objects` or `services` entries naming a script this project does not own, which the feature stanza gave up, as `{ worker, bindings }` |
+| `pendingSecretsRemedy` | `string \| null` | What does create them. For `--env`, `pithy secrets provision` said as a person's decision — it runs against every environment, production included; `"pithy provision --feature with SECRETS_STORE_ID set"` for `--feature`, whose own run creates them once it has a Secrets Store. A pipeline branches on this rather than on the mode |
+| `dryRun` | `boolean` | Whether this was `--dry-run`. Nothing was created, written or migrated when it is `true`, every other key is what the run would report, and a resource it would create carries its placeholder `id` |
+| `plan` | `object` | Present only under `--dry-run`: the resources to create or adopt, the config edits with their diffs, the secrets to bind or mint, and the migrations to apply, in the shape every `--dry-run` shares (`docs/CLI.md` §1.2) |
+| `next` | `object[]` | `[{ command, why }]`: `pithy deploy --env <env>` — `--env feature` for `--feature` — when a Worker this run named in `workers` has no deployed script on the account. Absent when every one is deployed, when the account could not be asked, and under `--dry-run`; never empty (`docs/CLI.md` §1.2) |
+
+### `--events`
+
+`--json --events` turns the one line into a stream: **one compact JSON record per line as each step starts and settles, then the document above as the last line.** It is framed as `pithy dev --json` is, so every line is compact and unpainted whatever `--pretty` or `PITHY_JSON` asked for. The last line has no `event` key and every record before it has one. The plan the confirmation is hung off is prose, so it is not printed; `--dry-run --json` is how a program reads a plan. Without `--json` it is refused: `--events needs --json.`, exit 2.
+
+| record key | type | meaning |
+|---|---|---|
+| `command` | string | `"provision"`, on every record. |
+| `schemaVersion` | integer | The same version the document carries. |
+| `event` | string | `"start"` as a step begins, `"settled"` as it ends. |
+| `what` | string | `start` only: what is being worked on — a resource's name, a migration, a seed set, a kit Worker. |
+| `binding` | string, optional | `start` of a resource: the binding it backs. |
+| `kind` | string, optional | `start` of a resource: `"d1"`, `"kv"` or `"r2"`. |
+| `line` | string | `settled` only: the line a person would have read for it, without color. |
+| `resource` | object, optional | `settled` of a resource: its row, exactly as `resources[]` lists it. |
+| `kit` | object, optional | `settled` of a feature's kit Worker: its row, exactly as `hosts[]` lists it. |
+
+A failure inside the command ends the stream with no document, and the `{"error": …}` line goes to stderr as it always does. `pithy schema provision --json` publishes the record's JSON Schema as `events`.
+
+```
+$ pithy provision --env staging --yes --json --events
+{"command":"provision","schemaVersion":1,"event":"start","what":"replay-staging-db","binding":"DB","kind":"d1"}
+{"command":"provision","schemaVersion":1,"event":"settled","line":"replay-staging-db: created.","resource":{"kind":"d1","binding":"DB","name":"replay-staging-db","id":"9f0…","created":true}}
+{"command":"provision","schemaVersion":1,"event":"start","what":"Applying 1000_app_0001_things to DB"}
+{"command":"provision","schemaVersion":1,"env":"staging","resources":[…],…}
+```
 
 ## Exit codes
 

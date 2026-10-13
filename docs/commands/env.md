@@ -49,6 +49,7 @@ One line on stdout.
 | key | type | meaning |
 |---|---|---|
 | `command` | string | `"env"`. |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `accountId` | string \| null | The Cloudflare account id, or `null` — dashboard links are omitted when it is absent. |
 | `workers` | object[] | Every selected Worker with a `wrangler.jsonc`, in discovery order. |
 | `workers[].worker` | string | The Worker's name, as `pithy worker list` shows it. |
@@ -70,7 +71,7 @@ One line on stdout.
 
 The command exits 0 for every state it is meant to report, including a completely unprovisioned project. Two things still refuse:
 
-- **`No workers here.`** Nothing under `apps/` carries a `wrangler.jsonc`. Run `pithy init` to start a project.
+- **`No workers here.`** Nothing under `apps/` carries a `wrangler.jsonc`. Name one and create it with `pithy worker add`.
 - **`No worker named "<name>".`** `--worker` matched nothing. The refusal lists the Workers that do exist.
 
 A Worker whose `wrangler.jsonc` vanished between discovery and reading is skipped rather than failing the inventory. A Worker whose config is present and will not open still refuses — a Worker silently missing from an inventory is the under-report this command exists to prevent.
@@ -89,7 +90,7 @@ pithy env --worker api --json
 ```
 
 ```json
-{"command":"env","accountId":"<account-id>","workers":[{"worker":"acme-api","dir":"apps/api","environments":[{"name":"dev","scriptName":"acme-api","baseUrl":"local","workerDashboardUrl":null,"resources":[{"kind":"d1","binding":"DB","id":"<database_id>","provisioned":false,"dashboardUrl":null}]},{"name":"prod","scriptName":"acme-prod-api","baseUrl":"https://api.example.com","workerDashboardUrl":"<dashboard-url>","resources":[{"kind":"d1","binding":"DB","id":"<database-id>","provisioned":true,"dashboardUrl":"<dashboard-url>"}]}]}]}
+{"command":"env","schemaVersion":1,"accountId":"<account-id>","workers":[{"worker":"acme-api","dir":"apps/api","environments":[{"name":"dev","scriptName":"acme-api","baseUrl":"local","workerDashboardUrl":null,"resources":[{"kind":"d1","binding":"DB","id":"<database_id>","provisioned":false,"dashboardUrl":null}]},{"name":"prod","scriptName":"acme-prod-api","baseUrl":"https://api.example.com","workerDashboardUrl":"<dashboard-url>","resources":[{"kind":"d1","binding":"DB","id":"<database-id>","provisioned":true,"dashboardUrl":"<dashboard-url>"}]}]}]}
 ```
 
 Nothing this command reads is a credential, and nothing it prints is one. An account id and a resource id are identifiers.

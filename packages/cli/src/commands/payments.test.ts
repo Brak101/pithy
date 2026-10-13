@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: MIT
 
 import { payments as paymentsCapability } from "@pithy-sh/payments/src/capability";
+import { PaymentsRail } from "@pithy-sh/payments/src/data/rail";
 import type { CommandDef } from "citty";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { Plan } from "../plan/plan";
 import type { ResolvedWorker } from "../project/workerScope";
-import payments from "./payments";
+import { contractAt, expectConforms } from "../test-utils/payloadContract";
+import payments, { reconcilePlan } from "./payments";
 
 /**
  * The project name is resolved at this command edge, and both payments names lead with it — the deployed
@@ -21,7 +24,11 @@ import payments from "./payments";
 const root = vi.hoisted(() => ({ config: {} as { name?: string } }));
 
 /** What the mocked Workflows client was asked to dispatch — the pass that would have run. */
-const dispatched = vi.hoisted(() => ({ calls: [] as { name: string; params: unknown }[] }));
+const dispatched = vi.hoisted(() => ({
+  calls: [] as { name: string; params: unknown }[],
+  /** The report the pass returns. Clean by default; a test that needs drift sets it. */
+  report: { scanned: 4, drifted: 0, unchanged: 4, skipped: 0, failed: 0 },
+}));
 
 /** The project's Workers, as `loadPaymentsConfig` and the audit emitter discover them. */
 const scope = vi.hoisted(() => ({ workers: [] as unknown[] }));
@@ -33,7 +40,7 @@ vi.mock("@pithy-sh/cloudflare/src/workflows/workflowsClient", async (importOrigi
   CloudflareWorkflowsClient: class {
     async dispatchAndPoll(name: string, params: unknown): Promise<unknown> {
       dispatched.calls.push({ name, params });
-      return { scanned: 4, drifted: 0, unchanged: 4, skipped: 0, failed: 0 };
+      return dispatched.report;
     }
   },
 }));
@@ -92,6 +99,21 @@ async function failure(
   return JSON.parse(lines.join("")).error;
 }
 
+/** Run a subcommand to completion and return everything it wrote to stdout, as text. */
+async function succeedText(name: string, args: Record<string, unknown>): Promise<string> {
+  const lines: string[] = [];
+  const stdout = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+    lines.push(String(chunk));
+    return true;
+  });
+  try {
+    await subcommand(name).run?.({ args, rawArgs: [] } as never);
+  } finally {
+    stdout.mockRestore();
+  }
+  return lines.join("");
+}
+
 /** Run a subcommand to completion and return the single `--json` line it wrote to stdout. */
 async function succeed(name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
   const lines: string[] = [];
@@ -138,10 +160,38 @@ describe("pithy payments", () => {
     scope.workers = [];
   });
 
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   test("provision refuses a project with no name, before it reaches Cloudflare", async () => {
     const error = await failure("provision", { json: true });
-    expect(error.code).toBe("validation/invalid_input");
+    // The call is right and the project is missing its name: a precondition, exit 3 (#697).
+    expect(error.code).toBe("core/precondition_failed");
     expect(error.message).toBe("pithy.config.ts has no `name`.");
+  });
+
+  // The call is right and nothing composes payments: a precondition, exit 3 (#697). And no `fix`: `pithy add
+  // payments` refuses without `--set billingSubject=…`, which has no default and is the adopter's to choose
+  // (#412), so no command runs as written. The manifest read is the installed one under the runner's cwd.
+  test("reconcile in a project composing no payments is a precondition, with no fix a run could follow", async () => {
+    root.config = { name: "acme" };
+    scope.workers = [
+      { name: "board", dir: "/nowhere/apps/board", config: {}, capabilities: [], target: {} },
+    ] as unknown as ResolvedWorker[];
+    vi.stubEnv("CLOUDFLARE_ACCOUNT_ID", "acct-1");
+    vi.stubEnv("CLOUDFLARE_API_TOKEN", "tok");
+    vi.stubEnv("SECRETS_STORE_ID", "store-1");
+    const error = (await failure("reconcile", { json: true, env: "staging", "dry-run": true })) as Record<
+      string,
+      unknown
+    >;
+    expect(error).toMatchObject({
+      code: "core/precondition_failed",
+      message: "The payments capability is not configured.",
+      exit: 3,
+    });
+    expect(error).not.toHaveProperty("fix");
   });
 
   test("reconcile refuses a project with no name rather than dispatching to a guessed worker", async () => {
@@ -159,6 +209,7 @@ describe("pithy payments reconcile --rail", () => {
   beforeEach(() => {
     root.config = { name: "acme" };
     dispatched.calls = [];
+    dispatched.report = { scanned: 4, drifted: 0, unchanged: 4, skipped: 0, failed: 0 };
     scope.workers = lemonSqueezyWorker();
     // Credentials for the account this project does not pin — `cloudflareEnv` overlays the environment
     // per key, and the unit-test config unsets all four.
@@ -169,6 +220,15 @@ describe("pithy payments reconcile --rail", () => {
 
   afterEach(() => {
     vi.unstubAllEnvs();
+  });
+
+  /**
+   * `pithy schema` publishes the rails `--rail` takes, but the command parses against the project's own
+   * `@pithy-sh/payments` at run time, which a shipped module cannot import. So the published list is held
+   * to the package's enum here: the day a rail is added there, this goes red until the schema says so too.
+   */
+  test("publishes exactly the rails the payments package accepts", async () => {
+    expect((await contractAt("payments reconcile")).flags?.rail?.enum).toEqual(PaymentsRail.options);
   });
 
   test("lemonSqueezy reaches the deployed Workflow, like every rail before it", async () => {
@@ -183,13 +243,17 @@ describe("pithy payments reconcile --rail", () => {
     expect(dispatched.calls).toEqual([{ name: "acme-staging-payments-reconcile", params: { rail: "lemonSqueezy" } }]);
     expect(line).toEqual({
       command: "payments reconcile",
+      schemaVersion: 1,
       env: "staging",
+      dryRun: false,
       report: { scanned: 4, drifted: 0, unchanged: 4, skipped: 0, failed: 0 },
     });
+    // Held to the schema `pithy schema payments reconcile` publishes (#697).
+    await expectConforms("payments reconcile", JSON.stringify(line));
   });
 
   test("a dry run narrowed to one holder and lemonSqueezy carries both, and writes nothing", async () => {
-    await succeed("reconcile", {
+    const line = await succeed("reconcile", {
       json: true,
       env: "staging",
       subject: "user:ada",
@@ -203,6 +267,30 @@ describe("pithy payments reconcile --rail", () => {
       rail: "lemonSqueezy",
       dryRun: true,
     });
+    // The one plan every dry run shares (#697): the pass's drift is the repair it would make, and the
+    // Workflow start a dry run still makes is said, not hidden.
+    expect(line.dryRun).toBe(true);
+    const plan = Plan.parse(line.plan);
+    expect(plan.data).toEqual([]);
+    expect(plan.notes[0]).toContain("reconcile Workflow, which a dry run starts too");
+    await expectConforms("payments reconcile", JSON.stringify(line));
+  });
+
+  test("a dry run in text says what it found and that it repaired none of it", async () => {
+    // Drift is what makes the real run say `Drift was repaired.`, so it is here to prove the dry run does not.
+    dispatched.report = { scanned: 5, drifted: 2, unchanged: 3, skipped: 0, failed: 0 };
+    const text = await succeedText("reconcile", { json: false, env: "staging", rail: "lemonSqueezy", "dry-run": true });
+
+    expect(text).toContain("5 scanned, 2 drifted, 0 skipped, 0 failed.\n");
+    expect(text).not.toContain("Drift was repaired.");
+    expect(text.trimEnd().split("\n").at(-1)).toBe("Dry run. Nothing repaired.");
+  });
+
+  test("the drift a dry run finds is the repair its plan names", () => {
+    expect(reconcilePlan("staging", "stripe", 3).data).toEqual([
+      { store: "payments", target: "stripe", count: 3, action: "repair" },
+    ]);
+    expect(reconcilePlan("staging", undefined, 2).data[0]?.target).toBe("every rail");
   });
 
   test("an organization is as narrow a holder as a person", async () => {

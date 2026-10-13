@@ -24,8 +24,9 @@ import { expect, test } from "vitest";
  * assertion now, and `packages/cli/src/ci/testIsolation.test.ts` resolves the path it cites rather
  * than trusting it.
  *
- * **Not one key below is a binding.** They are Vite's `import.meta.env` shims and vitest's two pool
- * ids. The older wording called them "miniflare's bindings"; they never were. A binding is reached
+ * **Not one key below is a binding.** They are Vite's `import.meta.env` shims, vitest's two pool ids,
+ * and the major-version marker `@cloudflare/vitest-plugin` sets for itself, which arrived between 1.0.0 and
+ * 1.4.0 (workerd `1.20261006.1`). The older wording called them "miniflare's bindings"; they never were. A binding is reached
  * through `cloudflare:test`, not `process.env`.
  *
  * **The set belongs to this config, not to the harness**, which is why the equality is stated here and
@@ -34,7 +35,16 @@ import { expect, test } from "vitest";
  * that declares one sees its own key too, and the invariant to carry there is the second assertion,
  * never the first.
  */
-const VITEST_WORKERD_ENV = ["BASE_URL", "DEV", "MODE", "PROD", "SSR", "VITEST_POOL_ID", "VITEST_WORKER_ID"];
+const VITEST_WORKERD_ENV = [
+  "BASE_URL",
+  "DEV",
+  "MODE",
+  "PROD",
+  "SSR",
+  "VITEST_POOL_ID",
+  "VITEST_WORKER_ID",
+  "__VITEST_POOL_WORKERS_VITEST_MAJOR_VERSION",
+];
 
 /**
  * Declared here rather than reached through `@types/node`. `@pithy-sh/core` is bundled into the
@@ -43,7 +53,7 @@ const VITEST_WORKERD_ENV = ["BASE_URL", "DEV", "MODE", "PROD", "SSR", "VITEST_PO
  *
  * **The `nodejs_compat` flag is not what puts a `process` here, which is worth saying because the
  * obvious reading is wrong.** Measured both ways on this project: with the flag and without it,
- * `typeof process` is `"object"`, the keys below are the same seven, and `process.version` is
+ * `typeof process` is `"object"`, the keys above are the same set, and `process.version` is
  * `"v22.19.0"`. The vitest pool supplies it either way. What the flag decides is whether miniflare
  * copies a declared `binding` into `process.env` — so without it, this file's equality still passes
  * while a declared credential sits in `env` from `cloudflare:test`, unseen. That is why the root guard

@@ -28,11 +28,11 @@ pithy vector reprocess [--env <environment>] [--worker <name>] [--index <name>] 
 | `--filter <json>` | `reprocess` | — | Narrow the run to matching documents, as a JSON metadata object: `'{"ownerId":"ada"}'`. Parsed here, so a malformed filter fails in this terminal rather than inside a running Workflow |
 | `--json` | all three | `false` | One line of machine-readable output |
 
-**There is no `--yes` on `reset`, deliberately.** `--yes` elsewhere means "yes, this is not dev", and it was designed to authorize additive writes. A reset deletes every vector in an index, so it carries the stricter gate of `docs/CLI.md` §8.5 — the same one `pithy seed --redo` uses, imported rather than re-implemented. `dev` is free; every other environment needs the exact phrase, and a headless run without `--confirm-reset` is refused.
+**There is no `--yes` on `reset`, deliberately.** `--yes` elsewhere means "yes, this is not dev", and it was designed to authorize additive writes. A reset deletes every vector in an index, so it carries the stricter gate of `docs/CLI.md` §8.5 — the same one `pithy seed --redo` uses, imported rather than re-implemented. `dev` is free; every other environment needs the exact phrase, and a headless run without `--confirm-reset` — `--json`, `--no-input`, `PITHY_NONINTERACTIVE=1`, or no terminal — is refused `core/person_required`, exit 5, and the action names `--confirm-reset`.
 
 ## What it does
 
-`provision` creates each index the config declares, or reuses one that already exists, and creates every metadata index the index's schema marks filterable. It returns only once each declared metadata index is actually live — waiting out Cloudflare's asynchronous apply — because the very next step deploys the Worker that writes vectors, and a write landing before an index exists is permanently unfilterable. Then it deploys the prebuilt reprocess Worker for that environment and writes two things into the app's `wrangler.jsonc`: the `VECTOR_PROVISIONED` var recording what it observed, and this environment's `vectorize` and `workflows` bindings. `pithy add vector` cannot write those bindings — wrangler requires an `index_name` on one and a `name` plus `class_name` on the other, and all three are provisioning outputs.
+`provision` creates each index the config declares, or reuses one that already exists, and creates every metadata index the index's schema marks filterable. It returns only once each declared metadata index is actually live — listed under its own name and type on three reads in a row, which can take Vectorize up to five minutes — because the very next step deploys the Worker that writes vectors, and a write landing before an index exists is permanently unfilterable. Then it deploys the prebuilt reprocess Worker for that environment and writes two things into the app's `wrangler.jsonc`: the `VECTOR_PROVISIONED` var recording what it observed, and this environment's `vectorize` and `workflows` bindings. `pithy add vector` cannot write those bindings — wrangler requires an `index_name` on one and a `name` plus `class_name` on the other, and all three are provisioning outputs.
 
 The `VECTOR_PROVISIONED` var is what the Worker compares its declarations against at boot, refusing to serve on drift. That check is the only way an adopter who edits a metadata schema and deploys without re-provisioning hears about it, because Vectorize answers such a filter with partial results and no error. The var is written last, and only on success, so it never claims more than provisioning got done.
 
@@ -46,12 +46,13 @@ One line, one object, one shape per subcommand. The `command` field carries the 
 
 ```
 $ pithy vector provision --env staging --json
-{"command":"vector provision","env":"staging","indexes":[{"index":"docs","indexName":"acme-staging-vector-docs","created":[{"propertyName":"ownerId","indexType":"string"}],"extra":[],"observed":[{"propertyName":"ownerId","indexType":"string"}]}]}
+{"command":"vector provision","schemaVersion":1,"env":"staging","indexes":[{"index":"docs","indexName":"acme-staging-vector-docs","created":[{"propertyName":"ownerId","indexType":"string"}],"extra":[],"observed":[{"propertyName":"ownerId","indexType":"string"}]}]}
 ```
 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"vector provision"` | The subcommand that produced the line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `env` | `string` | The environment provisioned |
 | `indexes` | `object[]` | One entry per configured index — see below |
 | `indexes[].index` | `string` | The config's name for the index |
@@ -68,7 +69,7 @@ $ pithy vector provision --env staging --json
 
 ```
 $ pithy vector reset --env staging --confirm-reset "yes, i really want to reset staging" --json
-{"command":"vector reset","env":"staging","indexes":[…],"deleted":["acme-staging-vector-docs"],"reprocessed":["docs"]}
+{"command":"vector reset","schemaVersion":1,"env":"staging","indexes":[…],"deleted":["acme-staging-vector-docs"],"reprocessed":["docs"]}
 ```
 
 `reset` emits everything `provision` does — it rebuilds through the same path — plus two fields.
@@ -76,6 +77,7 @@ $ pithy vector reset --env staging --confirm-reset "yes, i really want to reset 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"vector reset"` | The subcommand that produced the line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `env` | `string` | The environment reset |
 | `indexes` | `object[]` | Each rebuilt index, in the shape `provision` reports above |
 | `deleted` | `string[]` | The indexes that were deleted and rebuilt, by their Vectorize names |
@@ -83,12 +85,13 @@ $ pithy vector reset --env staging --confirm-reset "yes, i really want to reset 
 
 ```
 $ pithy vector reprocess --env staging --index docs --json
-{"command":"vector reprocess","env":"staging","runs":[{"index":"docs","report":{"indexName":"acme-staging-vector-docs","pages":2,"scanned":140,"reembedded":140,"skipped":0}}]}
+{"command":"vector reprocess","schemaVersion":1,"env":"staging","runs":[{"index":"docs","report":{"indexName":"acme-staging-vector-docs","pages":2,"scanned":140,"reembedded":140,"skipped":0}}]}
 ```
 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"vector reprocess"` | The subcommand that produced the line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `env` | `string` | The environment the runs happened in |
 | `runs` | `object[]` | One entry per index reprocessed, in run order |
 | `runs[].index` | `string` | The config's name for the index |
@@ -106,20 +109,22 @@ $ pithy vector reprocess --env staging --index docs --json
 
 ## Errors
 
-Each one is a `PithyError` — the problem, then the action. Under `--json` they arrive on stderr as `{"error":{…}}`, and the process exits 1.
+Each one is a `PithyError` — the problem, then the action. Under `--json` they arrive on stderr as `{"error":{…}}`, with `exit`, `retryable` and, where the cause is known, `fix`, and the process exits by its kind — 2 for a call to fix, 3 for something to set up first, 4 to retry, 5 for a person (`docs/CLI.md` §3.8).
 
 **The Worker does not compose `vector`.** The target, `--worker` or the project's only Worker, has no `vector(...)` registration. The config is read off the Worker the run writes into and never off a sibling: the indexes created are the ones the Worker holding the `VECTOR_PROVISIONED` record declares.
 
 ```
 <worker> does not compose the vector capability.
-Add `vector({ ... })` to <worker>'s pithy.config.ts (run `pithy add vector`), or name the Worker that composes it with --worker.
+Add `vector({ ... })` to <worker>'s pithy.config.ts (run `pithy add vector --worker <worker>`), or name the Worker that composes it with --worker.
 ```
+
+Named with `--worker`, it is a usage error, exit 2: another `--worker` is the fix. The project's only Worker, unnamed, is `core/precondition_failed`, exit 3, with `pithy add vector --worker <worker>` as its `fix`, `<worker>` being the Worker's `apps/` directory.
 
 **Cloudflare credentials are missing.**
 
 ```
 Cloudflare credentials are missing.
-Run pithy init to record CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN, or export them.
+Export CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN for this project's account, then run this again.
 ```
 
 **No `DB` id for this environment.** The document corpus lives in the app database, so provisioning refuses rather than standing up an index with nothing to fill it: `<worker>'s wrangler.jsonc has no DB database_id for <env>.`
@@ -148,7 +153,7 @@ Resetting staging destroys all of its data.
 Pass --confirm-reset "yes, i really want to reset staging" to drop and recreate the staging schema.
 ```
 
-A supplied-but-wrong phrase is refused separately, and the phrase names its environment — one authorizing a `staging` reset cannot be pasted into a command targeting another.
+A supplied-but-wrong phrase is refused separately, and the phrase names its environment — one authorizing a `staging` reset cannot be pasted into a command targeting another. Either refusal is `core/person_required`, exit 5: the phrase is a person's to give.
 
 **An unknown `--index`.** Raised for every named index before the first run starts.
 
@@ -159,7 +164,16 @@ Pick one of: docs, notes.
 
 **A malformed `--filter`.** `--filter is not valid JSON.` or `--filter must be a JSON object.` — an array and a bare scalar are both refused.
 
-**The project has no name.** An index is found by name and reused, so the name must be identical on every run, and it is never guessed: a wrong one adopts another project's corpus.
+**The project has no name.** An index is found by name and reused, so the name must be identical on every run, and it is never guessed: a wrong one adopts another project's corpus. It is `core/precondition_failed`, exit 3: the call is right and the project is missing what it depends on.
+
+**A metadata index is accepted but not live yet.** Five minutes passed without three agreeing reads. Vectorize applies a metadata index asynchronously, and this one has not landed yet. Write no vectors, and re-run `provision`. It creates nothing twice, and it waits again.
+
+```
+The metadata indexes on `acme-staging-vector-docs` were accepted but are not live yet.
+Re-run `pithy vector provision --worker api --env staging` in a minute. Do not write vectors until it reports them ready.
+```
+
+The command is this run's own, with its Worker and environment. In a production environment it is not offered as a fix: the line names it and says the run is a person's decision.
 
 **The Workflow did not finish.** `reset` and `reprocess` wait on dispatched instances and raise a `cloudflare/*` error when one ends `errored` or `terminated`, or is still running at the poll cap.
 

@@ -2,7 +2,15 @@
 // SPDX-License-Identifier: MIT
 
 import { describe, expect, test } from "vitest";
-import { malformedPrettyFlag, ROOT_FLAGS, wantsPretty, wantsVersion } from "./rootFlags";
+import {
+  malformedNoInputFlag,
+  malformedPrettyFlag,
+  ROOT_FLAG_DESCRIPTIONS,
+  ROOT_FLAGS,
+  wantsNoInput,
+  wantsPretty,
+  wantsVersion,
+} from "./rootFlags";
 
 describe("wantsVersion", () => {
   test("answers the bare root flags", () => {
@@ -71,11 +79,15 @@ describe("wantsPretty", () => {
     expect(wantsPretty(["secrets", "rotate", "API_KEY", "--json", "--no-pretty"])).toBe(false);
   });
 
-  /** Last wins, which is what every parser does with a repeated flag and what a shell alias relies on. */
-  test("the last one typed wins, so an alias can be overridden on the command line", () => {
+  /**
+   * Read by citty's rule, as every boolean flag is (`booleanToken.ts`, #697 review): a bare `--no-pretty` wins
+   * wherever it is, so an alias carrying `--pretty` is overridden by `--no-pretty`, and one carrying `--no-pretty`
+   * is not undone by `--pretty`. `PITHY_JSON` is the lever for a session-wide setting.
+   */
+  test("a bare --no-pretty wins wherever it is; otherwise the last --pretty decides", () => {
     expect(wantsPretty(["--pretty", "--no-pretty"])).toBe(false);
-    expect(wantsPretty(["--no-pretty", "--pretty"])).toBe(true);
-    expect(wantsPretty(["--pretty", "--no-pretty", "--pretty"])).toBe(true);
+    expect(wantsPretty(["--no-pretty", "--pretty"])).toBe(false);
+    expect(wantsPretty(["--pretty=false", "--pretty"])).toBe(true);
   });
 
   test("stops at `--`, so passthrough payload is never read as a Pithy flag", () => {
@@ -139,7 +151,65 @@ describe("malformedPrettyFlag", () => {
  * restated in either. Two flags went missing from the catalog exactly once, by being written out twice.
  */
 describe("ROOT_FLAGS", () => {
-  test("carries both pretty spellings beside --help and --version", () => {
-    expect([...ROOT_FLAGS].sort()).toEqual(["--help", "--no-pretty", "--pretty", "--version", "-h", "-v"]);
+  test("carries both pretty spellings and --no-input beside --help and --version", () => {
+    expect([...ROOT_FLAGS].sort()).toEqual([
+      "--help",
+      "--no-input",
+      "--no-pretty",
+      "--pretty",
+      "--version",
+      "-h",
+      "-v",
+    ]);
+  });
+});
+
+/** `--no-input` forbids prompts for one call (#697), read off the raw tokens like `--pretty`. */
+describe("wantsNoInput", () => {
+  test("absent is undefined, so the variable and --json decide", () => {
+    expect(wantsNoInput(["init"])).toBeUndefined();
+    expect(wantsNoInput([])).toBeUndefined();
+  });
+
+  test("the bare flag forbids, on any command and on either side of a positional", () => {
+    expect(wantsNoInput(["--no-input", "init"])).toBe(true);
+    expect(wantsNoInput(["add", "auth", "--no-input"])).toBe(true);
+  });
+
+  /** Read by the one rule every boolean flag is read by (`booleanToken.ts`): a bare `--no-input` wins wherever it is. */
+  test("=true and =false are read, the last of them wins, and a bare --no-input wins over both", () => {
+    expect(wantsNoInput(["init", "--no-input=true"])).toBe(true);
+    expect(wantsNoInput(["init", "--no-input=false"])).toBe(false);
+    expect(wantsNoInput(["init", "--no-input=true", "--no-input=false"])).toBe(false);
+    expect(wantsNoInput(["init", "--no-input", "--no-input=false"])).toBe(true);
+  });
+
+  test("a malformed value is no answer here; malformedNoInputFlag reports it", () => {
+    expect(wantsNoInput(["init", "--no-input=maybe"])).toBeUndefined();
+  });
+
+  test("anything after -- is a child's, and look-alikes are not it", () => {
+    expect(wantsNoInput(["dev", "--", "--no-input"])).toBeUndefined();
+    expect(wantsNoInput(["init", "--no-inputs", "--input"])).toBeUndefined();
+  });
+});
+
+describe("malformedNoInputFlag", () => {
+  test("names the first token whose value is neither true nor false", () => {
+    expect(malformedNoInputFlag(["init", "--no-input=1", "--no-input=x"])).toBe("--no-input=1");
+  });
+
+  test("well-formed spellings and payload after -- are not malformed", () => {
+    expect(malformedNoInputFlag(["init", "--no-input", "--no-input=false"])).toBeUndefined();
+    expect(malformedNoInputFlag(["dev", "--", "--no-input=x"])).toBeUndefined();
+  });
+});
+
+/** What `pithy schema` publishes for the root flags is the list `bin.ts` answers, described (#697). */
+describe("ROOT_FLAG_DESCRIPTIONS", () => {
+  test("names every spelling ROOT_FLAGS holds, exactly once, each with what it does", () => {
+    const spellings = ROOT_FLAG_DESCRIPTIONS.flatMap((flag) => [flag.name, ...flag.aliases]);
+    expect(spellings.sort()).toEqual([...ROOT_FLAGS].sort());
+    for (const flag of ROOT_FLAG_DESCRIPTIONS) expect(flag.description).not.toBe("");
   });
 });

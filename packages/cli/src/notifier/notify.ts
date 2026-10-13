@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
+import { cliAtVersion } from "@pithy-sh/core/src/cli/command";
 import { saffron } from "../terminal/style";
 import { type FetchLike, refreshCliState } from "./check";
 import { type Installer, upgradeCommandFor } from "./installer";
@@ -13,6 +14,9 @@ import { type Bump, classifyBump, parseVersion } from "./version";
  * The check is `setImmediate`-scheduled so it never blocks the command, silent on every failure, and the
  * notice prints to stderr only when every suppression rule holds.
  */
+
+/** Any non-blank value suppresses the end-of-command update notice. */
+export const NO_UPDATE_NOTIFIER_ENV = "PITHY_NO_UPDATE_NOTIFIER";
 
 /** The inputs the four suppression rules read. All must hold for the notice to print. */
 export interface SuppressionInput {
@@ -36,7 +40,7 @@ export interface SuppressionInput {
  */
 export function shouldNotify(input: SuppressionInput): boolean {
   if (!input.isTTY) return false;
-  if (input.env.PITHY_NO_UPDATE_NOTIFIER) return false;
+  if (input.env[NO_UPDATE_NOTIFIER_ENV]) return false;
   if (!input.notifierEnabled) return false;
   if (input.bump === "minor" || input.bump === "major") return true;
   if (input.bump === "patch" && input.securityFlagged) return true;
@@ -62,7 +66,7 @@ export function formatUpdateNotice(input: NoticeInput): string {
   const command = upgradeCommandFor(input.installer);
   const major = parseVersion(input.latest)?.major ?? 0;
 
-  const lead = `pithy ${accent(input.latest)} ${accent("available")}. You have ${input.installed}.`;
+  const lead = `${cliAtVersion(accent(input.latest))} ${accent("available")}. You have ${input.installed}.`;
   const lines = [""];
   if (input.bump === "major") {
     lines.push(`${lead} (Major release — see changelog.)`);

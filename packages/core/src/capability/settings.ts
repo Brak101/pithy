@@ -69,6 +69,13 @@ export const SettingsFinding = z
       .describe(
         "What resolves it: the `pithy` command, the `pithy.config.ts` key, or the one-time account action. Never optional — a finding nobody can act on is a complaint.",
       ),
+    fix: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "The `pithy` command that resolves it, whole and runnable as written, when one does. Absent when the remedy is an edit or an account action, and from a capability older than the field — `pithy doctor --json` reports either as `fix: null`.",
+      ),
   })
   .describe("One capability setting that does not work, with the action that resolves it.");
 export type SettingsFinding = z.infer<typeof SettingsFinding>;
@@ -90,8 +97,15 @@ export interface SettingsEnvironment {
 export interface SettingsCheckContext {
   /** The root config's `name` — the leading segment of every resource this project provisions. */
   project: string;
-  /** The Worker whose `pithy.config.ts` composed this capability. */
+  /** The Worker whose `pithy.config.ts` composed this capability, by its `wrangler.jsonc` name. */
   worker: string;
+  /**
+   * That Worker's directory under `apps/` — the value `--worker` takes, and the one a refusal lists (#711).
+   *
+   * Not `worker` under another name. A scaffold deploys `apps/api` as `acme-api`, so a command a finding names
+   * for one Worker is written with this.
+   */
+  workerDirectory: string;
   /** Every environment the project declares, in declaration order. */
   environments: readonly SettingsEnvironment[];
 }
@@ -156,7 +170,7 @@ export interface CapabilitySettings {
  * import("../workflow/hostEnv").checkHostEnv} against its own declaration, and hands the report here. The
  * problem line is Zod's own message and the action line is {@link hostEnvProviderSentence} — the same
  * words the host writes into its log before it refuses to start. Two readers of one declaration, and no
- * second wording to drift.
+ * second wording to drift. A provider that names a command carries it as `fix` too.
  */
 export function hostEnvFindings(report: HostEnvReport<unknown>, environment: string | null): SettingsFinding[] {
   return report.problems.map((problem) => ({
@@ -164,5 +178,8 @@ export function hostEnvFindings(report: HostEnvReport<unknown>, environment: str
     environment,
     problem: problem.reason,
     action: hostEnvProviderSentence(problem.provider),
+    // The provider's own command, where it names one, as the finding's `fix` (#697): the same words the action
+    // line runs, without the sentence around them.
+    ...(problem.provider.command === undefined ? {} : { fix: problem.provider.command }),
   }));
 }

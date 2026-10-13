@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { ValidationError } from "@pithy-sh/core/src/error/pithyError";
 import type { Logger } from "@pithy-sh/core/src/logger/logger";
 import type { CommandDef } from "citty";
@@ -38,7 +41,7 @@ vi.mock("../project/config", async (importOriginal) => ({
 const roster = vi.hoisted(() => ({ readCohortCalls: [] as unknown[][], passDeps: [] as Record<string, unknown>[] }));
 
 /** What the stubbed project's one Worker composes beside testers. Swapped per case. */
-const project = vi.hoisted(() => ({ siblings: [] as Record<string, unknown>[] }));
+const project = vi.hoisted(() => ({ siblings: [] as Record<string, unknown>[], composesTesters: true }));
 
 const COHORT = { id: "c1", name: "closed-test", targetSize: 20, windowDays: 14, closedAt: null };
 
@@ -51,6 +54,11 @@ vi.mock("../capabilities/testersLoader", async () => ({
     listCohorts: async () => [COHORT],
     resolveCohortRef: async () => COHORT,
     listSnapshots: async () => [],
+    findMemberByEmail: async () => undefined,
+    inviteMember: async (_deps: unknown, input: { email: string }) => ({
+      member: { id: `m-${input.email}`, email: input.email },
+      created: true,
+    }),
     toCohortView: () => ({ name: COHORT.name, members: [] }),
     readCohort: async (...args: unknown[]) => {
       roster.readCohortCalls.push(args);
@@ -73,8 +81,11 @@ vi.mock("../project/workerScope", async (importOriginal) => ({
   resolveWorkers: async () => [
     {
       name: "api",
-      dir: "/does/not/exist",
-      capabilities: [{ name: "testers", testersConfig: { activeWithinDays: 7 } }, ...project.siblings],
+      dir: "/does/not/exist/apps/api",
+      capabilities: [
+        ...(project.composesTesters ? [{ name: "testers", testersConfig: { activeWithinDays: 7 } }] : []),
+        ...project.siblings,
+      ],
     },
   ],
 }));
@@ -124,8 +135,29 @@ describe("pithy testers", () => {
 
   test("provision refuses a project with no name, before it reaches Cloudflare", async () => {
     const error = await failure("provision", { json: true });
-    expect(error.code).toBe("validation/invalid_input");
+    // The call is right and the project is missing its name: a precondition, exit 3 (#697).
+    expect(error.code).toBe("core/precondition_failed");
     expect(error.message).toBe("pithy.config.ts has no `name`.");
+  });
+
+  /**
+   * **A project composing no testers is missing what the call depends on (#697).** `pithy testers list --env dev`
+   * was right as typed; `pithy add testers` is the step. Exit 3 with that as its `fix`, never 2.
+   */
+  test("a project composing no testers is a precondition, with pithy add testers as its fix", async () => {
+    project.composesTesters = false;
+    try {
+      const error = (await failure("list", { json: true, env: "dev" })) as Record<string, unknown>;
+      expect(error).toMatchObject({
+        code: "core/precondition_failed",
+        message: "The testers capability is not configured.",
+        exit: 3,
+        // testers declares `email`, so the add composes it too, with nobody to ask (#697).
+        fix: "pithy add testers --worker api --with-prerequisites",
+      });
+    } finally {
+      project.composesTesters = true;
+    }
   });
 
   test("deprovision refuses a project with no name rather than deleting nothing and exiting 0", async () => {
@@ -226,8 +258,9 @@ describe("the optional email import classifies rather than asserts", () => {
     expect((thrown as ValidationError).payload.message).toBe("The email capability is installed but incomplete.");
   });
 
-  // The `bin` ships on Bun, whose `ResolveMessage` is not `instanceof Error`. Vitest runs on Node, so a
-  // fixture built out of `Error` proves nothing about the runtime adopters use.
+  // The `bin` ships on Bun, and the classifier reads a `ResolveMessage` by its fields, never its class: on
+  // Bun 1.3 it was not `instanceof Error`, and on 1.4 it is. A fixture built out of `Error` would pass
+  // whichever way a gate on the class went, so this one carries Bun's fields alone.
   test("a Bun-shaped ResolveMessage for the package itself is still an absence", async () => {
     expect(
       await loadOptionalEmail(() => {
@@ -327,5 +360,49 @@ describe("the read commands and the pass see through the project's auth", () => 
     const error = await failure("list", { json: true, env: "dev" });
     expect(error.message).toBe("The composed auth is too old for testers to see who has used the app.");
     expect(roster.readCohortCalls).toHaveLength(0);
+  });
+});
+
+/**
+ * **The page quotes the lines the command prints (#711).** `docs/commands/testers.md` kept three in the form they had
+ * before their commands were rebuilt — a roster read with no `--env`, which reads `dev`'s whatever the reader was on,
+ * and a pass named with no cohort and no environment. Each case runs the command and finds its words on the page.
+ */
+describe("docs/commands/testers.md quotes what the commands print", () => {
+  const page = readFileSync(
+    resolve(import.meta.dirname, "..", "..", "..", "..", "docs", "commands", "testers.md"),
+    "utf8",
+  );
+
+  beforeEach(() => {
+    project.siblings = [];
+  });
+
+  test.each([
+    ["create", { json: true, env: "dev" }],
+    ["remove", { json: true, env: "dev", cohort: COHORT.name, email: "nobody@example.com" }],
+  ])("%s's refusal", async (name, args) => {
+    const error = (await failure(name, args)) as { message: string; action?: string };
+    expect(page).toContain(`${error.message}\n${error.action}`);
+  });
+
+  test("invite's closing line", async () => {
+    const lines: string[] = [];
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    try {
+      await subcommand("invite").run?.({
+        args: { env: "dev", json: false, cohort: COHORT.name, email: ["sam@example.com", "pat@example.com"] },
+        rawArgs: [],
+      } as never);
+    } finally {
+      stdout.mockRestore();
+    }
+    const printed = stripVTControlCharacters(lines.join(""));
+    const next = printed.split("\n").find((line) => line.startsWith("Run "));
+    expect(next).toBeDefined();
+    expect(page).toContain(`${next}`);
   });
 });

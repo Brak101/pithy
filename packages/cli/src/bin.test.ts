@@ -6,6 +6,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { EXIT } from "./terminal/exitClass";
 
 const run = promisify(execFile);
 const bin = join(import.meta.dirname, "bin.ts");
@@ -81,7 +82,7 @@ describe("root flags", () => {
     )) as { code: number; stdout: string };
     // citty reads it as `add`'s capability argument, and `add` runs — the point is that the bin did not
     // intercept it. Outside a project that run fails, which is `add`'s business, not the flag's.
-    expect(error.code).toBe(1);
+    expect(error.code).toBe(EXIT.precondition);
     expect(error.stdout).toBe("");
   });
 });
@@ -104,45 +105,52 @@ describe("pithy init", () => {
     // and a required prompt would break that. A project declares `domains` in pithy.config.ts directly.
     expect(result).toEqual({
       command: "init",
+      schemaVersion: 1,
       appName: "smoke",
       targetDir: target,
       worker: "api",
       environments: ["staging", "prod"],
       domains: null,
+      // The agent instructions (#697): a cloned repo with neither file gets both.
+      agents: { path: "AGENTS.md", state: "added", reason: null },
+      claude: { path: "CLAUDE.md", state: "added", reason: null },
     });
+    expect(await readFile(join(target, "AGENTS.md"), "utf8")).toContain("<!-- pithy:begin");
 
     const pkg = JSON.parse(await readFile(join(target, "package.json"), "utf8")) as { name: string };
     expect(pkg.name).toBe("smoke");
     expect(await readFile(join(target, "README.md"), "utf8")).toBe("# smoke\n");
   });
 
-  test("a target already holding a file init writes fails with problem and action lines, exit 1", async () => {
+  test("a target already holding a file init writes fails with problem and action lines, exit 3", async () => {
     await writeFile(join(dir, "pithy.config.ts"), "mine");
     const error = (await run("bun", [bin, "init", "--name", "x", "--dir", dir]).catch((e: unknown) => e)) as {
       code: number;
       stderr: string;
     };
-    expect(error.code).toBe(1);
+    expect(error.code).toBe(EXIT.precondition);
     const [problem, action] = error.stderr.trim().split("\n");
     expect(problem).toContain("pithy.config.ts");
-    expect(action).toContain("Run pithy init again.");
+    expect(action).toContain("Move those aside, or pick a directory without them, then run this again.");
   });
 
-  test("--json renders the error as a parseable envelope on stderr, exit 1", async () => {
+  test("--json renders the error as a parseable envelope on stderr, exit 3", async () => {
     await writeFile(join(dir, "pithy.config.ts"), "mine");
     const error = (await run("bun", [bin, "init", "--name", "x", "--dir", dir, "--json"]).catch((e: unknown) => e)) as {
       code: number;
       stdout: string;
       stderr: string;
     };
-    expect(error.code).toBe(1);
+    expect(error.code).toBe(EXIT.precondition);
     expect(error.stdout).toBe(""); // stdout stays clean — the result channel
     expect(JSON.parse(error.stderr.trim())).toEqual({
       error: {
         code: "core/conflict",
         status: 409,
         message: expect.stringContaining("pithy.config.ts"),
-        action: expect.stringContaining("Run pithy init again."),
+        action: expect.stringContaining("Move those aside, or pick a directory without them, then run this again."),
+        exit: EXIT.precondition,
+        retryable: false,
       },
     });
   });
@@ -158,13 +166,15 @@ describe("pithy init", () => {
       (e: unknown) => e,
     )) as { code: number; stderr: string };
 
-    expect(error.code).toBe(1);
+    expect(error.code).toBe(EXIT.precondition);
     expect(JSON.parse(error.stderr.trim())).toEqual({
       error: {
         code: "core/conflict",
         status: 409,
         message: expect.stringContaining(join("apps", "edge")),
-        action: expect.stringContaining("Run pithy init again."),
+        action: expect.stringContaining("Move those aside, or pick a directory without them, then run this again."),
+        exit: EXIT.precondition,
+        retryable: false,
       },
     });
     // Nothing was written before the refusal.
@@ -194,12 +204,12 @@ describe("pithy add", () => {
     expect(result.capabilities.every((c) => c.installed === false)).toBe(true);
   });
 
-  test("no capability and no --list points at --list, exit 1", async () => {
+  test("no capability and no --list points at --list, exit 2", async () => {
     const error = (await run("bun", [bin, "add"], { cwd: dir }).catch((e: unknown) => e)) as {
       code: number;
       stderr: string;
     };
-    expect(error.code).toBe(1);
+    expect(error.code).toBe(EXIT.usage);
     expect(error.stderr).toContain("Name a capability");
     expect(error.stderr).toContain("pithy add --list");
   });
@@ -215,9 +225,11 @@ describe("pithy migrate", () => {
     // `group` is the timestamp this run stamped itself with (#694) — generated, so matched by shape.
     expect(JSON.parse(stdout.trim())).toEqual({
       command: "migrate",
+      schemaVersion: 1,
       env: "dev",
       project: "app",
       rollback: false,
+      dryRun: false,
       group: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
       workers: [{ worker: "app-api", databases: [] }],
     });
@@ -226,9 +238,11 @@ describe("pithy migrate", () => {
     const rollback = await run("bun", [bin, "migrate", "--rollback", "--json"], { cwd: target });
     expect(JSON.parse(rollback.stdout.trim())).toEqual({
       command: "migrate",
+      schemaVersion: 1,
       env: "dev",
       project: "app",
       rollback: true,
+      dryRun: false,
       workers: [{ worker: "app-api", databases: [] }],
     });
   });
@@ -238,7 +252,7 @@ describe("pithy migrate", () => {
       code: number;
       stderr: string;
     };
-    expect(error.code).toBe(1);
+    expect(error.code).toBe(EXIT.precondition);
     expect(error.stderr).toContain("No pithy.config.ts here.");
     expect(error.stderr).toContain("pithy init creates one.");
   });

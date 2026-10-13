@@ -82,3 +82,58 @@ describe("assertProvisionConfirmed", () => {
     ).resolves.toBeUndefined();
   });
 });
+
+/**
+ * **The production phrase is a person's to give (#697).** With no phrase and nobody to ask, a wrong
+ * `--confirm`, or a wrong phrase at the prompt, the refusal is `core/person_required` — exit 5, so an agent
+ * stops and asks rather than trying variations. The action line still names `--confirm`, for the person.
+ */
+describe("assertProvisionConfirmed's refusals, by kind", () => {
+  /** The payload a run rejected with. */
+  async function payloadOf(run: Promise<void>): Promise<Record<string, unknown>> {
+    const failure = await run.catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PithyError);
+    return (failure as PithyError).payload as unknown as Record<string, unknown>;
+  }
+
+  test("production with no phrase and nobody to ask needs a person, and the action names --confirm", async () => {
+    expect(await payloadOf(assertProvisionConfirmed({ env: "prod", yes: true, json: true }))).toMatchObject({
+      code: "core/person_required",
+      action: `Pass --confirm "${provisionConfirmPhrase("prod")}".`,
+    });
+  });
+
+  test("a prompt is never asked under --json, even when one is supplied", async () => {
+    let asked = false;
+    const payload = await payloadOf(
+      assertProvisionConfirmed({
+        env: "prod",
+        yes: true,
+        json: true,
+        prompt: async () => {
+          asked = true;
+          return provisionConfirmPhrase("prod");
+        },
+      }),
+    );
+    expect(payload.code).toBe("core/person_required");
+    expect(asked).toBe(false);
+  });
+
+  test("a wrong --confirm needs a person, not another guess", async () => {
+    const payload = await payloadOf(
+      assertProvisionConfirmed({ env: "prod", yes: true, json: true, confirmPhrase: "yes" }),
+    );
+    expect(payload.code).toBe("core/person_required");
+  });
+
+  test("a wrong phrase typed at the prompt needs a person too", async () => {
+    const payload = await payloadOf(
+      assertProvisionConfirmed({ env: "prod", yes: true, json: false, prompt: async () => "yes" }),
+    );
+    expect(payload).toMatchObject({
+      code: "core/person_required",
+      message: "Provisioning prod was not confirmed.",
+    });
+  });
+});

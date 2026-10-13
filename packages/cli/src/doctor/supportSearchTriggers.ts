@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: MIT
 
 import type { Capability } from "@pithy-sh/core/src/capability/capability";
+import { type Command, pithyCommand, type WorkerDir } from "@pithy-sh/core/src/cli/command";
 import { cloudflareClients } from "../cloudflare/clients";
 import { type CloudflareAccountSelection, cloudflareCredentials } from "../cloudflare/config";
 import { kitImport } from "../project/kitResolve";
+import { workerDirName } from "../project/workerIdentity";
 import { readWranglerConfig } from "../project/wrangler";
 import type { RemoteSkip } from "./environmentMigrations";
 
@@ -70,12 +72,15 @@ export type EnvironmentSearchIndex =
       env: string;
       /** The Worker whose support capability was read. */
       worker: string;
+      /** That Worker's `apps/` directory: what `--worker` takes, and what the `fix` names (#711). */
+      directory: WorkerDir;
       /** The table and all three triggers are there. */
       state: "ok";
     }
   | {
       env: string;
       worker: string;
+      directory: WorkerDir;
       /** The table is provisioned and its triggers are not. Nothing is maintaining the index. */
       state: "drift";
       /** How much of the trigger set is there — `"some"` leaves one statement kind unindexed. */
@@ -84,6 +89,7 @@ export type EnvironmentSearchIndex =
   | {
       env: string;
       worker: string;
+      directory: WorkerDir;
       /**
        * The triggers are there and the table they write into is not. Worse than `drift`: a trigger body
        * inserts into `pithy_support_search`, so with the table gone every message write raises
@@ -96,12 +102,14 @@ export type EnvironmentSearchIndex =
   | {
       env: string;
       worker: string;
+      directory: WorkerDir;
       /** That environment's stanza names no app database, so there is nothing to ask. */
       state: "not-provisioned";
     }
   | {
       env: string;
       worker: string;
+      directory: WorkerDir;
       /** A deployed read that was not attempted. */
       state: "skipped";
       /** Why it was not. */
@@ -110,15 +118,28 @@ export type EnvironmentSearchIndex =
   | {
       env: string;
       worker: string;
+      directory: WorkerDir;
       /** The read threw. Nothing of what it threw is kept. */
       state: "unreadable";
     }
   | {
       env: string;
       worker: string;
+      directory: WorkerDir;
       /** The Worker's `pithy.config.ts` threw when evaluated for this environment. */
       state: "not-composed";
     };
+
+/**
+ * The command that rights one environment's answer, or `null` — `pithy doctor --json`'s `fix` (#697). The two
+ * fault states are what `pithy support provision` repairs: it rewrites the table and its triggers. It spans
+ * every managed environment and takes no `--env`, so it is narrowed to the Worker instead, which a project
+ * with several is refused without. Every other state is not a fault and names nothing.
+ */
+export function supportSearchFix(answer: EnvironmentSearchIndex): Command | null {
+  if (answer.state !== "drift" && answer.state !== "orphaned-triggers") return null;
+  return pithyCommand("support provision", { flags: { "--worker": answer.directory } });
+}
 
 /** What `doctor` learned about this project's support search index. */
 export interface SupportSearchTriggersCheck {
@@ -240,7 +261,7 @@ export async function checkSupportSearchTriggers(
 
   for (const env of options.environments) {
     for (const worker of options.workers) {
-      const here = { env, worker: worker.name };
+      const here = { env, worker: worker.name, directory: workerDirName(worker) };
       let capabilities: readonly Capability[];
       try {
         ({ capabilities } = await options.composeWorker(worker, env));
@@ -319,7 +340,8 @@ export async function checkSupportSearchTriggers(
  * block is the finding, and an `ok` environment contributes nothing.
  *
  * A skip gets a line for the same reason `environmentMigrations` gives one: a missing line must never be
- * mistaken for a clean one.
+ * mistaken for a clean one. Each fault's line names exactly its `fix`, from {@link supportSearchFix} (#711): the
+ * bare `pithy support provision` it named before is refused in a project with several Workers.
  */
 export function describeSupportSearchTriggers(check: SupportSearchTriggersCheck): string[] {
   const lines: string[] = [];
@@ -330,13 +352,13 @@ export function describeSupportSearchTriggers(check: SupportSearchTriggersCheck)
       case "drift":
         lines.push(
           answer.triggers === "none"
-            ? `${answer.env}: pithy_support_search is provisioned and has no triggers, so nothing indexes a new message. Run pithy support provision.`
-            : `${answer.env}: pithy_support_search has only some of its triggers, so some writes are not indexed. Run pithy support provision.`,
+            ? `${answer.env}: pithy_support_search is provisioned and has no triggers, so nothing indexes a new message. Run ${supportSearchFix(answer)}.`
+            : `${answer.env}: pithy_support_search has only some of its triggers, so some writes are not indexed. Run ${supportSearchFix(answer)}.`,
         );
         break;
       case "orphaned-triggers":
         lines.push(
-          `${answer.env}: pithy_support_search is gone and its triggers are not, so every message write fails. Run pithy support provision.`,
+          `${answer.env}: pithy_support_search is gone and its triggers are not, so every message write fails. Run ${supportSearchFix(answer)}.`,
         );
         break;
       case "not-provisioned":

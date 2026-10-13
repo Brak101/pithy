@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
-import { InternalError } from "@pithy-sh/core/src/error/pithyError";
 import { describe, expect, test } from "vitest";
 import { loadIntegrationCreds, uniqueName, withThrowawayResource } from "../test-utils/harness";
+import { METADATA_INDEX_SETTLE_MS, metadataIndexesSettled, waitForStable } from "../test-utils/settle";
 import { CloudflareVectorizeProvisioner, type VectorizeMetadataIndex } from "./vectorizeProvisioner";
 
 /**
@@ -17,29 +17,32 @@ const creds = loadIntegrationCreds();
 const DIMENSIONS = 32; // Vectorize requires dimensions in [32, 1536].
 
 /**
- * Wait until a metadata property is listed on the index.
+ * Wait until a metadata property is listed on the index, and stays listed.
  *
  * Vectorize's metadata-index list is eventually consistent *and* non-monotonic — a live probe watched it
  * report a property, then not report it 18 seconds later with nothing else running, then report it again.
  * So a single confirming read proves nothing, and deleting straight after creating races the create: the
  * delete arrives first and Vectorize answers `400`/40005. Settle before asserting, and before deleting.
+ *
+ * The budget and the rule are `@pithy-sh/vector`'s suite's, shared through `test-utils/settle`: the 300s
+ * metadata-index budget, three agreeing reads, and a predicate that compares the name and the type. This
+ * suite had 60s and one read of its own, then 120s, and timed out on a slow apply both times (#709).
  */
 async function waitForMetadataIndex(
   provisioner: CloudflareVectorizeProvisioner,
   indexName: string,
-  propertyName: string,
+  declared: VectorizeMetadataIndex,
 ): Promise<VectorizeMetadataIndex> {
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const listed = await provisioner.listMetadataIndexes(indexName);
-    const found = listed.find((entry) => entry.propertyName === propertyName);
-    if (found) return found;
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-  }
-  throw new InternalError({
-    message: "A Vectorize metadata index never became visible.",
-    action: "Re-run the suite. If it repeats, check Vectorize's status — the control plane may be degraded.",
-    detail: `metadata index ${indexName}.${propertyName} never appeared after 30 polls at 2s`,
-  });
+  const { propertyName } = declared;
+  const listed = await waitForStable(
+    `metadata index ${indexName}.${propertyName}`,
+    () => provisioner.listMetadataIndexes(indexName),
+    metadataIndexesSettled([declared]),
+    { timeoutMs: METADATA_INDEX_SETTLE_MS },
+  );
+  const found = listed.find((entry) => entry.propertyName === propertyName);
+  if (!found) throw new Error(`unreachable: ${propertyName} settled as listed on ${indexName}`);
+  return found;
 }
 
 describe.skipIf(!creds.hasCreds)("CloudflareVectorizeProvisioner — LIVE", () => {
@@ -48,7 +51,11 @@ describe.skipIf(!creds.hasCreds)("CloudflareVectorizeProvisioner — LIVE", () =
   // back. The reclaim is now the run's own `globalSetup` sweep rather than a `beforeAll` here, so it also
   // covers `@pithy-sh/vector`'s indexes, which this suite never saw. See `test-utils/reap.ts`.
 
-  test("validates access, creates an index, finds it, indexes a metadata property, then deletes it", async () => {
+  // Its own timeout, above the run's 120s default: the metadata-index wait alone may take its whole 300s
+  // budget, and the create, the reads and the deletes come on top of it.
+  test("validates access, creates an index, finds it, indexes a metadata property, then deletes it", {
+    timeout: 360_000,
+  }, async () => {
     const provisioner = new CloudflareVectorizeProvisioner({ accountId: creds.accountId, apiToken: creds.apiToken });
 
     expect(await provisioner.validateServiceAccess()).toBe(true);
@@ -71,7 +78,10 @@ describe.skipIf(!creds.hasCreds)("CloudflareVectorizeProvisioner — LIVE", () =
         // Assert on the observation that settled, never on a fresh read. Because the list is
         // non-monotonic, re-listing here would flap back to empty often enough to fail under load — it
         // did, which is how this comment came to be written.
-        const found = await waitForMetadataIndex(provisioner, name, "tenantId");
+        const found = await waitForMetadataIndex(provisioner, name, {
+          propertyName: "tenantId",
+          indexType: "string",
+        });
 
         // The decoded shape carries the type in the lowercase spelling the create endpoint takes — live
         // returns "String", so this also pins the casing normalization.

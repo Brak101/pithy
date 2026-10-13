@@ -61,6 +61,82 @@ export class ValidationError extends PithyError {
   }
 }
 
+/**
+ * A run that may not prompt reached a question nobody gave it the answer to (#697).
+ *
+ * `flag` is the flag that answers it, or `null` when no flag can — a person, or a document on stdin, is
+ * the only answer. `choices` is every value the flag takes when that set is known, and is left off the
+ * payload rather than written empty when it is not: an empty list would claim the flag takes nothing.
+ */
+export class InputRequiredError extends PithyError {
+  declare readonly payload: Extract<ErrorPayload, { code: "input/required" }>;
+
+  constructor(
+    args: ErrorArgs & { flag?: string | null; choices?: readonly string[] } = {},
+    options?: { cause?: unknown },
+  ) {
+    super(
+      {
+        code: "input/required",
+        status: 400,
+        message: args.message ?? "An answer is required, and this run may not ask for it.",
+        action: args.action,
+        detail: args.detail,
+        params: args.params,
+        flag: args.flag ?? null,
+        ...(args.choices === undefined ? {} : { choices: [...args.choices] }),
+      },
+      options,
+    );
+  }
+}
+
+/**
+ * The call is well formed, and what it depends on is not there yet (#697): no credentials, an environment
+ * nothing has provisioned. A separate class from {@link ValidationError} because the remedy is a step to
+ * run first, not a different call — the CLI exits 3 for it and 2 for a validation failure.
+ */
+export class PreconditionFailedError extends PithyError {
+  declare readonly payload: Extract<ErrorPayload, { code: "core/precondition_failed" }>;
+
+  constructor(args: ErrorArgs = {}, options?: { cause?: unknown }) {
+    super(
+      {
+        code: "core/precondition_failed",
+        status: 412,
+        message: args.message ?? "Something this needs is not set up yet.",
+        action: args.action,
+        detail: args.detail,
+        params: args.params,
+      },
+      options,
+    );
+  }
+}
+
+/**
+ * A step only a person may take (#697): a typed confirmation phrase, or a command that is manual by
+ * design. Not {@link InputRequiredError}, which names a flag an automated caller can pass — here no value
+ * a caller could choose is the right answer, and the CLI exits 5 so an agent stops and asks.
+ */
+export class PersonRequiredError extends PithyError {
+  declare readonly payload: Extract<ErrorPayload, { code: "core/person_required" }>;
+
+  constructor(args: ErrorArgs = {}, options?: { cause?: unknown }) {
+    super(
+      {
+        code: "core/person_required",
+        status: 403,
+        message: args.message ?? "Only a person may take this step.",
+        action: args.action,
+        detail: args.detail,
+        params: args.params,
+      },
+      options,
+    );
+  }
+}
+
 export class UnauthorizedError extends PithyError {
   declare readonly payload: Extract<ErrorPayload, { code: "auth/invalid_token" }>;
 

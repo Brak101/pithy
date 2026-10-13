@@ -118,7 +118,7 @@ The three numeric flags must each be a whole number above zero, and `--platform`
 
 Each environment's deploy resolves two ids first: the app `DB` id from that environment's stanza in the app worker's `wrangler.jsonc`, and this project's shared email-suppression database, looked up by name — the daily pass reads it to reconcile bounced addresses, so `pithy email provision` has to have run.
 
-An environment is **ready** when its stanza carries a `DB` binding with a `database_id` — that is, when `pithy provision --env <name>` has run for it. One that is not is **skipped and reported**, never fatal: standing staging up and proving it before production resources exist is the ordinary bring-up. `--env` and readiness are two different narrowings and both are reported: the flag says which environments you meant, readiness says which of those can be acted on. If every environment in the selection is skipped the run exits 1 rather than reporting a success for a run that did nothing. The suppression database stays a refusal — it is project-global, and its absence means `pithy email provision` has not run at all, which no per-environment skip could express.
+An environment is **ready** when its stanza carries a `DB` binding with a `database_id` — that is, when `pithy provision --env <name>` has run for it. One that is not is **skipped and reported**, never fatal: standing staging up and proving it before production resources exist is the ordinary bring-up. `--env` and readiness are two different narrowings and both are reported: the flag says which environments you meant, readiness says which of those can be acted on. If every environment in the selection is skipped the run exits 3 (`core/precondition_failed`, with a `fix`) rather than reporting a success for a run that did nothing. The suppression database stays a refusal — it is project-global, and its absence means `pithy email provision` has not run at all, which no per-environment skip could express.
 
 The sending identity is read off the composed `email` capability rather than asked for. When no email capability is composed, the host is still deployed and the pass records the day but sends nothing — said at provision time rather than discovered on the first silent morning. The pass runs daily at 05:00 UTC.
 
@@ -145,22 +145,41 @@ One line, one object. The `command` field is the space-separated subcommand name
 | key | type | meaning |
 |---|---|---|
 | `command` | `"testers provision"` | The subcommand that produced this line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `results` | array | One entry per environment provisioned |
 | `results[].env` | `"staging" \| "prod"` | The environment this entry describes |
 | `results[].worker` | string | The deployed daily-pass worker name, `<project>-<env>-testers` |
 | `skippedEnvironments` | `object[]` | One entry per selected environment nothing was provisioned for |
 | `skippedEnvironments[].env` | `string` | The environment that was skipped |
 | `skippedEnvironments[].reason` | `string` | Why — `env.<name> has no DB database_id.` |
-| `skippedEnvironments[].action` | `string` | The command that resolves it |
+| `skippedEnvironments[].action` | `string` | What resolves it. For any environment but production, a command that runs as written: `Run pithy provision --env staging --yes.` Production takes a `--confirm` phrase only a person gives, so its line says so and is no command an agent can run alone: ```pithy provision --env prod --yes` with its --confirm phrase, which only a person gives, runs against prod, a production environment. That is a person's decision, not a fix.`` |
 | `sends` | boolean | Whether an email capability is composed. `false` means the pass will record the day and send nothing |
+| `exitCode` | integer | The status the run exits with: `0`. A run that provisions nothing writes no report |
 
-When **every** selected environment was skipped the line is still written to stdout — the per-environment structure is the answer — and an `{"error":…}` line follows on stderr with exit 1.
+**One outcome, never two.** A run that went ahead writes this report alone and exits 0, whether or not some environments were skipped — `exitCode` says so, and it matches `$?`. A run in which **every** selected environment was skipped provisioned nothing, so it writes nothing on stdout: the `{"error":…}` line on stderr is the whole answer, exit 3, with the provisioning command as its `fix`. `testers provision` is not one of the commands whose report is the answer to a failure (`docs/CLI.md` §3.8).
+
+```
+$ pithy testers provision --worker api --json
+{"command":"testers provision","schemaVersion":1,"results":[{"env":"staging","worker":"acme-staging-testers"}],"skippedEnvironments":[{"env":"prod","reason":"env.prod has no DB database_id.","action":"`pithy provision --env prod --yes` with its --confirm phrase, which only a person gives, runs against prod, a production environment. That is a person's decision, not a fix."}],"sends":true,"exitCode":0}
+$ echo $?
+0
+```
+
+```
+$ pithy testers provision --worker api --json
+{"error":{"code":"core/precondition_failed","status":412,"message":"No environment is ready — staging and prod have no DB database_id.","action":"Run pithy provision --env staging --yes to create its app database. `pithy provision --env prod --yes` with its --confirm phrase, which only a person gives, runs against prod, a production environment. That is a person's decision, not a fix. Once their app databases exist, this run is next: `pithy testers provision --json --worker api` runs against every environment, production included. That is a person's decision, not a fix.","exit":3,"retryable":false,"fix":"pithy provision --env staging --yes"}}
+$ echo $?
+3
+```
+
+The second line is on stderr, and stdout is empty. Run without `--env`, the command acts on every environment, production included, so running it again is said as a person's decision rather than named to run. Run with `--env staging`, the command to repeat carries it, and runs as written: `pithy testers provision --json --env staging --worker api`. Run with `--env prod`, running it again is a production run, said as a person's decision too.
 
 ### `pithy testers deprovision`
 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"testers deprovision"` | The subcommand that produced this line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `results` | array | One entry per environment torn down |
 | `results[].env` | `"staging" \| "prod"` | The environment this entry describes |
 | `results[].worker` | string | The daily-pass worker name that was deleted. Absent is success — teardown is idempotent |
@@ -172,6 +191,7 @@ Both emit the whole cohort row, under the same key and the same shape. `create` 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"testers create"` \| `"testers close"` | The subcommand that produced this line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `cohort` | object | The cohort row |
 | `cohort.id` | string | The cohort's UUID. Text rather than a sequential id, which would leak how many test programs a project has run |
 | `cohort.name` | string | The human label |
@@ -190,6 +210,7 @@ Both emit the whole cohort row, under the same key and the same shape. `create` 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"testers list"` | The subcommand that produced this line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `cohorts` | array | Every cohort, newest first |
 | `cohorts[].id` | string | The cohort id |
 | `cohorts[].name` | string | The cohort's human label |
@@ -204,6 +225,7 @@ Both emit the whole cohort row, under the same key and the same shape. `create` 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"testers invite"` | The subcommand that produced this line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `cohort` | string | The resolved cohort **id**, whether you passed a name or an id |
 | `invited` | array | One entry per `--email`, in the order given |
 | `invited[].id` | string | The member id. Stable across a revival, so history stays attached to one person |
@@ -215,6 +237,7 @@ Both emit the whole cohort row, under the same key and the same shape. `create` 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"testers pending"` | The subcommand that produced this line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `cohort` | string | The resolved cohort id |
 | `emails` | array of string | Every tester in the `accepted` state — they have agreed to test and are waiting to be added to the store's tester list |
 
@@ -223,6 +246,7 @@ Both emit the whole cohort row, under the same key and the same shape. `create` 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"testers remove"` | The subcommand that produced this line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `member` | object | The removed tester |
 | `member.id` | string | Their member id |
 | `member.email` | string | Their address |
@@ -232,6 +256,7 @@ Both emit the whole cohort row, under the same key and the same shape. `create` 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"testers run"` | The subcommand that produced this line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `results` | array | One entry per cohort the pass ran for — one with `--cohort`, otherwise every open cohort |
 | `results[].cohortId` | string | The cohort this entry describes |
 | `results[].snapshotOn` | string | The UTC day the pass recorded, `YYYY-MM-DD` |
@@ -255,6 +280,7 @@ That difference reaches `cohort.trend`. `direction` and every delta come off the
 | key | type | meaning |
 |---|---|---|
 | `command` | `"testers roster"` \| `"testers status"` | The subcommand that produced this line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `cohort` | object | The cohort view |
 | `cohort.id` | string | The cohort id |
 | `cohort.name` | string | The cohort's human label |
@@ -435,26 +461,26 @@ Each entry of `cohort.trend.series` is one day of the cohort's position as it wa
 | `cohort.members[].nudgeCooldownUntil` | ISO-8601 string \| null | When they may be nudged again, or `null` if they may be now |
 | `cohort.members[].unreachable` | boolean | Whether their address bounced or is suppressed. We cannot nudge them at all |
 
-A failing run writes `{"error":{…}}` to stderr instead and exits 1 — the same public payload the HTTP surface encodes, with `detail` stripped.
+A failing run writes `{"error":{…}}` to stderr instead and exits by its kind (`docs/CLI.md` §3.8) — the same public payload the HTTP surface encodes, with `detail` stripped, plus `exit`, `retryable` and, where the cause is known, `fix`.
 
 ## Errors
 
 Each is a `PithyError`: the problem, then the action.
 
-**The capability is not configured.**
+**The capability is not configured.** No Worker's `pithy.config.ts` composes `testers`. It is `core/precondition_failed`, exit 3. With one Worker its `fix` is `pithy add testers --worker <worker> --with-prerequisites` — testers declares `email`, and the Worker is named by its `apps/` directory — and the action names the same command. With several there is no `fix`, because nothing says which Worker should compose it (`docs/CLI.md` §3.8), and the action names one command per Worker, each runnable as written: ``(run `pithy add testers --worker api --with-prerequisites` or `pithy add testers --worker web --with-prerequisites`)``.
 
 ```
 The testers capability is not configured.
-Add `testers({ baseUrl: '...' })` to pithy.config.ts (run `pithy add testers`).
+Add `testers({ baseUrl: '...' })` to pithy.config.ts (run `pithy add testers --worker <worker> --with-prerequisites`).
 ```
 
-**The capability will not load.** Distinct from the above, and classified rather than assumed. `@pithy-sh/testers` missing answers `The testers capability is not installed.` with `pithy add testers`; the package present with one of its own imports unresolved answers `The testers capability could not be loaded.` and tells you to install the project's dependencies — `pithy add` cannot fix that one. A package that resolves and throws or will not parse answers `The testers capability is installed and will not load.`
+**The capability will not load.** Distinct from the above, and classified rather than assumed. `@pithy-sh/testers` missing answers `The testers capability is not installed.` with `pithy add testers --worker <w> --with-prerequisites` — read from the kit's own manifest, since none is installed — and, in a project with several Workers, one such command for each Worker; a project with no Worker is told to create one with `pithy worker add` first; the package present with a dependency of its own not installed answers `The testers capability could not be loaded.` and tells you to install the project's dependencies — `pithy add` cannot fix that one. A package that resolves and throws or will not parse answers `The testers capability is installed and will not load.`, and so does one whose import names something no install provides: a `#` import its own imports map lacks, or a `node:` module this runtime does not have. A path an installed package does not have, or does not export, answers `The testers capability is installed but incomplete.` No install fixes any of those, so the action never offers one, and it names the package that wrote the import.
 
 **A missing positional.**
 
 ```
 Missing a cohort name.
-Pass it: pithy testers create closed-test
+Pass a cohort name to pithy testers create, first.
 ```
 
 **A flag that is not a number, or not one of a fixed set.**
@@ -489,14 +515,14 @@ This deploys to a Cloudflare account, and dev is local-only. Run `pithy dev` ins
 
 ```
 No such cohort.
-List your cohorts with `pithy testers list` and retry with an id from there.
+List this environment's cohorts with `pithy testers list` and its --env, and retry with an id from there.
 ```
 
 **That address is not on this cohort**, from `remove`.
 
 ```
 That address is not on this cohort.
-Run `pithy testers roster closed-test` to see who is.
+Run `pithy testers roster closed-test --env dev` to see who is.
 ```
 
 **Roster refusals**, from `invite`: `That tester is already on this cohort.` (use resend, which preserves their history), `That tester asked to be taken off this test.` (a withdrawal is theirs and durable), and `That cohort's roster is full.` — refused at the roster edge rather than days later as a rejected email list at the store.
@@ -505,7 +531,7 @@ Run `pithy testers roster closed-test` to see who is.
 
 ```
 This project's email-suppression database (acme-global-email-suppressions) does not exist.
-Run `pithy email provision` first — the daily pass reads it to reconcile bounced addresses.
+Run `pithy email provision --worker api` first — the daily pass reads it to reconcile bounced addresses.
 ```
 
 ## Examples
@@ -522,7 +548,7 @@ Done.
 ```
 $ pithy testers invite closed-test --email sam@example.com --email pat@example.com
 2 added to closed-test.
-Run `pithy testers run` to ask them whether they will test.
+Run `pithy testers run --cohort closed-test --env dev` to ask them whether they will test.
 Done.
 ```
 
@@ -546,19 +572,19 @@ Take the addresses that are waiting and paste them into the Play console:
 
 ```
 $ pithy testers pending closed-test --json
-{"command":"testers pending","cohort":"7c2f…","emails":["sam@example.com","pat@example.com"]}
+{"command":"testers pending","schemaVersion":1,"cohort":"7c2f…","emails":["sam@example.com","pat@example.com"]}
 ```
 
 Run a pass by hand without sending anything:
 
 ```
 $ pithy testers run --cohort closed-test --skip-nudges --json
-{"command":"testers run","results":[{"cohortId":"7c2f…","snapshotOn":"2026-08-08","nudged":{"confirm":0,"store":0,"inactive":0,"closing":0},"estimatedOptedInCount":11,"estimatedHeldDays":6,"trendDirection":"steady","pruned":0}]}
+{"command":"testers run","schemaVersion":1,"results":[{"cohortId":"7c2f…","snapshotOn":"2026-08-08","nudged":{"confirm":0,"store":0,"inactive":0,"closing":0},"estimatedOptedInCount":11,"estimatedHeldDays":6,"trendDirection":"steady","pruned":0}]}
 ```
 
 Deploy the daily pass to every declared environment:
 
 ```
 $ pithy testers provision --json
-{"command":"testers provision","results":[{"env":"staging","worker":"acme-staging-testers"}],"skippedEnvironments":[{"env":"prod","reason":"env.prod has no DB database_id.","action":"Run pithy provision --env prod."}],"sends":true}
+{"command":"testers provision","schemaVersion":1,"results":[{"env":"staging","worker":"acme-staging-testers"}],"skippedEnvironments":[{"env":"prod","reason":"env.prod has no DB database_id.","action":"`pithy provision --env prod --yes` with its --confirm phrase, which only a person gives, runs against prod, a production environment. That is a person's decision, not a fix."}],"sends":true,"exitCode":0}
 ```

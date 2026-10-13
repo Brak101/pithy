@@ -2,12 +2,16 @@
 // SPDX-License-Identifier: MIT
 
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, symlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { parse } from "comment-json";
 import { Miniflare } from "miniflare";
 import { afterEach, beforeEach, expect, test } from "vitest";
+import { Plan } from "./plan/plan";
+import { seedDryRunPlan } from "./seed/dryRunPlan";
+import type { SeedRunReport } from "./seed/run";
+import { expectConforms } from "./test-utils/payloadContract";
 
 const run = promisify(execFile);
 const bin = join(import.meta.dirname, "bin.ts");
@@ -75,9 +79,11 @@ test("empty dir → init → boots, serves /health 200, migrates the empty regis
   const { stdout } = await run("bun", [bin, "migrate", "--json"], { cwd: target });
   expect(JSON.parse(stdout.trim())).toEqual({
     command: "migrate",
+    schemaVersion: 1,
     env: "dev",
     project: "smoke-app",
     rollback: false,
+    dryRun: false,
     // The group this run stamped itself with (#694): generated, so matched by shape.
     group: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
     workers: [{ worker: "smoke-app-api", databases: [] }],
@@ -143,12 +149,16 @@ test("pithy add auth on a bare project refuses non-interactively, naming the exa
   expect(refused.code).not.toBe(0);
   expect(JSON.parse(refused.stderr.trim())).toEqual({
     error: {
-      code: "validation/invalid_input",
+      code: "input/required",
       status: 400,
-      issues: [],
+      flag: "--with-prerequisites",
       message: "auth requires secrets and email, which board does not compose.",
       action:
-        "Run pithy add auth --with-prerequisites, or compose them first: pithy add secrets, then pithy add email.",
+        "Run `pithy add auth --worker board --with-prerequisites --json`, or compose them first: `pithy add secrets --worker board --json`, then `pithy add email --worker board --json`.",
+      exit: 2,
+      retryable: false,
+      // The command the action leads with, naming the Worker the caller named and keeping the --json it passed (#711).
+      fix: "pithy add auth --worker board --with-prerequisites --json",
     },
   });
 
@@ -165,6 +175,8 @@ test("pithy add auth --with-prerequisites composes secrets, email and auth, and 
   const added = await cli(["add", "auth", "--worker", "board", "--with-prerequisites", "--json"], target);
   // The refusal's own line rides on the assertion, so a non-zero exit names its cause rather than a bare `1`.
   expect(added.code, added.stderr).toBe(0);
+  // Held to the schema `pithy schema add` publishes (#697), from the real binary on a real project.
+  await expectConforms("add", added.stdout);
   const result = JSON.parse(added.stdout.trim()) as {
     capability: string;
     prerequisites: string[];
@@ -231,12 +243,34 @@ test("pithy add auth --with-prerequisites composes secrets, email and auth, and 
   expect(health.project.health.workers[0]?.migrations).toEqual({
     ok: true,
     environments: [
-      { env: "dev", state: "checked", ledger: { state: "read", pending: 0, undeclared: [] } },
-      { env: "staging", state: "not-provisioned", unprovisioned },
-      { env: "prod", state: "not-provisioned", unprovisioned },
+      { env: "dev", state: "checked", ledger: { state: "read", pending: 0, undeclared: [] }, fix: null },
+      // Each with its `fix` (#697): the provision for staging, and none for prod, whose provision is a person's.
+      { env: "staging", state: "not-provisioned", unprovisioned, fix: "pithy provision --env staging --yes" },
+      { env: "prod", state: "not-provisioned", unprovisioned, fix: null },
     ],
   });
   expect(checked.code, checked.stderr).toBe(0);
+  await expectConforms("doctor", checked.stdout);
+
+  // And the two lifecycle commands that read this registry next, from the same binary on the same project,
+  // held to the schemas `pithy schema` publishes for them (#697).
+  const migrated = await cli(["migrate", "--env", "dev", "--json"], target);
+  expect(migrated.code, migrated.stderr).toBe(0);
+  await expectConforms("migrate", migrated.stdout);
+  const planned = await cli(["seed", "--env", "dev", "--dry-run", "--json"], target);
+  expect(planned.code, planned.stderr).toBe(0);
+  await expectConforms("seed", planned.stdout);
+  // `plan` is optional in the published schema, so conforming alone would pass a dry run that dropped it.
+  // The plan the binary wrote is the one its own report restates, and a `dev` plan says what it skipped.
+  const payload = JSON.parse(planned.stdout.trim()) as SeedRunReport & { plan?: unknown };
+  expect(payload.dryRun).toBe(true);
+  const plan = Plan.parse(payload.plan);
+  expect(plan).toEqual(seedDryRunPlan(payload));
+  // A fresh project composes no seed sets, so there is nothing to write and nothing to reset.
+  expect(plan.data).toEqual([]);
+  expect(plan.notes).toContain(
+    "A real run also seeds the project's dev secrets into each Worker's .dev.vars and the local SECRETS store.",
+  );
 }, 300_000);
 
 test("pithy doctor reports a composed capability whose prerequisite is absent, and fails the exit", async () => {
@@ -284,11 +318,39 @@ test("pithy doctor reports a composed capability whose prerequisite is absent, a
   expect(after.project.health.workers[0]?.prerequisites).toEqual({
     ok: false,
     missing: [
-      { capability: "auth", requires: "secrets" },
-      { capability: "auth", requires: "email" },
+      { capability: "auth", requires: "secrets", fix: "pithy add secrets --worker board" },
+      { capability: "auth", requires: "email", fix: "pithy add email --worker board --with-prerequisites" },
     ],
   });
   expect(after.project.health.ok).toBe(false);
   // The exit is the gate CI reads. A report nobody fails on is a report nobody notices.
   expect(sick.code).not.toBe(0);
 }, 300_000);
+
+/**
+ * **`pithy add --dry-run --json` over a config linked from outside the project (#697).** The real add writes
+ * through the adopter's link. The dry run crashed there with a raw `ENOTDIR` stack naming its temporary copy,
+ * exit 1 and no `--json` line. Spawned, because the stack and the missing line are what the adopter saw.
+ */
+test("pithy add --dry-run --json plans an edit through a config linked from outside the project", async () => {
+  const target = join(dir, "app");
+  const workerDir = await scaffoldLinked(target);
+  const shared = join(dir, "shared", "pithy.config.ts");
+  await mkdir(join(dir, "shared"));
+  await rename(join(workerDir, "pithy.config.ts"), shared);
+  await symlink(join("..", "..", "..", "shared", "pithy.config.ts"), join(workerDir, "pithy.config.ts"));
+  const original = await readFile(shared, "utf8");
+
+  const planned = await cli(["add", "audit", "--worker", "board", "--dry-run", "--json"], target);
+
+  expect(planned.code, planned.stderr).toBe(0);
+  expect(planned.stderr).not.toContain("pithy-plan-");
+  await expectConforms("add", planned.stdout);
+  const { plan } = JSON.parse(planned.stdout.trim()) as { plan: Plan };
+  expect(plan.files.find((file) => file.path === "apps/board/pithy.config.ts")?.action).toBe("edit");
+  expect(plan.notes).toContain(
+    "apps/board/pithy.config.ts is a link to a file outside the project. The edit lands in that file.",
+  );
+  expect(planned.stdout).not.toContain("pithy-plan-");
+  expect(await readFile(shared, "utf8")).toBe(original);
+}, 180_000);

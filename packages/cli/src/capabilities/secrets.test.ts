@@ -13,6 +13,7 @@ import { describe, expect, test } from "vitest";
 import { z } from "zod";
 import type { CliAuditEvent } from "../audit/cliAudit";
 import type { WorkerConfig } from "../project/config";
+import { fixOf } from "../terminal/exitClass";
 import { unresolvedLines } from "./secretApplicability";
 import {
   assertNotTheMasterKey,
@@ -413,6 +414,17 @@ describe("resolveSecretRegistry", () => {
 
   test("throws when the worker doesn't enable the secrets capability", () => {
     expect(() => resolveSecretRegistry({ capabilities: [] })).toThrow(NotFoundError);
+    const failure = (() => {
+      try {
+        resolveSecretRegistry({ capabilities: [] });
+      } catch (error) {
+        return error as NotFoundError;
+      }
+    })();
+    // One Worker's config cannot say which Worker `pithy add` should wire, so the command is the project's to
+    // name (`commands/secrets.test.ts`, #697), and this sentence names none rather than a placeholder (#711).
+    expect(failure?.payload.action).toBe("Add secrets({ registry }) to a Worker's pithy.config.ts capabilities.");
+    expect(fixOf(failure as NotFoundError)).toBeUndefined();
   });
 
   /**

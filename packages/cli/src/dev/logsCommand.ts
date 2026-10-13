@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
+import { pithyCommand } from "@pithy-sh/core/src/cli/command";
 import { ValidationError } from "@pithy-sh/core/src/error/pithyError";
 import { defineCommand } from "citty";
+import { z } from "zod";
+import { withContract } from "../contract/commandContract";
 import { currentBranch, defaultGit } from "../feature/worktree";
 import { loadProject, requireProjectName } from "../project/config";
 import { formatJsonStreamLine, formatList, withErrorReporting } from "../terminal/output";
@@ -10,6 +13,7 @@ import { dim } from "../terminal/style";
 import { devLogDir } from "./devLogPath";
 import type { DevLogEntry, DevLogListing } from "./devLogRead";
 import { followDevLogs, listDevLogs, parseSince, readDevLogs } from "./devLogRead";
+import { DevLogRecord } from "./devLogRecord";
 import { devLogPalette, devLogWorkerOrder, renderDevLog, renderDevLogLine } from "./devLogRender";
 
 /**
@@ -59,7 +63,7 @@ export function parseLines(value: string | undefined): number {
   if (!/^\d+$/.test(trimmed)) {
     throw new ValidationError({
       message: `${value} is not a line count.`,
-      action: "Pass a whole number: pithy dev logs --app api -n 50.",
+      action: "Pass a whole number to --lines (-n), such as 50.",
       issues: [{ path: ["--lines"], code: "invalid_value", message: "A non-negative whole number." }],
     });
   }
@@ -110,7 +114,7 @@ export async function runDevLogs(options: DevLogsOptions): Promise<void> {
       return;
     }
     if (found.length === 0) {
-      stdout(`No session logs yet. Run pithy dev.\n${dim(`  ${dir}`)}\n`);
+      stdout(`No session logs yet. Run ${pithyCommand("dev")}.\n${dim(`  ${dir}`)}\n`);
       return;
     }
     stdout(`${formatList(listingRows(found))}\n`);
@@ -226,35 +230,77 @@ export function collectLogAppFlags(rawArgs: readonly string[]): string[] {
   if (missingValue) {
     throw new ValidationError({
       message: "--app needs a worker name.",
-      action: "Run pithy dev logs to see every worker that has a log, then name one.",
+      action: `Run ${pithyCommand("dev logs")} to see every worker that has a log, then name one.`,
     });
   }
   return found;
 }
 
-export default defineCommand({
-  meta: { name: "logs", description: "Read a dev session back, by worker and by time" },
-  args: {
-    app: { type: "string", description: "Render this worker's session (repeatable). Omitted, lists what is readable" },
-    lines: { type: "string", alias: "n", description: `How many records to render. Default ${DEFAULT_LINES}` },
-    since: { type: "string", description: "Only records at or after this point — 30s, 5m, 2h, 1d, or an instant" },
-    follow: { type: "boolean", default: false, description: "Keep reading as the session writes. Ctrl-C ends it" },
-    timestamps: { type: "boolean", default: false, description: "Prefix each line with the record's instant" },
-    branch: { type: "string", description: "Read another branch's logs. Default: the checked-out branch" },
-    json: { type: "boolean", default: false, description: "Machine-readable output — one compact object per line" },
+/** `pithy dev logs --json`: what is readable, or the records themselves. `docs/commands/dev.md`. */
+const DevLogsPayload = z
+  .union([
+    z
+      .object({
+        command: z.literal("dev").describe('`"dev"`.'),
+        event: z.literal("logs").describe('`"logs"`: the listing, written when no `--app` was named.'),
+        logs: z
+          .array(
+            z
+              .object({
+                branch: z.string().describe("The branch segment of the filename — what `--branch` takes."),
+                worker: z.string().describe("The worker segment of the filename — what `--app` takes."),
+                lines: z.number().int().describe("How many records parsed out of the file."),
+                bytes: z.number().int().describe("The file's size on disk."),
+                lastWrite: z.string().describe("When the file was last written, ISO-8601."),
+              })
+              .describe("One readable session log."),
+          )
+          .describe("Every readable file, across every branch, sorted by filename."),
+      })
+      .describe("What is readable."),
+    DevLogRecord,
+  ])
+  .describe(
+    "One line of `pithy dev logs --json`: the listing, or one record as it sits in the file with `schemaVersion` added.",
+  );
+
+export default withContract(
+  defineCommand({
+    meta: { name: "logs", description: "Read a dev session back, by worker and by time" },
+    args: {
+      app: {
+        type: "string",
+        description: "Render this worker's session (repeatable). Omitted, lists what is readable",
+      },
+      lines: { type: "string", alias: "n", description: `How many records to render. Default ${DEFAULT_LINES}` },
+      since: { type: "string", description: "Only records at or after this point — 30s, 5m, 2h, 1d, or an instant" },
+      follow: { type: "boolean", default: false, description: "Keep reading as the session writes. Ctrl-C ends it" },
+      timestamps: { type: "boolean", default: false, description: "Prefix each line with the record's instant" },
+      branch: { type: "string", description: "Read another branch's logs. Default: the checked-out branch" },
+      json: { type: "boolean", default: false, description: "Machine-readable output — one compact object per line" },
+    },
+    run: ({ args, rawArgs }) =>
+      withErrorReporting(args.json, async () => {
+        const now = new Date();
+        await runDevLogs({
+          projectDir: process.cwd(),
+          apps: collectLogAppFlags(rawArgs),
+          lines: parseLines(args.lines),
+          ...(args.since ? { since: parseSince(args.since, now) } : {}),
+          follow: args.follow,
+          timestamps: args.timestamps,
+          branch: args.branch ?? null,
+          json: args.json,
+        });
+      }),
+  }),
+  {
+    output: "stream",
+    schemaVersion: 1,
+    payload: DevLogsPayload,
+    mutates: false,
+    idempotent: true,
+    needsNetwork: false,
+    flags: { app: { repeatable: true } },
   },
-  run: ({ args, rawArgs }) =>
-    withErrorReporting(args.json, async () => {
-      const now = new Date();
-      await runDevLogs({
-        projectDir: process.cwd(),
-        apps: collectLogAppFlags(rawArgs),
-        lines: parseLines(args.lines),
-        ...(args.since ? { since: parseSince(args.since, now) } : {}),
-        follow: args.follow,
-        timestamps: args.timestamps,
-        branch: args.branch ?? null,
-        json: args.json,
-      });
-    }),
-});
+);

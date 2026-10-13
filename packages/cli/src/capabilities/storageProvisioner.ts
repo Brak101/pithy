@@ -5,6 +5,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { CloudflareClients } from "@pithy-sh/cloudflare/src/client/clients";
 import type { R2Credentials } from "@pithy-sh/cloudflare/src/r2/r2Credentials";
+import { commandName } from "@pithy-sh/core/src/cli/command";
 import { InternalError, ValidationError } from "@pithy-sh/core/src/error/pithyError";
 import type { DeclaredEnvironments } from "@pithy-sh/core/src/naming/environment";
 import type { WorkflowHostTemplate } from "@pithy-sh/core/src/workflow/host";
@@ -67,7 +68,7 @@ export async function loadStorage(projectDir: string): Promise<StorageModule> {
     ]);
     return { ...provision, ...resolve, ...registry, ...capability, ...specs };
   } catch (error) {
-    throw capabilityLoadError("storage", "@pithy-sh/storage", error, projectDir);
+    throw await capabilityLoadError("storage", "@pithy-sh/storage", error, projectDir);
   }
 }
 
@@ -258,7 +259,7 @@ export class CloudflareStorageProvisioner implements StorageProvisioner {
         throw new InternalError(
           {
             message: `Could not write the storage R2 credentials to ${env}.`,
-            action: "Check that `pithy secrets provision` has run for this environment, then re-run.",
+            action: `Check that \`${commandName("secrets provision")}\` has run for this environment, then re-run.`,
             detail: `create failed: ${errorMessage(createError)}; update failed: ${errorMessage(updateError)}`,
           },
           { cause: createError },
@@ -338,7 +339,7 @@ async function storageWorkerDir(projectDir: string): Promise<string> {
   try {
     return dirname(kitSource(projectDir, "@pithy-sh/storage/src/workflows/worker"));
   } catch (error) {
-    throw capabilityLoadError("storage", "@pithy-sh/storage/src/workflows/worker", error, projectDir);
+    throw await capabilityLoadError("storage", "@pithy-sh/storage/src/workflows/worker", error, projectDir);
   }
 }
 

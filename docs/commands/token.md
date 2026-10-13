@@ -55,11 +55,13 @@ One line on stdout. A failure is one `{"error": …}` line on stderr and a non-z
 | key | type | meaning |
 |---|---|---|
 | `command` | string | `"token mint"` or `"token rotate"`. |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `profile` | string | The profile that was minted. |
 | `env` | string | The environment it was minted for. |
 | `tokenId` | string | Cloudflare's id for the token. An identifier, not a credential. |
 | `store` | string | Where the value went: `"secrets-store"`, `"dev-vars"`, or `"ephemeral"`. |
 | `location` | string | A human location for that store: the `tokens.json` path for `dev-vars`, `"CF Secrets Store"`, or `"(ephemeral — not written)"`. |
+| `status` | string | The token's lifecycle status: `"active"`, `"disabled"`, or `"expired"`. Absent when Cloudflare returned none. A mint over a dead token says so here. |
 
 The token's value and its composed Cloudflare name are both on the internal result and both deliberately absent here.
 
@@ -68,6 +70,7 @@ The token's value and its composed Cloudflare name are both on the internal resu
 | key | type | meaning |
 |---|---|---|
 | `command` | string | `"token list"`. |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `env` | string | The environment listed. |
 | `tokens` | object[] | This project's tokens for that environment. Empty when there are none. |
 | `tokens[].profile` | string | The profile, recovered by exact-name lookup. |
@@ -75,12 +78,14 @@ The token's value and its composed Cloudflare name are both on the internal resu
 | `tokens[].name` | string | The composed Cloudflare token name, `<project>-<env>-<profile>`. |
 | `tokens[].tokenId` | string | Cloudflare's id for the token. |
 | `tokens[].status` | string, optional | The token's lifecycle status as Cloudflare reports it: `"active"`, `"disabled"`, or `"expired"`. Absent when the account API returned none. |
+| `tokens[].routeScope` | string | Whether the token can attach the routes this environment's declared domains need: `"not-required"`, `"scoped"`, `"stale"`, `"overridden"`, `"inactive"`, or `"unknown"`. |
 
 ### `token revoke`
 
 | key | type | meaning |
 |---|---|---|
 | `command` | string | `"token revoke"`. |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `profile` | string | The profile that was revoked. |
 | `env` | string | The environment it was revoked for. |
 | `name` | string | The composed Cloudflare token name the sweep matched. |
@@ -88,13 +93,13 @@ The token's value and its composed Cloudflare name are both on the internal resu
 
 ## Errors
 
-- **`Cloudflare credentials are missing.`** Set `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` — the bootstrap token — or record them with `pithy init`.
+- **`Cloudflare credentials are missing.`** Set `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` — the bootstrap token — then run it again. No command records them inside a project: `pithy init` does only as it scaffolds a new one.
 - **`Unknown token permission key: <key>.`** The refusal lists every legal key.
 - **`Unknown token store: <value>.`** Legal values are `secrets-store`, `dev-vars`, `ephemeral`.
 - **`Unknown token profile: <name>.`** The refusal lists the profiles this project actually resolves — the aggregate of its composed capabilities' declarations and its config overrides.
 - **No storage is declared for the token.** The profile names no store and its secret is not in the registry. Declare the secret as `cf-secrets-store`, or mint with `--store dev-vars`.
 - **The secret is declared `d1`.** A token whose value is read outside the Worker cannot live in the encrypted D1 store. Same two fixes.
-- **`No CF Secrets Store is configured for the secrets-store store.`** Run `pithy add secrets` to record `SECRETS_STORE_ID`, or mint with `--store dev-vars`.
+- **`No CF Secrets Store is configured for the secrets-store store.`** Run `pithy add secrets --worker api` to record `SECRETS_STORE_ID`, naming the Worker that composes `secrets`, or mint with `--store dev-vars`. In a project with several Workers the action names one command per Worker — ``Run `pithy add secrets --worker api` or `pithy add secrets --worker web` to record …`` — because a bare `pithy add secrets` is refused there.
 - **No project name.** The root `pithy.config.ts` needs `name`. Every token name and Secrets Store entry starts with it, and `revoke` deletes every account token of the name it computes — a guess would point that sweep at another project's credentials.
 - **`--env` is validated at the flag.** `production` is answered with `prod`; anything over seven characters or outside the charset is refused before a single Cloudflare call.
 
@@ -118,10 +123,10 @@ pithy token revoke ci-system --env staging --json
 ```
 
 ```json
-{"command":"token mint","profile":"ci-system","env":"prod","tokenId":"<token-id>","store":"dev-vars","location":"/home/you/.config/pithy/acme/tokens.json"}
-{"command":"token list","env":"prod","tokens":[{"profile":"ci-system","env":"prod","name":"acme-prod-ci-system","tokenId":"<token-id>","status":"active"}]}
-{"command":"token rotate","profile":"secrets","env":"prod","tokenId":"<token-id>","store":"secrets-store","location":"CF Secrets Store"}
-{"command":"token revoke","profile":"ci-system","env":"staging","name":"acme-staging-ci-system","revoked":1}
+{"command":"token mint","schemaVersion":1,"profile":"ci-system","env":"prod","tokenId":"<token-id>","store":"dev-vars","location":"/home/you/.config/pithy/acme/tokens.json"}
+{"command":"token list","schemaVersion":1,"env":"prod","tokens":[{"profile":"ci-system","env":"prod","name":"acme-prod-ci-system","tokenId":"<token-id>","status":"active"}]}
+{"command":"token rotate","schemaVersion":1,"profile":"secrets","env":"prod","tokenId":"<token-id>","store":"secrets-store","location":"CF Secrets Store"}
+{"command":"token revoke","schemaVersion":1,"profile":"ci-system","env":"staging","name":"acme-staging-ci-system","revoked":1}
 ```
 
 Every value above that looks like an identifier is a placeholder. No payload on this page can carry a token value, whatever is substituted in.

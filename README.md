@@ -14,7 +14,7 @@ The logic lives in the packages and upgrades with them. The surface you own is t
 
 ## Quickstart
 
-You need [Node.js](https://nodejs.org) 22.18 or newer. No Cloudflare account until you deploy.
+You need [Node.js](https://nodejs.org) 22.18 or newer. If you run Pithy under [Bun](https://bun.sh), use 1.4 or later; on an older Bun, upgrade Bun to 1.4.2. No Cloudflare account until you deploy.
 
 ```sh
 bun add --global @pithy-sh/cli      # or: npm install --global @pithy-sh/cli
@@ -64,7 +64,7 @@ Two more pieces ride along with every project. The [control plane](https://pithy
 
 ## Built for agents too
 
-Every command takes full flags, never requires a prompt, and answers with `--json`, so you and your coding agent drive the same CLI. `pithy docs connect` points Claude Code, Cursor, VS Code and seven other clients at the Pithy documentation server. See [Pithy for agents](https://pithy.sh/docs/agents/).
+Every command but the deliberately manual `pithy remove` takes full flags, answers with `--json`, and never prompts when told not to. `pithy schema --json` describes each one, and a failure exits with a code that says what to do next. So you and your coding agent drive the same CLI. `pithy docs connect` points Claude Code, Cursor, VS Code and seven other clients at the Pithy documentation server. See [Pithy for agents](https://pithy.sh/docs/agents/).
 
 ## One project, or two?
 

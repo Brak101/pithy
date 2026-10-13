@@ -4,6 +4,7 @@
 import { describe, expect, test } from "vitest";
 import type { TurnstileSitekeysCheck } from "../doctor/turnstileSitekeys";
 import { doctorHarness } from "../test-utils/doctorHarness";
+import { dirOf } from "../test-utils/workerDir";
 import { buildDoctorReport, doctorExitCode, renderDoctorJson, renderDoctorText } from "./doctor";
 
 /**
@@ -18,17 +19,17 @@ const finding: TurnstileSitekeysCheck = {
   state: "findings",
   stranded: [
     {
-      worker: "board",
+      worker: dirOf("board"),
       name: "TURNSTILE_SITEKEY_VISIBLE",
       environment: "prod",
       file: "/p/apps/board/wrangler.jsonc",
-      removedBy: "board",
+      removedBy: dirOf("board"),
     },
   ],
   unrendered: [
-    { worker: "board", environment: "staging", slot: true },
-    { worker: "board", environment: "prod", slot: true },
-    { worker: "board", environment: "live", slot: false },
+    { worker: dirOf("board"), environment: "staging", slot: true },
+    { worker: dirOf("board"), environment: "prod", slot: true },
+    { worker: dirOf("board"), environment: "live", slot: false },
   ],
 };
 
@@ -62,8 +63,15 @@ describe("the Turnstile: block", () => {
       turnstileSitekeys: TurnstileSitekeysCheck & { detail: string[] };
     };
 
-    expect(payload.turnstileSitekeys.stranded).toEqual(finding.stranded);
-    expect(payload.turnstileSitekeys.unrendered).toEqual(finding.unrendered);
+    // Each with the command that clears it, or `null` where none does (#697).
+    expect(payload.turnstileSitekeys.stranded).toEqual([
+      { ...finding.stranded[0], fix: "pithy turnstile provision --worker board" },
+    ]);
+    expect(payload.turnstileSitekeys.unrendered).toEqual([
+      { ...finding.unrendered[0], fix: "pithy turnstile provision --worker board" },
+      { ...finding.unrendered[1], fix: "pithy turnstile provision --worker board" },
+      { ...finding.unrendered[2], fix: null },
+    ]);
     expect(payload.turnstileSitekeys.detail).toHaveLength(3);
   });
 });

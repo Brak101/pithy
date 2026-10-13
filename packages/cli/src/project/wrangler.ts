@@ -2,9 +2,16 @@
 // SPDX-License-Identifier: MIT
 
 import { spawn } from "node:child_process";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { stripVTControlCharacters } from "node:util";
-import { ConflictError, InternalError, NotFoundError } from "@pithy-sh/core/src/error/pithyError";
+import { pithyCommand } from "@pithy-sh/core/src/cli/command";
+import {
+  ConflictError,
+  InternalError,
+  NotFoundError,
+  PreconditionFailedError,
+} from "@pithy-sh/core/src/error/pithyError";
+import { FEATURE_ENVIRONMENT, LOCAL_ENVIRONMENT } from "@pithy-sh/core/src/naming/environment";
 import { parse } from "comment-json";
 import { cloudflareChildEnv, credentialedChildEnv } from "../cloudflare/childEnv";
 import type { CloudflareAccountSelection, CloudflareCredentials } from "../cloudflare/config";
@@ -51,12 +58,25 @@ export async function readOptionalWranglerConfig(projectDir: string): Promise<un
  * A directory with no `wrangler.jsonc` is a `PithyError` naming the file rather than node's own `ENOENT`
  * escaping into a command's output. Caller casts the shape.
  */
+/**
+ * **The environments a Worker provisions for**, as a line naming a per-environment command lists them (#711):
+ * local `dev` first, then each deployed stanza in its `wrangler.jsonc`. A feature's stanza is left out: a feature
+ * is provisioned with its branch, never by name.
+ */
+export async function workerEnvironments(workerDir: string): Promise<string[]> {
+  const config = (await readOptionalWranglerConfig(workerDir)) as { env?: Record<string, unknown> } | null;
+  const deployed = Object.keys(config?.env ?? {}).filter(
+    (env) => env !== FEATURE_ENVIRONMENT && env !== LOCAL_ENVIRONMENT,
+  );
+  return [LOCAL_ENVIRONMENT, ...deployed];
+}
+
 export async function readWranglerConfig(projectDir: string): Promise<unknown> {
   const config = await readOptionalWranglerConfig(projectDir);
   if (config === null) {
     throw new NotFoundError({
       message: `No wrangler.jsonc at ${join(projectDir, "wrangler.jsonc")}.`,
-      action: "Every worker lives in apps/<name> with its own wrangler.jsonc. Run pithy worker list to see them.",
+      action: `Every worker lives in apps/<name> with its own wrangler.jsonc. Run ${pithyCommand("worker list")} to see them.`,
     });
   }
   return config;
@@ -187,6 +207,40 @@ export function wranglerErrorBlock(output: string): string[] {
   return block;
 }
 
+/**
+ * **What wrangler says when Cloudflare will not take the credentials (#697).** Read off wrangler 4.125.0's own
+ * classification rather than guessed: `AUTHENTICATION_ERROR_CODES` is `[9106, 10000]`, printed as `[code: N]`
+ * under the failed request, and with no token and no way to log in it refuses before any request with the
+ * `non-interactive environment` sentence. Anything else wrangler prints is not this, whatever code it carries.
+ */
+const CREDENTIAL_REFUSAL = /\[code: (?:9106|10000)\]|In a non-interactive environment, it's necessary to set a /;
+
+/**
+ * A wrangler run Cloudflare refused for its credentials: `core/precondition_failed`, exit 3. The call was
+ * right and what it depends on is not, so retrying it unchanged fails the same way and so does any other
+ * call. No `fix`: a token is minted in the dashboard and an account id is an edit, which is what `pithy doctor`
+ * says about both. A class of its own so a batch can tell it from a per-Worker failure and stop on it.
+ */
+export class WranglerCredentialsError extends PreconditionFailedError {}
+
+/**
+ * wrangler could not be started at all: the program the project runs it with is not installed. A
+ * precondition, exit 3, like the credentials — and, like them, the same for every Worker a batch would spawn.
+ */
+export class WranglerNotRunnableError extends PreconditionFailedError {}
+
+/**
+ * Whether `error` refuses the whole run rather than one Worker: credentials Cloudflare will not take, or a
+ * wrangler that cannot start. A batch that recorded either as a row per Worker would report one missing
+ * precondition as that many failures.
+ */
+export function refusesTheRun(error: unknown): error is WranglerCredentialsError | WranglerNotRunnableError {
+  return error instanceof WranglerCredentialsError || error instanceof WranglerNotRunnableError;
+}
+
+/** The action line of {@link WranglerCredentialsError}. */
+const CREDENTIAL_ACTION = `Cloudflare refused the credentials. Run ${pithyCommand("doctor")} to see whether the token or the account is wrong.`;
+
 /** The child's environment, from whichever of the two things the caller holds. See {@link WranglerAccount}. */
 function wranglerChildEnv(account: WranglerAccount): Record<string, string> {
   if (account !== null && "apiToken" in account) return credentialedChildEnv(account);
@@ -216,9 +270,16 @@ export async function runWrangler(
   options: WranglerOptions,
 ): Promise<{ stdout: string; stderr: string }> {
   assertCreatesNoResources(args);
+  // **wrangler's own `--cwd`, ahead of the command (#709).** The spawn's `cwd` is where the runner starts, not
+  // where wrangler does: `npx` runs a binary from the nearest package root, so in an npm workspace, or a
+  // Worker directory with no lockfile under a package that has one, wrangler started in the package, found no
+  // `wrangler.jsonc`, and tried to autoconfigure it as a static site. `--cwd` is a global wrangler flag that
+  // `chdir`s before anything is read, so the Worker directory is wrangler's whatever the runner did. A `bin`
+  // stand-in is spawned directly, with no runner between, and is not wrangler, so it gets the argv as given.
+  const directory = resolve(options.cwd ?? process.cwd());
   const runner = options.bin
     ? { command: options.bin, args }
-    : execArgs(await detectPackageManager(options.cwd ?? process.cwd()), "wrangler", args);
+    : execArgs(await detectPackageManager(directory), "wrangler", ["--cwd", directory, ...args]);
   const command = runner.command;
   const commandArgs = runner.args;
   const label = options.bin ?? "wrangler";
@@ -247,7 +308,7 @@ export async function runWrangler(
       // installed perfectly well. It said "Is wrangler installed and on PATH?" while `bun` was what was
       // absent (#474), which sends an adopter to reinstall the one thing they already had.
       reject(
-        new InternalError({
+        new WranglerNotRunnableError({
           message: `Could not run ${label}.`,
           action:
             command === label
@@ -263,19 +324,24 @@ export async function runWrangler(
         resolve({ stdout, stderr });
         return;
       }
-      // Surface the captured output (the errors) even in quiet mode; in passthrough it already streamed.
-      const captured = options.passthrough ? "" : `\n${(stderr || stdout).trim()}`;
+      // Surface the captured output (the errors) even in quiet mode; in passthrough it already streamed. Without
+      // its color (#697): this is a `--json` payload's `detail` and a deploy row's `error`, and the encoder
+      // writes every value as it is, so the capture is the one place wrangler's paint is known to be noise.
+      const captured = options.passthrough ? "" : `\n${stripVTControlCharacters(stderr || stdout).trim()}`;
       // **wrangler's own reason goes under the failure line, not only into `detail`** (#645). `detail` never
       // reaches a terminal, so a deploy that could not bundle said `wrangler deploy failed.` and the line
       // naming the import it could not resolve was only in wrangler's log file.
       const block = options.passthrough ? [] : wranglerErrorBlock(`${stderr}\n${stdout}`);
       const failed = `${label} ${args[0] ?? ""} failed.`;
+      const message =
+        block.length > 0 ? [failed, ...block.map((line) => (line === "" ? "" : `  ${line}`))].join("\n") : failed;
+      const detail = `exit ${code}${captured}`;
+      // Classified only off what was captured: in passthrough the output went to the terminal, unread.
+      const refused = !options.passthrough && CREDENTIAL_REFUSAL.test(stripVTControlCharacters(`${stderr}\n${stdout}`));
       reject(
-        new InternalError({
-          message:
-            block.length > 0 ? [failed, ...block.map((line) => (line === "" ? "" : `  ${line}`))].join("\n") : failed,
-          detail: `exit ${code}${captured}`,
-        }),
+        refused
+          ? new WranglerCredentialsError({ message, action: CREDENTIAL_ACTION, detail })
+          : new InternalError({ message, detail }),
       );
     });
   });

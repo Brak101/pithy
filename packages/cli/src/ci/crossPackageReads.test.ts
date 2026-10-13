@@ -49,12 +49,14 @@ async function filtersFor(changed: readonly string[]): Promise<string[]> {
 const RECORD: Record<string, string> = {
   ".": "The repo root. `project/atomic.test.ts`'s rename and recursive-delete tripwires walk every source file in the tree, and the docs tests hold `README.md` and `docs/` to the CLI's real output.",
   "docs/CLI.md": "`terminal/styleDocs.test.ts` holds the documented styles to the ones the terminal module exports.",
+  "docs/commands/testers.md":
+    "`commands/testers.test.ts` runs the testers refusals and notes the page quotes, and finds each on the page (#711): a quoted line that kept its old form named a roster read with no `--env`, which reads `dev`'s whatever environment the reader was on.",
   "docs/FIXTURES.md":
     "`@pithy-sh/cloudflare`'s `test-utils/fixtures.test.ts` holds every live fixture to the section its skip message cites. A skip line naming a document nobody wrote is worse than no line at all, so the citation is a gate rather than a convention — and it only means anything if editing the document re-runs it (#106).",
   "node_modules/.bin/biome":
     "The workspace's Biome, run as a subprocess. `project/jsonc.test.ts` and `ui/formatting.test.ts` assert that a config Pithy writes is one the formatter the kit scaffolds would print unchanged (#249), and the only honest way to answer that is to ask the formatter.",
   "packages/core/src/error/cause.ts":
-    "`project/config.test.ts` asserts core's record of how Bun reports a build failure — that it wraps two or more diagnostics in an `AggregateError`, and re-throws it emptied on every import after the first (#223). The assertion belongs beside the classifier that depends on it, and the fact belongs in core, so the read crosses.",
+    "`project/config.test.ts` asserts core's record of how Bun reports a build failure — that it wraps two or more diagnostics in an `AggregateError` (#223), and that a second import of the same broken file gets every one of them back (#709). The assertion belongs beside the classifier that depends on it, and the fact belongs in core, so the read crosses.",
   "packages/core/src/naming/provisionScope.ts":
     "`ci/selfAdministration.test.ts` reads the scope factories core declares, so that the gate on the self service binding covers **every** scope a provisioning run can happen in rather than the two somebody thought of (#616). The rule it holds is per scope — each generated stanza binds `SELF` to the script that scope composes — and a third scope landing in core with nothing exercising it is exactly the hole the gate exists to refuse, so adding one has to re-run the CLI's suite.",
   packages:

@@ -2,10 +2,14 @@
 // SPDX-License-Identifier: MIT
 
 import { join } from "node:path";
-import { InternalError, ValidationError } from "@pithy-sh/core/src/error/pithyError";
+import { commandName, type Remedy } from "@pithy-sh/core/src/cli/command";
+import { InternalError, PreconditionFailedError, ValidationError } from "@pithy-sh/core/src/error/pithyError";
 import type { DeclaredEnvironments } from "@pithy-sh/core/src/naming/environment";
 import { type ManagedEnvironment, managedEnvironments } from "@pithy-sh/secrets/src/scope";
-import { formatList } from "../terminal/output";
+import { z } from "zod";
+import { provisionRemedy, withProvisionFix } from "../provision/provisionFix";
+import { EXIT } from "../terminal/exitClass";
+import { formatJsonLine, formatList } from "../terminal/output";
 import type { AddressStanza } from "./workerAddress";
 import { readWranglerConfig } from "./wrangler";
 
@@ -68,14 +72,14 @@ export interface ReadyStanza {
 }
 
 /** One environment that was skipped, with the two sentences an operator needs. */
-export interface SkippedEnvironment {
-  /** The environment nothing was provisioned for. */
-  env: ManagedEnvironment;
-  /** Why it was skipped, as a sentence. */
-  reason: string;
-  /** The command that resolves it, as a sentence. */
-  action: string;
-}
+export const SkippedEnvironment = z
+  .object({
+    env: z.string().describe("The environment nothing was provisioned for."),
+    reason: z.string().describe("Why it was skipped, as a sentence: `env.<name> has no DB database_id.`"),
+    action: z.string().describe("The command that resolves it, as a sentence. The command runs as written."),
+  })
+  .describe("One environment a provisioning run created nothing for, and why.");
+export type SkippedEnvironment = Omit<z.infer<typeof SkippedEnvironment>, "env"> & { env: ManagedEnvironment };
 
 /** The partition of a project's declared environments into what can be provisioned and what cannot. */
 export interface EnvironmentReadiness {
@@ -89,6 +93,8 @@ export interface EnvironmentReadiness {
   skipped: SkippedEnvironment[];
   /** The resolved stanza per ready environment — read once here rather than again per phase. */
   stanzas: ReadonlyMap<ManagedEnvironment, ReadyStanza>;
+  /** The project's `seed.productionEnvironments`, which decides whether a refusal can name a `fix`. */
+  productionEnvironments?: readonly string[];
 }
 
 /**
@@ -120,6 +126,8 @@ export async function environmentReadiness(options: {
   label: string;
   /** The project's declaration from the root `pithy.config.ts`, in order. */
   environments: DeclaredEnvironments | readonly string[];
+  /** The project's `seed.productionEnvironments`, carried for {@link requireReadyEnvironments}. */
+  productionEnvironments?: readonly string[] | undefined;
 }): Promise<EnvironmentReadiness> {
   const path = join(options.workerDir, "wrangler.jsonc");
   const config = (await readWranglerConfig(options.workerDir)) as WranglerConfig;
@@ -140,7 +148,9 @@ export async function environmentReadiness(options: {
       skipped.push({
         env,
         reason: `env.${env} has no DB database_id.`,
-        action: `Run pithy provision --env ${env}.`,
+        // The command the refusal below carries as its `fix`, from the same builder (#711): without `--yes`
+        // it was refused, and an agent reading the skip had nothing else to go on.
+        action: provisionRemedy(env, options.productionEnvironments).say((provision) => `Run ${provision}.`),
       });
       continue;
     }
@@ -148,7 +158,14 @@ export async function environmentReadiness(options: {
     stanzas.set(env, { appDatabaseId: id, stanza });
   }
 
-  return { path, declared: managedEnvironments(options.environments), ready, skipped, stanzas };
+  return {
+    path,
+    declared: managedEnvironments(options.environments),
+    ready,
+    skipped,
+    stanzas,
+    ...(options.productionEnvironments ? { productionEnvironments: options.productionEnvironments } : {}),
+  };
 }
 
 /**
@@ -171,6 +188,7 @@ export function narrowReadiness(
     ready,
     skipped: readiness.skipped.filter((entry) => wanted.has(entry.env)),
     stanzas: new Map(ready.map((env) => [env, readyStanza(readiness, env)])),
+    ...(readiness.productionEnvironments ? { productionEnvironments: readiness.productionEnvironments } : {}),
   };
 }
 
@@ -227,21 +245,95 @@ export function formatEnvironmentOutcomes(rows: readonly { env: string; outcome:
 }
 
 /**
+ * The caller's run again, after the provisions: a command to run, or — a production run of a command that makes it
+ * one, `pithy testers provision --env prod` — a person's decision, said as one (#711).
+ */
+function runAgain(rerun: Remedy, opening: string): string {
+  const lead = opening.endsWith(", then") ? opening : `${opening},`;
+  return rerun.fix === undefined
+    ? `${lead} this run is next: ${rerun.say((line) => line)}`
+    : rerun.say((line) => `${lead} run ${line} again.`);
+}
+
+/**
+ * **The provisions every skipped environment needs, then the caller's run again (#711).** Every environment the
+ * fault applies to is named: the ones an agent can provision as one `Run …`, and each production one as the person's
+ * decision it is, in its own sentence.
+ */
+function afterProvisions(remedies: readonly Remedy[], rerun: Remedy): string {
+  const runnable = remedies.flatMap((one) => (one.fix === undefined ? [] : [one.fix]));
+  const decided = remedies.filter((one) => one.fix === undefined).map((one) => one.say((command) => command));
+  const run = `Run ${runnable.join(" and ")} to create ${runnable.length > 1 ? "their app databases" : "its app database"}`;
+  if (decided.length === 0) return runAgain(rerun, `${run}, then`);
+  const opening = remedies.length > 1 ? "Once their app databases exist" : "Once its app database exists";
+  return [...(runnable.length === 0 ? [] : [`${run}.`]), ...decided, runAgain(rerun, opening)].join(" ");
+}
+
+/**
  * Refuse a run in which **every** environment was skipped.
  *
  * Nothing was provisioned, and reporting success for a run that did nothing is the failure mode
  * skip-and-report would otherwise introduce — the operator would read `Done.` and believe production has a
- * worker. Exit 1, naming which environments were skipped, why, and the command that resolves the first of
- * them. Call it **after** the report is written, so `--json` still carries the per-environment structure on
- * stdout beside the `{"error":…}` line on stderr.
+ * worker. `core/precondition_failed`, exit 3, naming which environments were skipped, why, and the provision each
+ * needs (#711). Its `fix` is the one provision an agent can run, when there is exactly one: with several, no one
+ * command resolves the fault, and the action names each.
+ *
+ * `rerun` is the caller's own run, to repeat once that is done, rebuilt from its arguments with its Worker named
+ * ({@link rerunRemedy}) — a person's decision when a production `--env` makes it one.
  */
-export function requireReadyEnvironments(readiness: EnvironmentReadiness, command: string): void {
+export function requireReadyEnvironments(
+  readiness: EnvironmentReadiness,
+  rerun: Remedy,
+  did: readonly string[] = [],
+): void {
   if (readiness.ready.length > 0) return;
   const names = readiness.skipped.map((entry) => entry.env);
-  const first = names[0];
-  throw new ValidationError({
-    message: `No environment is ready — ${names.join(" and ")} ${names.length === 1 ? "has" : "have"} no DB database_id.`,
-    action: `Run pithy provision --env ${first} to create its app database, then run ${command} again.`,
+  const remedies = names.map((env) => provisionRemedy(env, readiness.productionEnvironments));
+  const refusal = new PreconditionFailedError({
+    message: [
+      `No environment is ready — ${names.join(" and ")} ${names.length === 1 ? "has" : "have"} no DB database_id.`,
+      ...did,
+    ].join(" "),
+    action:
+      names.length === 0
+        ? runAgain(rerun, `Declare an environment, provision it with ${commandName("provision")}, then`)
+        : afterProvisions(remedies, rerun),
     detail: `${readiness.path}: no DB database_id for ${names.join(", ")}`,
   });
+  // Nothing ready and nothing skipped is a project that declared no environment: there is none to provision.
+  const runnable = names.filter((_env, at) => remedies[at]?.fix !== undefined);
+  const only = runnable.length === 1 ? runnable[0] : undefined;
+  throw only === undefined ? refusal : withProvisionFix(refusal, only, readiness.productionEnvironments);
+}
+
+/**
+ * The `exitCode` every capability `provision --json` report carries (#711). A report is written only by a run
+ * that went ahead, so the one status it names is 0: a run that provisioned nothing writes no report, only its
+ * error line. An integer, as `secrets verify` publishes its own.
+ */
+export const ProvisionReportExitCode = z
+  .number()
+  .int()
+  .describe("The status this run exits with: 0. A run that provisions nothing writes no report, only its error line.");
+
+/**
+ * **One outcome for a capability `provision --json` run (#711).** Every environment skipped is refused by
+ * {@link requireReadyEnvironments} before a byte reaches stdout, so the error line, with its exit and `fix`,
+ * is the whole answer. Otherwise the report is the whole answer, written alone, and its `exitCode` is what the
+ * process exits with. None of these commands is one whose report is the answer to a failure (`AGENTS.md`,
+ * `docs/CLI.md` §3.8), so a report beside an error line would be two answers to one run.
+ *
+ * `rerun` is the caller's own run again, its Worker named ({@link rerunRemedy}), for the refusal's sentence.
+ *
+ * The report comes first, as an object literal at the call, so `commands/doctorDocs.test.ts` reads its keys
+ * the way it reads a `formatJsonLine({ … })` and holds each page to them.
+ */
+export function writeProvisionReport(
+  report: Record<string, unknown> & { command: string },
+  readiness: EnvironmentReadiness,
+  rerun: Remedy,
+  did: readonly string[] = [],
+): void {
+  requireReadyEnvironments(readiness, rerun, did);
+  process.stdout.write(`${formatJsonLine({ ...report, exitCode: EXIT.ok })}\n`);
 }

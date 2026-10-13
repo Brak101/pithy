@@ -5,19 +5,33 @@ import { readFileSync } from "node:fs";
 import { readdir, readFile, realpath } from "node:fs/promises";
 import { platform as osPlatform, release as osRelease } from "node:os";
 import { isAbsolute, join, relative, resolve as resolvePath, sep } from "node:path";
+import { cliAtVersion, commandName, commandNameOf, pithyCommand, type WorkerDir } from "@pithy-sh/core/src/cli/command";
 import { PithyError, ValidationError } from "@pithy-sh/core/src/error/pithyError";
 import { LOCAL_ENVIRONMENT } from "@pithy-sh/core/src/naming/environment";
 import { defineCommand } from "citty";
+import { z } from "zod";
+import { addAction } from "../capabilities/addCommand";
+import { providerExample } from "../capabilities/entitlementGap";
+import { ManifestFault } from "../capabilities/manifests";
+import { MissingPrerequisite } from "../capabilities/prerequisites";
+import {
+  capabilityProvisionRemedies,
+  capabilityProvisionRemedy,
+  remediesSentence,
+} from "../capabilities/provisionCommand";
 import {
   type BindingDeclines,
   type BuildReconcilePlanOptions,
   buildReconcilePlan,
+  EntitlementGap,
+  GeneratedValueDrift,
   type GeneratedValues,
   type ReconcilePlan,
   undeclinableReason,
 } from "../capabilities/reconcile";
 import { projectSecretApplicability, type SecretApplicability } from "../capabilities/secretApplicability";
 import { pithyOffline } from "../cloudflare/config";
+import { withContract } from "../contract/commandContract";
 import { type BindingScopeHealth, repointableIds, type SplitGlobalBinding } from "../doctor/bindingScope";
 import type { CapabilityReachHealth } from "../doctor/capabilityReach";
 import { type CloudflareAccess, checkCloudflareAccess, describeCloudflareAccess } from "../doctor/cloudflare";
@@ -46,11 +60,24 @@ import {
 } from "../doctor/environmentInheritance";
 import type { EnvironmentMigrations, RemoteSkip } from "../doctor/environmentMigrations";
 import { checkEnvironments, describeEnvironmentDrift, type EnvironmentsCheck } from "../doctor/environments";
+import { DoctorFailures, doctorFailures } from "../doctor/failures";
 import {
   checkFeatureRatelimitIds,
   FEATURE_RATELIMIT_IDS_ACTION,
   type FeatureRatelimitIdsCheck,
 } from "../doctor/featureRatelimitIds";
+import {
+  capabilityReachPlan,
+  DoctorFix,
+  docsConnectFix,
+  EMPTY_DEV_VARS_FIX,
+  healthWithFixes,
+  prerequisitePlan,
+  secretBindingFix,
+  strandedTurnstileFix,
+  unrenderedTurnstileFix,
+  upgradeFix,
+} from "../doctor/findingFixes";
 import {
   buildProjectHealth,
   type MigrationHealth,
@@ -81,6 +108,7 @@ import {
   describeSupportSearchTriggers,
   type SupportSearchTriggersCheck,
   type SupportSearchTriggersOptions,
+  supportSearchFix,
 } from "../doctor/supportSearchTriggers";
 import {
   type ComposeWorkerFor,
@@ -113,12 +141,13 @@ import { readRcFile } from "../platform/rc";
 import { detectShell, type ShellInfo } from "../platform/shell";
 import { resolveWorkersFor } from "../project/composeFor";
 import { loadProject, loadProjectEnvironments, type ProjectConfig, projectCloudflareAccount } from "../project/config";
-import { checkOrigins, describeOriginDrift, type OriginsCheck } from "../project/domains";
+import { checkOrigins, describeOriginDrift, type OriginsCheck, originDriftFix } from "../project/domains";
 import { checkExtensions, describeExtension, type ExtensionsCheck } from "../project/extensions";
 import { alreadyProvided, detectPackageManager } from "../project/packageManager";
 import type { ResolvedWorker } from "../project/workerScope";
-import { checkWorkflows, describeWorkflowDrift, type WorkflowsCheck } from "../project/workflows";
+import { checkWorkflows, describeWorkflowDrift, type WorkflowsCheck, workflowDriftFix } from "../project/workflows";
 import { describeUnrepeatedKey } from "../project/wranglerInheritance";
+import { provisionFixCommand, provisionRemedy } from "../provision/provisionFix";
 import { formatJsonLine, withErrorReporting } from "../terminal/output";
 
 /**
@@ -136,7 +165,7 @@ import { formatJsonLine, withErrorReporting } from "../terminal/output";
  */
 
 /** The alias-block marker `pithy alias` writes — reused here to detect an installed `p.` shortcut. */
-const ALIAS_MARKER = "# >>> pithy alias >>>";
+const ALIAS_MARKER = `# >>> ${commandName("alias")} >>>`;
 
 /**
  * Whether the `p.` alias is installed — **three states, because a boolean cannot say "I could not tell"**
@@ -258,6 +287,11 @@ export interface DoctorReport {
   project: ProjectStatus | null;
   /** Set when a `pithy.config.ts` is present but could not be loaded (e.g. dependencies not installed). */
   projectLoadError: string | null;
+  /**
+   * The project's `seed.productionEnvironments`, empty outside a project or when it names none. Read for one
+   * fact: whether a failing check's provisioning `fix` would stop at a person's `--confirm` phrase (#697).
+   */
+  productionEnvironments: readonly string[];
   /** Whether the configured Cloudflare credentials actually reach the account. */
   cloudflare: CloudflareAccess;
   /**
@@ -1075,6 +1109,8 @@ export async function buildDoctorReport(options: DoctorReportOptions): Promise<D
   // as "no composed capability declares a check". A project whose `pithy.config.ts` would not import
   // would read as one with no settings questions.
   let workersResolved = false;
+  // The production policy, for the one question a failing check's `fix` asks of it. See `DoctorReport`.
+  let productionEnvironments: readonly string[] = [];
   const load = options.loadProject ?? loadProject;
   const resolve = options.resolveWorkersFor ?? resolveWorkersFor;
   // Set the moment the root config loads, so a `core/not_found` raised *later* (no workers under apps/)
@@ -1086,6 +1122,7 @@ export async function buildDoctorReport(options: DoctorReportOptions): Promise<D
     // The deployed environments the migration check answers, beside `dev`. A declaration that will not
     // parse answers none of them rather than a default the project did not write: `Environments:` reports
     // the declaration, and a count under a name nobody declared is the #586 defect in another spelling.
+    productionEnvironments = rootConfig.seed?.productionEnvironments ?? [];
     let declared: readonly string[];
     try {
       declared = loadProjectEnvironments(rootConfig);
@@ -1266,6 +1303,7 @@ export async function buildDoctorReport(options: DoctorReportOptions): Promise<D
     ? await probed<DocsMcpCheck>(() => probeDocsMcp(options.projectDir), {
         state: "could-not-check",
         findings: [],
+        clients: [],
       })
     : null;
   // And once more, one level out: the declaration is project-wide, so with no readable config there is
@@ -1436,6 +1474,7 @@ export async function buildDoctorReport(options: DoctorReportOptions): Promise<D
     notifierDisabledBy,
     project,
     projectLoadError,
+    productionEnvironments,
     cloudflare,
     projectName,
     workerNames,
@@ -1467,106 +1506,14 @@ export async function buildDoctorReport(options: DoctorReportOptions): Promise<D
   };
 }
 
-/** Non-zero exit when a health check fails or the project could not load (the CI gate). Toolchain state never fails it. */
+/**
+ * Non-zero exit when a check fails or the project could not load (the CI gate). Toolchain state never fails
+ * it. **The gate is {@link doctorFailures}** (#697): every failing check is one entry there, with the reason
+ * it gates beside its branch and the command that rights it as `fix`, so the exit and the list `--json`
+ * reports cannot disagree.
+ */
 export function doctorExitCode(report: DoctorReport): number {
-  if (report.projectLoadError) return 1;
-  // Configured-but-broken credentials are drift worth gating CI on. Absent ones are not: a project that has
-  // not been provisioned yet is a legitimate state, and failing it would make `doctor` useless before setup.
-  // `not_checked` is the same standard once more and the clearest case of it — the check did not run, so it
-  // established nothing, and a caller who asked for no network did not ask for a red exit (#218).
-  const cloudflare = report.cloudflare.state;
-  // `probe_failed` joins them on the same standard (#371): the probe threw, so it established nothing —
-  // and a credentials file that will not parse is not a credential this project has been shown to lack.
-  if (
-    cloudflare !== "ok" &&
-    cloudflare !== "unconfigured" &&
-    cloudflare !== "not_checked" &&
-    cloudflare !== "probe_failed"
-  ) {
-    return 1;
-  }
-  // Listed positively, never as "anything but ok": only a fault this project's own config or wiring
-  // positively establishes may gate CI. `unconfigured` (no name yet) and `could-not-check` (the wiring
-  // would not read) establish nothing, and failing on either would break every run in an unprovisioned
-  // project. `invalid` meets the same standard the other two do — the name is set, and no Cloudflare
-  // namespace can carry it, which is why every other command already hard-fails on it.
-  //
-  // `drifted` and `orphaned` now meet it too, which they did not always: `drifted` used to fire on any one
-  // declared name that merely had Pithy's shape, so an adopter's pre-existing `myapp-prod-db` — the ordinary
-  // Cloudflare convention — turned a green CI red on the adoption path. Both are evidence-backed now.
-  // `drifted` is a wholesale contradiction between this repo's own config and its own wiring, checkable
-  // from files alone; `orphaned` is Pithy's own `pithy_migrations_owner` stamp naming another project. A
-  // name that only *looks* like ours establishes nothing and no longer reaches either.
-  //
-  // A `null` check is the same standard once more: no readable config means nothing was established about
-  // any name, and `doctor` outside a project — to read the CLI version, the shell, the alias — must exit 0.
-  const state = report.projectName?.state;
-  if (state === "invalid" || state === "drifted" || state === "orphaned") return 1;
-  // Same standard once more, and it is met from local files alone: a Worker's directory and its own
-  // wrangler.jsonc contradict each other about which Worker this is, or a stanza names a script a
-  // capability's own host Worker already deploys under (#580) — `drifted` covers both. Nothing is
-  // inferred about the account, and `could-not-check` establishes nothing, so only `drifted` gates.
-  // The convention note this check also carries is deliberately not here: a Worker's name is the
-  // adopter's, so being on wrangler's suffix is a report line, never a reason to exit 1.
-  if (report.workerNames?.state === "drifted") return 1;
-  // The same standard, met the same way, and there is no day-one state to spare here either: a project
-  // that declares nothing has nothing to report, and one that declares self-administration while a stanza
-  // it deploys from binds no SELF is a contradiction between its own two files. The consequence is the
-  // reason it gates — a 522 at runtime, which reads as somebody else's outage — and the remedy is the
-  // `pithy provision` that was going to be run anyway. `could-not-check` establishes nothing.
-  if (report.selfBinding?.state === "unbound") return 1;
-  // A namespace in the feature range is one `provision` and `deploy` refuse, established by the files (#643).
-  if (report.featureRatelimitIds?.state === "reserved") return 1;
-  // Same standard again, and met the same way: the root config and a Worker's own wrangler.jsonc
-  // contradict each other about which environments this project has. Nothing about the account is
-  // inferred — an orphan is established by ids the checkout already commits — and `could-not-check`
-  // establishes nothing, so only `drifted` gates.
-  if (report.environments?.state === "drifted") return 1;
-  // And the same standard applied to the same declaration one level deeper (#548): a Worker's
-  // `pithy.config.ts` throws when it is composed for a declared environment. Established from the
-  // checkout's own files, with no account reached and nothing inferred — and there is no day-one state
-  // here to spare, because a freshly scaffolded project composes in every environment it declares. Every
-  // command that composes that environment fails the same way, so a green CI over it would be the lie.
-  if ((report.environmentConfigs?.unresolved.length ?? 0) > 0) return 1;
-  // The same standard, and two of the three origin faults meet it. `workers-dev-open` is a Worker serving
-  // a live origin its own config does not name, established from that config alone — and it is the
-  // security half: on that origin the CSRF gate refuses the requests that establish who you are, and
-  // nothing bound to the hostname applies. `unserved-origin` is the mirror image and the harder failure:
-  // the config names an origin and nothing in it serves that host, so the Worker answers nowhere — which
-  // is the state this command's own `workers_dev` remedy used to produce, then report as healthy (#264).
-  // Both are established from the project's own files. `no-origin` is the state every freshly scaffolded
-  // project is in before it has a domain, which is legitimate and universal; failing it would turn
-  // `pithy doctor` red on day one for everyone and teach them to stop reading it. It is reported, loudly,
-  // and `pithy deploy` is what refuses it — the moment it stops being hypothetical.
-  if (report.origins?.drift.some((drift) => drift.fault !== "no-origin")) return 1;
-  // The same standard, and **both** faults meet it — there is no day-one state here to spare. A project
-  // that declares no Workflows has no drift to report; one that declares them and has not synced is a
-  // contradiction between its own two files, checkable offline, and the only fault in this report whose
-  // consequence is nothing happening at all: the cron never fires and nothing anywhere says so (#267).
-  // An unwritable declaration is the same standard once more — the declaration itself is what no command
-  // can act on. `could-not-check` establishes nothing and carries no drift, so it never reaches here.
-  if (report.workflows && report.workflows.drift.length > 0) return 1;
-  // The same standard, met the way `Settings:` meets it rather than the way the file checks do (#678): the
-  // fault is established by a **database that answered**, so it is the finding that gates and never the
-  // state. A provisioned `pithy_support_search` with no triggers is the only fault in this report whose
-  // symptom is that search silently under-returns — every message stored, none indexed, nothing logged —
-  // and the remedy is the `pithy support provision` an upgrade was going to run anyway. A read that was
-  // skipped or threw contributes no drift, so an offline run cannot fail here.
-  if (report.supportSearchTriggers?.state === "findings") return 1;
-  // And once more, on a file rather than a config. A `dev.json` that will not parse or names no user is a
-  // fault this machine's own disk establishes: the file is there, and nothing will ever read anything out of
-  // it. `absent` is the documented default — no file, no session, magic links only — so it never gates, and
-  // CI (which has no `dev.json` at all) is therefore never touched by this check. The audience is the
-  // developer whose dev login stopped working, which is the audience the whole check exists for.
-  const preferences = report.devPreferences?.state;
-  if (preferences === "unparseable" || preferences === "no-user") return 1;
-  // The same standard as everything above it, and **both tiers meet it** (#411). A local finding is
-  // established from the project's own config through the capability's own schema. An account finding is
-  // established from an account that answered — which is exactly why the list is what gates and the
-  // tier's state is not: an account nobody reached contributes no findings, so a run that skipped it
-  // cannot fail here. `could-not-check` and `unchecked` establish nothing and never reach this line.
-  if (report.settings && report.settings.findings.length > 0) return 1;
-  return report.project && !report.project.health.ok ? 1 : 0;
+  return doctorFailures(report).length > 0 ? 1 : 0;
 }
 
 /** Abbreviate a home-relative path to `~/…` for display. */
@@ -1601,7 +1548,11 @@ function portsRegistryRows(check: PortsRegistryCheck, home: string): string[] {
   const width = Math.max(0, ...check.entries.map((entry) => range(entry).length));
   return check.entries.map((entry) => {
     const held = entry.own ? entry.branch : `${tildify(entry.root, home)} — ${entry.branch}`;
-    const note = !entry.onDisk ? "  ← not on disk" : entry.orphaned ? "  ← no worktree; pithy feature prune" : "";
+    const note = !entry.onDisk
+      ? "  ← not on disk"
+      : entry.orphaned
+        ? `  ← no worktree; ${pithyCommand("feature prune")}`
+        : "";
     return `${range(entry).padEnd(width)}  ${held}${note}`;
   });
 }
@@ -1620,9 +1571,9 @@ function aliasLine(alias: AliasStatus, terse: boolean, home: string): string {
     case "installed":
       return terse ? "Alias: installed" : "Alias: installed (`p.` → `pithy`)";
     case "not-installed":
-      return terse ? "Alias: not installed" : "Alias: not installed (run `pithy alias`)";
+      return terse ? "Alias: not installed" : `Alias: not installed (run \`${pithyCommand("alias")}\`)`;
     case "unknown":
-      return `Alias: unknown — can't read ${tildify(alias.rcPath ?? "your shell config", home)}. Fix that first; \`pithy alias\` reads the same file.`;
+      return `Alias: unknown — can't read ${tildify(alias.rcPath ?? "your shell config", home)}. Fix that first; \`${commandName("alias")}\` reads the same file.`;
   }
 }
 
@@ -1656,14 +1607,22 @@ interface MigrationSentence {
  * unread databases are named — the only actionable fact — and nothing derived from what the read threw
  * appears, because a D1 failure's own words name an id or a query.
  */
-function environmentMigrationLines(entry: EnvironmentMigrations): MigrationSentence[] {
+function environmentMigrationLines(
+  entry: EnvironmentMigrations,
+  productionEnvironments: readonly string[],
+): MigrationSentence[] {
   const env = entry.env;
   switch (entry.state) {
     case "not-composed":
       return [{ first: `${env}: couldn't be checked — pithy.config.ts does not compose for ${env}`, cont: [] }];
     case "not-provisioned": {
       const named = entry.unprovisioned.map((target) => `${target.binding} (${target.database})`).join(", ");
-      return [{ first: `${env}: ${named} not provisioned — run: pithy provision --env ${env}`, cont: [] }];
+      return [
+        {
+          first: `${env}: ${named} not provisioned — ${provisionRemedy(env, productionEnvironments).say((command) => `run: ${command}`)}`,
+          cont: [],
+        },
+      ];
     }
     case "skipped":
       return [
@@ -1693,7 +1652,10 @@ function environmentMigrationLines(entry: EnvironmentMigrations): MigrationSente
   const counted = ledger.state === "read" ? ledger : ledger.counted;
   const sentences: MigrationSentence[] = [];
   if (counted.pending > 0) {
-    sentences.push({ first: `${env}: ${counted.pending} pending — run: pithy migrate --env ${env}`, cont: [] });
+    sentences.push({
+      first: `${env}: ${counted.pending} pending — run: ${pithyCommand("migrate", { flags: { "--env": env } })}`,
+      cont: [],
+    });
   }
   // The other direction, and the one nothing reported until #282. It is not "N pending" with a
   // different number: nothing is pending, migrate refuses outright, and the remedy is neither `pithy
@@ -1733,10 +1695,10 @@ function hasMigrationNotes(worker: WorkerChecks): boolean {
  * label sits on the first line only; every other environment aligns beneath it, and a sentence's
  * continuation sits two columns further in.
  */
-function migrationLines(health: MigrationHealth): string[] {
+function migrationLines(health: MigrationHealth, productionEnvironments: readonly string[]): string[] {
   const lines: string[] = [];
   for (const entry of health.environments) {
-    for (const sentence of environmentMigrationLines(entry)) {
+    for (const sentence of environmentMigrationLines(entry, productionEnvironments)) {
       lines.push(healthLine(lines.length === 0 ? "migrations" : "", sentence.first));
       // Two further columns in, so a continuation reads as its environment's and not as the next one's.
       for (const text of sentence.cont) lines.push(`${HEALTH_CONT}  ${text}`);
@@ -1834,7 +1796,13 @@ function generatedValueLines(values: GeneratedValues): string[] {
   return lines;
 }
 
-function declineLines(declines: BindingDeclines): string[] {
+/** `envs` is every environment the Worker has, `dev` first — what a decline, which is about all of them, names. */
+function declineLines(
+  declines: BindingDeclines,
+  worker: WorkerDir,
+  envs: readonly string[],
+  productionEnvironments: readonly string[],
+): string[] {
   if (declines.state === "invalid") {
     return ["`declinedBindings` in pithy.config.ts cannot be read", `${HEALTH_CONT}${declines.problem}`];
   }
@@ -1863,7 +1831,7 @@ function declineLines(declines: BindingDeclines): string[] {
           `${HEALTH_CONT}${undeclinableReason(decline.type)} ${
             decline.type === "durable_object"
               ? "Remove the line."
-              : `Run \`pithy ${decline.capability} provision\`, or remove the line.`
+              : `${remediesSentence(capabilityProvisionRemedies(decline.capability, worker, envs, productionEnvironments))} Or remove the line.`
           }`,
         ];
       case "unrecognized":
@@ -1881,7 +1849,11 @@ function declineLines(declines: BindingDeclines): string[] {
   });
 }
 
-function workerHealthLines(health: WorkerChecks): string[] {
+function workerHealthLines(
+  health: WorkerChecks,
+  worker: WorkerDir,
+  productionEnvironments: readonly string[],
+): string[] {
   const lines: string[] = [];
 
   // First, and above the rest, because it is the only one that means the Worker does not start. Binding
@@ -1894,7 +1866,7 @@ function workerHealthLines(health: WorkerChecks): string[] {
       lines.push(
         healthLine(
           index === 0 ? "prereqs" : "",
-          `${entry.capability} requires ${entry.requires} — run: pithy add ${entry.requires}`,
+          `${entry.capability} requires ${entry.requires} — ${addAction(prerequisitePlan(worker, entry.requires), (add) => `run: ${add}`)}`,
         ),
       );
     });
@@ -1905,7 +1877,7 @@ function workerHealthLines(health: WorkerChecks): string[] {
     lines.push(healthLine("config", "parses against every capability schema ✓"));
   } else {
     const [first, ...rest] = health.config.drift;
-    lines.push(healthLine("config", `options missing from pithy.config.ts — run \`pithy upgrade\``));
+    lines.push(healthLine("config", `options missing from pithy.config.ts — run \`${upgradeFix(worker)}\``));
     if (first) lines.push(`${HEALTH_CONT}${first.capability}: ${first.keys.join(", ")}`);
     for (const cap of rest) lines.push(`${HEALTH_CONT}${cap.capability}: ${cap.keys.join(", ")}`);
   }
@@ -1930,13 +1902,14 @@ function workerHealthLines(health: WorkerChecks): string[] {
     // deploy this project cannot make — reported under `bindings` because it is one binding written in
     // two files (#428).
     for (const className of health.bindings.missingExports) {
-      bindingLine(`${className} not exported from this worker's entry — run \`pithy upgrade\``);
+      bindingLine(`${className} not exported from this worker's entry — run \`${upgradeFix(worker)}\``);
     }
   }
   // Declines print whether or not the checks above passed, and that is the whole point: a binding an
   // adopter deliberately left out is invisible on a green report otherwise, and the next person cannot
   // tell "chosen" from "never heard of it" (#440).
-  for (const line of declineLines(health.bindings.declinedBindings)) {
+  const envs = health.migrations.environments.map((entry) => entry.env);
+  for (const line of declineLines(health.bindings.declinedBindings, worker, envs, productionEnvironments)) {
     if (line.startsWith(HEALTH_CONT)) bindingLines.push(line);
     else bindingLine(line);
   }
@@ -1951,7 +1924,7 @@ function workerHealthLines(health: WorkerChecks): string[] {
 
   // Every environment, whether or not the check passed: `ok` is `dev`'s alone, and a deployed environment
   // behind is reported rather than gated, so it has to print on a passing Worker too (#586).
-  lines.push(...migrationLines(health.migrations));
+  lines.push(...migrationLines(health.migrations, productionEnvironments));
 
   if (health.entitlements.ok) {
     lines.push(healthLine("entitlements", "no gated route without a provider ✓"));
@@ -1960,7 +1933,7 @@ function workerHealthLines(health: WorkerChecks): string[] {
     lines.push(healthLine("entitlements", "couldn't be checked — this worker's source would not scan"));
   } else {
     // Report-only: `pithy upgrade` cannot pick a capability for the adopter, so the line names the fix.
-    lines.push(healthLine("entitlements", "gated routes, no provider — run: pithy add payments"));
+    lines.push(healthLine("entitlements", `gated routes, no provider. ${providerExample(worker)}`));
     for (const gate of health.entitlements.gap.gates) lines.push(`${HEALTH_CONT}${gate}`);
   }
 
@@ -2007,7 +1980,10 @@ function capabilityReachLines(reach: CapabilityReachHealth): string[] {
     lines.push(`${HEALTH_INDENT}  composed by ${entry.workers.join(", ")}`);
     lines.push(`${HEALTH_INDENT}  Nothing resolves it — not the project root, not any Worker's own node_modules — so`);
     lines.push(`${HEALTH_INDENT}  every command that reaches into it refuses, and every check below skips it.`);
-    lines.push(`${HEALTH_INDENT}  Run: pithy add ${entry.capability}`);
+    // The command names the first Worker composing it (#711). A capability composed by no Worker names none,
+    // and gets no line rather than a command with a placeholder in it.
+    const plan = capabilityReachPlan(entry);
+    if (plan !== null) lines.push(`${HEALTH_INDENT}  ${addAction(plan, (add) => `Run: ${add}`)}`);
   }
   for (const entry of reach.split) {
     const versions = new Set(entry.at.map((where) => where.version)).size;
@@ -2033,13 +2009,32 @@ function capabilityReachLines(reach: CapabilityReachHealth): string[] {
 }
 
 /**
+ * **The provision that makes a project-global resource, for a Worker that composes its capability (#711).** A
+ * stale stanza's own Worker is not that Worker by being stale — it may declare the binding and compose nothing
+ * that owns it, and the provision refuses it. With no composing Worker there is nothing to run, and the line
+ * says which kind of Worker it takes.
+ */
+function destinationLine(
+  entry: { capability: string; composing: readonly WorkerDir[] },
+  productionEnvironments: readonly string[],
+): string {
+  const [worker] = entry.composing;
+  if (worker === undefined) {
+    return `Make the destination if it is not there yet, with ${commandNameOf(`${entry.capability} provision`)} for a Worker that composes ${entry.capability}.`;
+  }
+  return capabilityProvisionRemedy(entry.capability, worker, undefined, productionEnvironments).say(
+    (command) => `Make the destination if it is not there yet: ${command}`,
+  );
+}
+
+/**
  * The `shared:` lines — a resource the whole project shares that its Workers do not all point at (#513).
  *
  * Above the Workers, beside `manifests:`, because no Worker owns it: the finding *is* that two stanzas
  * disagree, so attributing it to one of them would hide the half that makes it a finding. Every line names
  * the environment and the Worker it came from, which is what turns a report into an edit.
  */
-function bindingScopeLines(scope: BindingScopeHealth): string[] {
+function bindingScopeLines(scope: BindingScopeHealth, productionEnvironments: readonly string[]): string[] {
   const lines: string[] = [];
   for (const entry of scope.split) {
     lines.push(
@@ -2052,9 +2047,9 @@ function bindingScopeLines(scope: BindingScopeHealth): string[] {
       ...new Set(entry.stale.filter((stale) => stale.env !== LOCAL_ENVIRONMENT).map((stale) => stale.env)),
     ];
     if (fixable.length > 0) {
-      lines.push(...carryOverLines(entry));
+      lines.push(...carryOverLines(entry, productionEnvironments));
       lines.push(...upgradeFirstLines(entry));
-      lines.push(...repointLines(entry, fixable));
+      lines.push(...repointLines(entry, fixable, productionEnvironments));
     }
 
     // `provision` writes `config.env[<stanza>]` and `dev` is never a declared environment, so no command
@@ -2087,7 +2082,7 @@ function bindingScopeLines(scope: BindingScopeHealth): string[] {
     if (fixable.length > 0 && repointableIds(entry).length > 1) {
       lines.push(...chooseOneLines(entry));
       lines.push(...upgradeFirstLines(entry));
-      lines.push(...repointLines(entry, fixable));
+      lines.push(...repointLines(entry, fixable, productionEnvironments));
     }
     if (entry.ids.some(({ at }) => at.some((where) => where.env === LOCAL_ENVIRONMENT))) {
       lines.push(
@@ -2116,7 +2111,10 @@ function bindingScopeLines(scope: BindingScopeHealth): string[] {
  * carries the same five, and a remedy that reads a sixth field has to say so at the seam rather than
  * quietly widen.
  */
-type GlobalRemedy = Pick<SplitGlobalBinding, "kind" | "capability" | "expected" | "credential" | "binding">;
+type GlobalRemedy = Pick<
+  SplitGlobalBinding,
+  "kind" | "capability" | "expected" | "credential" | "binding" | "composing"
+>;
 
 /** Indent a remedy's sentences to the depth every line under a `shared:` finding sits at. */
 function remedy(copy: string[]): string[] {
@@ -2279,12 +2277,13 @@ function credentialLines(credential: string): string[] {
  * then creates the project-global resource itself, so the operator lands live on a resource created empty
  * seconds earlier. The command that makes it is named first, for that reason.
  */
-function carryOverLines(entry: GlobalRemedy): string[] {
+function carryOverLines(entry: GlobalRemedy, productionEnvironments: readonly string[]): string[] {
+  const destination = destinationLine(entry, productionEnvironments);
   if (entry.kind === "d1") {
     return remedy([
       `Copy the rows across first. The repoint changes which database is read, not what is in it:`,
       `every unsubscribe recorded above stops being honored, and nothing moves it for you.`,
-      `Make the destination if it is not there yet: pithy ${entry.capability} provision`,
+      destination,
       ...d1CopyIsNotADump(CARRY_OVER_URL),
       ...D1_STRICTER_ROW_WINS,
       `The old databases are left where they are.`,
@@ -2300,7 +2299,7 @@ function carryOverLines(entry: GlobalRemedy): string[] {
           `Copy the objects across first. The repoint changes which bucket the binding names, not what`,
           `is in it, and nothing moves the objects for you.`,
         ]),
-    `Make the destination if it is not there yet: pithy ${entry.capability} provision`,
+    destination,
     `Sync each old bucket into ${entry.expected} over R2's S3 endpoint — the API token cannot do it.`,
     ...(entry.credential === null ? [] : credentialLines(entry.credential)),
     `The old buckets are left where they are.`,
@@ -2334,7 +2333,7 @@ function carryOverLines(entry: GlobalRemedy): string[] {
 function chooseOneLines(entry: GlobalRemedy): string[] {
   if (entry.kind === "d1") {
     return remedy([
-      `Two databases are open and one survives. pithy provision picks it by name, not from the ids`,
+      `Two databases are open and one survives. ${commandName("provision")} picks it by name, not from the ids`,
       `above: it resolves ${entry.expected} on the account and writes that id into every stanza.`,
       `Decide from the ids which one that is, and copy the other's rows into it first.`,
       `They answer to one name, so no wrangler command can tell them apart by it. Each is reachable`,
@@ -2345,7 +2344,7 @@ function chooseOneLines(entry: GlobalRemedy): string[] {
     ]);
   }
   return remedy([
-    `Two buckets are open and one survives. pithy provision picks it by name, not from the ids`,
+    `Two buckets are open and one survives. ${commandName("provision")} picks it by name, not from the ids`,
     `above: it resolves ${entry.expected} on the account and writes that name into every stanza.`,
     `Decide from the ids which one that is, and sync the other's objects into it first, over R2's`,
     `S3 endpoint — the API token cannot do it.`,
@@ -2371,19 +2370,25 @@ function chooseOneLines(entry: GlobalRemedy): string[] {
  * per environment: it is the same act with the same arguments, and which of the two verbs applies is a
  * fact about the project rather than about the environment.
  */
-function repointLines(entry: GlobalRemedy, environments: string[]): string[] {
+function repointLines(
+  entry: GlobalRemedy,
+  environments: string[],
+  productionEnvironments: readonly string[],
+): string[] {
   const runs = environments.flatMap((env) => [
-    `${HEALTH_INDENT}  Then run: pithy provision --env ${env}`,
+    `${HEALTH_INDENT}  ${provisionRemedy(env, productionEnvironments).say((command) => `Then run: ${command}`)}`,
     ...(entry.credential === null
       ? []
-      : [`${HEALTH_INDENT}            pithy secrets update ${entry.credential} --env ${env}`]),
+      : [
+          `${HEALTH_INDENT}            ${pithyCommand("secrets update", { args: [entry.credential], flags: { "--env": env } })}`,
+        ]),
   ]);
   if (entry.credential === null) return runs;
   return [
     ...runs,
     ...remedy([
       `A project that has never signed a read has no ${entry.credential} to update. There the`,
-      `command is pithy secrets create, with the same arguments.`,
+      `command is ${commandName("secrets create")}, with the same arguments.`,
     ]),
   ];
 }
@@ -2401,13 +2406,13 @@ function repointLines(entry: GlobalRemedy, environments: string[]): string[] {
 function upgradeFirstLines(entry: { repointable: boolean; package: string }): string[] {
   if (entry.repointable) return [];
   return [
-    `Nothing installed declares this binding project-wide, so pithy provision would compose`,
+    `Nothing installed declares this binding project-wide, so ${commandName("provision")} would compose`,
     `the per-environment name again. Upgrade ${entry.package} first — its pithy.manifest.json is what`,
     `the writer reads, and this finding is keyed on the capability's own namer instead.`,
   ].map((line) => `${HEALTH_INDENT}  ${line}`);
 }
 
-function healthBlock(health: ProjectHealth): string {
+function healthBlock(health: ProjectHealth, productionEnvironments: readonly string[]): string {
   const lines = ["Project health:"];
   // First, and above the Workers, because it explains a hole in every one of their blocks: a capability
   // whose manifest could not be read contributes no drift to any check below it, so a project full of
@@ -2437,7 +2442,7 @@ function healthBlock(health: ProjectHealth): string {
   // and it explains a disagreement that only exists *between* two of the blocks below.
   if (!health.bindingScope.ok || health.bindingScope.split.length > 0 || health.bindingScope.divergent.length > 0) {
     lines.push("  shared:");
-    lines.push(...bindingScopeLines(health.bindingScope));
+    lines.push(...bindingScopeLines(health.bindingScope, productionEnvironments));
   }
   for (const worker of health.workers) {
     // Not "healthy", and not five empty checks either. Nothing was read about this Worker, so the block
@@ -2459,7 +2464,7 @@ function healthBlock(health: ProjectHealth): string {
       continue;
     }
     lines.push(`  ${worker.worker}:`);
-    lines.push(...workerHealthLines(worker));
+    lines.push(...workerHealthLines(worker, worker.directory, productionEnvironments));
   }
   return lines.join("\n");
 }
@@ -2718,12 +2723,17 @@ function secretBindingsBlock(check: SecretBindingsCheck): string {
  * The stanzas a self-administering project has left unbound — one line each, then the one command that
  * writes them. The block is the finding: a project that declares nothing, or has them all, prints nothing.
  */
-function selfBindingBlock(check: SelfBindingCheck): string {
+function selfBindingBlock(check: SelfBindingCheck, productionEnvironments: readonly string[]): string {
   const lines = ["Self binding:"];
   for (const entry of check.missing) lines.push(healthLine(entry.worker, describeSelfBinding(entry)));
-  lines.push(
-    `${HEALTH_INDENT}Run pithy provision --env <name> — it writes the binding with the stanza's own script name.`,
-  );
+  // One line per environment, with the command `--json` names as its `fix` (#697). A production environment
+  // is provisioned with its `--confirm` phrase, which is a person's to give, so its line says so — the same
+  // words every provisioning sentence uses, from one builder (#711).
+  for (const env of [...new Set(check.missing.map((entry) => entry.env))]) {
+    lines.push(
+      `${HEALTH_INDENT}${provisionRemedy(env, productionEnvironments).say((command) => `Run ${command} — it writes the binding with the stanza's own script name.`)}`,
+    );
+  }
   return lines.join("\n");
 }
 
@@ -2741,7 +2751,9 @@ function workerNamesBlock(check: WorkerNameCheck): string {
     // No command is offered to fix this one, because none of them can: the directory has already moved, and
     // `pithy worker rename` refuses a destination that exists. The fix is the two edits named above. The
     // command is named anyway, for the next rename — it moves all three at once and this block stays empty.
-    lines.push(`${HEALTH_INDENT}Make wrangler.jsonc agree with the directory. Next time: pithy worker rename.`);
+    lines.push(
+      `${HEALTH_INDENT}Make wrangler.jsonc agree with the directory. Next time: ${commandName("worker rename")}.`,
+    );
   }
   // The clash, before the convention note, because it is the only half that is a fault: the deploy this
   // stanza describes replaces a capability's own host Worker, and nothing on the account would say so.
@@ -2750,7 +2762,9 @@ function workerNamesBlock(check: WorkerNameCheck): string {
     lines.push(healthLine(clash.env, describeReservedWorkerName(clash)));
   }
   if (check.reserved.length > 0) {
-    lines.push(`${HEALTH_INDENT}Rename that stanza, or the Worker. pithy worker rename moves all three names.`);
+    lines.push(
+      `${HEALTH_INDENT}Rename that stanza, or the Worker. ${commandName("worker rename")} moves all three names.`,
+    );
   }
   // And last, the half that is not a fault at all — see {@link WorkerNameConvention}.
   for (const note of check.convention) {
@@ -2794,13 +2808,13 @@ function outdatedAdvice(cap: CapabilityStatus): string {
   if (cap.command === null) {
     switch (cap.reason) {
       case "not-a-registry-range":
-        return `${available} — declared as ${cap.declaredAs}. Not moved by pithy upgrade.`;
+        return `${available} — declared as ${cap.declaredAs}. Not moved by ${commandName("upgrade")}.`;
       case "linked":
-        return `${available} — linked from a checkout. Not moved by pithy upgrade.`;
+        return `${available} — linked from a checkout. Not moved by ${commandName("upgrade")}.`;
       case "deprecated":
-        return `${available} — deprecated. Not moved by pithy upgrade.`;
+        return `${available} — deprecated. Not moved by ${commandName("upgrade")}.`;
       case "prerelease":
-        return `${available} — a prerelease. Not moved by pithy upgrade.`;
+        return `${available} — a prerelease. Not moved by ${commandName("upgrade")}.`;
       default:
         return `${available} — not a direct dependency`;
     }
@@ -2952,7 +2966,7 @@ export function renderDoctorText(report: DoctorReport, home = process.env.HOME ?
         : (() => {
             const detail = describeDevSecretsLocation(secretsFile);
             const path = tildify(secretsFile.path, home);
-            return `${path} (run \`pithy secrets edit\`)${detail ? ` — ${detail}` : ""}`;
+            return `${path} (run \`${pithyCommand("secrets edit")}\`)${detail ? ` — ${detail}` : ""}`;
           })();
 
   /**
@@ -2967,7 +2981,7 @@ export function renderDoctorText(report: DoctorReport, home = process.env.HOME ?
   const cloudflareLine = `Cloudflare: ${describeCloudflareAccess(report.cloudflare, home)}`;
 
   // CLI version.
-  const cliLines = [`pithy ${report.cli.installed} (installed via ${report.cli.installer})`];
+  const cliLines = [`${cliAtVersion(report.cli.installed)} (installed via ${report.cli.installer})`];
   if (report.cli.state === "outdated" && report.cli.latest) {
     cliLines.push(`Update available: ${report.cli.latest}`);
     cliLines.push(`Run: ${report.cli.upgradeCommand}`);
@@ -2996,7 +3010,7 @@ export function renderDoctorText(report: DoctorReport, home = process.env.HOME ?
     } else if (report.notifierDisabledBy === "env") {
       notifier = "disabled (PITHY_NO_UPDATE_NOTIFIER set)";
     } else {
-      notifier = "disabled (pithy doctor --enable-notifier to re-enable)";
+      notifier = `disabled (${pithyCommand("doctor", { flags: { "--enable-notifier": true } })} to re-enable)`;
     }
     // The dev-login line belongs in this block and nowhere else. It is the same question the two lines above
     // it answer — where does the CLI keep this, and what is in it — and it is here because it used not to be
@@ -3050,10 +3064,10 @@ export function renderDoctorText(report: DoctorReport, home = process.env.HOME ?
     // and a project whose every check passes is exactly the project they are about — gating the block on
     // `ok` alone would print their output on every report except the ones they are for.
     if (!report.project.health.ok || projectHasGreenFindings(report.project.health)) {
-      blocks.push(healthBlock(report.project.health));
+      blocks.push(healthBlock(report.project.health, report.productionEnvironments));
     }
   } else {
-    blocks.push("Project: no pithy.config.ts here — run `pithy init`, or change to a project directory");
+    blocks.push(`Project: no pithy.config.ts here — run \`${pithyCommand("init")}\`, or change to a project directory`);
   }
 
   // Cloudflare credentials, on every run. See `cloudflareLine` above for why this one is not gated on
@@ -3078,7 +3092,7 @@ export function renderDoctorText(report: DoctorReport, home = process.env.HOME ?
   // Straight after the names, because it is the same stanza asked what it binds rather than what it is
   // called. The block is the finding — see {@link selfBindingBlock}.
   if (report.selfBinding && report.selfBinding.missing.length > 0) {
-    blocks.push(selfBindingBlock(report.selfBinding));
+    blocks.push(selfBindingBlock(report.selfBinding, report.productionEnvironments));
   }
 
   // A rate-limit namespace in the feature range (#643). The block is the finding.
@@ -3207,6 +3221,15 @@ export function renderDoctorText(report: DoctorReport, home = process.env.HOME ?
 }
 
 /** The `--json` mirror of every block (agents can't read aligned columns). Health failures still drive the exit. */
+/** The `devVars` block: the check, its sentences, and seeding as the `fix` beside each empty Worker (#697). */
+function jsonDevVars(check: DevVarsCheck): Record<string, unknown> {
+  return {
+    ...check,
+    empty: check.empty.map((entry) => ({ ...entry, fix: EMPTY_DEV_VARS_FIX })),
+    detail: describeDevVars(check),
+  };
+}
+
 export function renderDoctorJson(report: DoctorReport): Record<string, unknown> {
   return {
     cli: report.cli,
@@ -3229,7 +3252,9 @@ export function renderDoctorJson(report: DoctorReport): Record<string, unknown> 
         ? {
             present: true,
             capabilities: report.project.capabilities,
-            health: report.project.health,
+            // Each finding with its `fix` beside it (#697): the health is the domain type `upgrade` reuses,
+            // so the field is added on the way out rather than to the type.
+            health: healthWithFixes(report.project.health, report.productionEnvironments),
           }
         : null,
     cloudflare: {
@@ -3253,7 +3278,8 @@ export function renderDoctorJson(report: DoctorReport): Record<string, unknown> 
       ? {
           state: report.projectName.state,
           project: report.projectName.project,
-          misnamed: report.projectName.misnamed,
+          // A rename orphans everything provisioned, so it is the adopter's call: an edit, never a command.
+          misnamed: report.projectName.misnamed.map((entry) => ({ ...entry, fix: null })),
           featureMarker: report.projectName.featureMarker ?? null,
           detail: describeProjectName(report.projectName),
         }
@@ -3263,9 +3289,11 @@ export function renderDoctorJson(report: DoctorReport): Record<string, unknown> 
     workerNames: report.workerNames
       ? {
           state: report.workerNames.state,
+          // A rename that already happened on disk: an edit, so no command (`doctor/failures.ts`).
           mismatches: report.workerNames.mismatches.map((mismatch) => ({
             ...mismatch,
             detail: describeWorkerName(mismatch),
+            fix: null,
           })),
           // Its own key, not a mismatch: a clash is established against the host registry rather than
           // against the directory, and its remedy is a different one. It is part of `drifted`, so a
@@ -3273,6 +3301,7 @@ export function renderDoctorJson(report: DoctorReport): Record<string, unknown> 
           reserved: report.workerNames.reserved.map((clash) => ({
             ...clash,
             detail: describeReservedWorkerName(clash),
+            fix: null,
           })),
           // And its own key for the opposite reason: this one never reaches `state`, so a consumer that
           // only reads `state` must not see it, and a consumer that wants it must be able to ask.
@@ -3288,13 +3317,24 @@ export function renderDoctorJson(report: DoctorReport): Record<string, unknown> 
       ? { state: report.featureRatelimitIds.state, findings: report.featureRatelimitIds.findings }
       : null,
     docsMcp: report.docsMcp
-      ? { state: report.docsMcp.state, findings: report.docsMcp.findings, detail: describeDocsMcp(report.docsMcp) }
+      ? {
+          state: report.docsMcp.state,
+          findings: report.docsMcp.findings,
+          // The same clients as data, each with the command that connects it (#697), so an agent never
+          // takes the id out of a sentence.
+          clients: report.docsMcp.clients.map((client) => ({ ...client, fix: docsConnectFix(client.client) })),
+          detail: describeDocsMcp(report.docsMcp),
+        }
       : null,
     selfBinding: report.selfBinding
       ? {
           state: report.selfBinding.state,
           declared: report.selfBinding.declared,
-          missing: report.selfBinding.missing.map((entry) => ({ ...entry, detail: describeSelfBinding(entry) })),
+          missing: report.selfBinding.missing.map((entry) => ({
+            ...entry,
+            detail: describeSelfBinding(entry),
+            fix: provisionFixCommand(entry.env, report.productionEnvironments),
+          })),
         }
       : null,
     // Same `null` discipline once more, and each drift carries its own sentence — the remedy for an
@@ -3303,9 +3343,11 @@ export function renderDoctorJson(report: DoctorReport): Record<string, unknown> 
       ? {
           state: report.environments.state,
           declared: report.environments.declared,
+          // No command renames a stanza or a declaration, so no drift has a `fix`.
           drift: report.environments.drift.map((drift) => ({
             ...drift,
             detail: describeEnvironmentDrift(drift, report.environments?.declared ?? []),
+            fix: null,
           })),
         }
       : null,
@@ -3314,19 +3356,36 @@ export function renderDoctorJson(report: DoctorReport): Record<string, unknown> 
     // the cost of a missing `vars`, and a script must not have to reconstruct which from a key name.
     // Its own key: the lines are the report's sentences, and the two lists are what a script acts on.
     turnstileSitekeys: report.turnstileSitekeys
-      ? { ...report.turnstileSitekeys, detail: describeTurnstileSitekeys(report.turnstileSitekeys) }
+      ? {
+          ...report.turnstileSitekeys,
+          unrendered: report.turnstileSitekeys.unrendered.map((found) => ({
+            ...found,
+            fix: unrenderedTurnstileFix(found),
+          })),
+          stranded: report.turnstileSitekeys.stranded.map((found) => ({ ...found, fix: strandedTurnstileFix(found) })),
+          detail: describeTurnstileSitekeys(report.turnstileSitekeys),
+        }
       : null,
     // Per environment, because that is the grain the fix has: a project whose staging was re-provisioned and
     // whose production was not is two different answers, and a single verdict would hide the one that matters.
     supportSearchTriggers: report.supportSearchTriggers
-      ? { ...report.supportSearchTriggers, detail: describeSupportSearchTriggers(report.supportSearchTriggers) }
+      ? {
+          ...report.supportSearchTriggers,
+          environments: report.supportSearchTriggers.environments.map((answer) => ({
+            ...answer,
+            fix: supportSearchFix(answer),
+          })),
+          detail: describeSupportSearchTriggers(report.supportSearchTriggers),
+        }
       : null,
     environmentInheritance: report.environmentInheritance
       ? {
           state: report.environmentInheritance.state,
+          // A key to repeat in a stanza is an edit, so no command.
           unrepeated: report.environmentInheritance.unrepeated.map((found) => ({
             ...found,
             detail: describeUnrepeatedKey(found),
+            fix: null,
           })),
         }
       : null,
@@ -3336,7 +3395,8 @@ export function renderDoctorJson(report: DoctorReport): Record<string, unknown> 
     // without parsing a sentence.
     environmentConfigs: report.environmentConfigs
       ? {
-          unresolved: report.environmentConfigs.unresolved,
+          // The config's own refusal is the remedy, and it is an edit to that config.
+          unresolved: report.environmentConfigs.unresolved.map((entry) => ({ ...entry, fix: null })),
           detail: describeEnvironmentConfigs(report.environmentConfigs),
         }
       : null,
@@ -3346,7 +3406,11 @@ export function renderDoctorJson(report: DoctorReport): Record<string, unknown> 
     origins: report.origins
       ? {
           state: report.origins.state,
-          drift: report.origins.drift.map((drift) => ({ ...drift, detail: describeOriginDrift(drift) })),
+          drift: report.origins.drift.map((drift) => ({
+            ...drift,
+            detail: describeOriginDrift(drift),
+            fix: originDriftFix(drift),
+          })),
         }
       : null,
     // Same `null` discipline, and each drift carries both sides of the comparison as well as its own
@@ -3355,7 +3419,11 @@ export function renderDoctorJson(report: DoctorReport): Record<string, unknown> 
     workflows: report.workflows
       ? {
           state: report.workflows.state,
-          drift: report.workflows.drift.map((drift) => ({ ...drift, detail: describeWorkflowDrift(drift) })),
+          drift: report.workflows.drift.map((drift) => ({
+            ...drift,
+            detail: describeWorkflowDrift(drift),
+            fix: workflowDriftFix(drift),
+          })),
         }
       : null,
     // Same `null` discipline, and each entry carries its own sentence so an agent never has to
@@ -3386,7 +3454,7 @@ export function renderDoctorJson(report: DoctorReport): Record<string, unknown> 
     secretBindings: report.secretBindings
       ? {
           state: report.secretBindings.state,
-          missing: report.secretBindings.missing,
+          missing: report.secretBindings.missing.map((entry) => ({ ...entry, fix: secretBindingFix(entry) })),
           detail: describeSecretBindings(report.secretBindings),
         }
       : null,
@@ -3398,9 +3466,12 @@ export function renderDoctorJson(report: DoctorReport): Record<string, unknown> 
           state: report.settings.state,
           account: report.settings.account,
           checked: report.settings.checked,
+          // `fix` is the capability's own where its check named one, and `null` otherwise — never absent, so a
+          // capability older than the field reads the same as one that named no command.
           findings: report.settings.findings.map((finding) => ({
             ...finding,
             detail: describeSettingsFinding(finding),
+            fix: finding.fix ?? null,
           })),
           unchecked: report.settings.unchecked,
           detail: describeSettingsAccount(report.settings.account),
@@ -3428,51 +3499,436 @@ export function renderDoctorJson(report: DoctorReport): Record<string, unknown> 
     // Names only, never a value — the same discipline as its neighbor. The whole `root` classification
     // is carried rather than only the findings, because an agent asking "what is in that file and what
     // reads it" is asking the question the classification *is*, and a filtered list answers half of it.
-    devVars: reported(report.devVars)
-      ? { ...report.devVars, detail: describeDevVars(report.devVars as DevVarsCheck) }
-      : report.devVars,
+    devVars: reported(report.devVars) ? jsonDevVars(report.devVars as DevVarsCheck) : report.devVars,
     os: `${report.os.name} ${report.os.version}`,
     runtime: report.runtime,
     node: report.node,
+    // Every check that fails the exit, each with the command that rights it (#697). The exit is this list's
+    // emptiness, so a script reads one or the other and gets the same answer.
+    failures: doctorFailures(report),
   };
 }
 
-export default defineCommand({
-  meta: { name: "doctor", description: "Check the toolchain, project, and for a new CLI version" },
-  args: {
-    worker: { type: "string", description: "Check only this worker (default: every worker under apps/)" },
-    "disable-notifier": { type: "boolean", default: false, description: "Turn off the update notifier (persisted)" },
-    "enable-notifier": { type: "boolean", default: false, description: "Turn the update notifier back on" },
-    // No `default: false`. An unpassed flag has to stay absent so `PITHY_OFFLINE` can answer, and citty's
-    // default would make every run an explicit "not offline" that overrode the variable.
-    offline: { type: "boolean", description: "Use no ambient credentials and make no network call" },
-    json: { type: "boolean", default: false, description: "Machine-readable output" },
-  },
-  run: ({ args }) =>
-    withErrorReporting(args.json, async () => {
-      if (args["disable-notifier"] && args["enable-notifier"]) {
-        throw new ValidationError({
-          message: "Pass either --disable-notifier or --enable-notifier, not both.",
-          action: "Choose one.",
-        });
-      }
-      const file = stateFilePath();
-      if (args["disable-notifier"]) await setNotifierFlag(file, false);
-      if (args["enable-notifier"]) await setNotifierFlag(file, true);
+/**
+ * One check's block in the payload: the keys `docs/commands/doctor.md` names for it, typed, and open beyond
+ * them. Its findings are open objects, each carrying its own `detail` sentence beside the fields the
+ * check found — the per-finding shapes are the check modules' own, and the page is where they are read.
+ */
+const Findings = (what: string) =>
+  z
+    .array(z.looseObject({}).describe(`One ${what}, with its fields and its own \`detail\`.`))
+    .describe(`Every ${what}.`);
+/**
+ * {@link Findings} for a block whose findings are faults: each carries `fix` beside its `detail` (#697), the
+ * command that rights it or `null`.
+ */
+const Fixed = (what: string) =>
+  z
+    .array(z.looseObject({ fix: DoctorFix }).describe(`One ${what}, with its fields, its \`detail\` and its \`fix\`.`))
+    .describe(`Every ${what}.`);
+const Lines = z.array(z.string().describe("One line of the report.")).describe("The report's lines for this check.");
+const State = (states: string) => z.string().describe(`The verdict — ${states}.`);
+const Check = (description: string, shape: z.ZodRawShape) => z.looseObject(shape).nullable().describe(description);
 
-      const report = await buildDoctorReport({
-        projectDir: process.cwd(),
-        stateFile: file,
-        ...(args.worker ? { worker: args.worker } : {}),
-        ...(args.offline === undefined ? {} : { offline: args.offline }),
-      });
-      const output = args.json ? formatJsonLine(renderDoctorJson(report)) : renderDoctorText(report);
-      process.stdout.write(`${output}\n`);
+/** One finding of `project.health`, declared whole, with its `fix` (`healthWithFixes`). */
+const HealthFinding = (what: string, shape: z.ZodRawShape) =>
+  z.array(z.object({ ...shape, fix: DoctorFix }).describe(`One ${what}, with its \`fix\`.`)).describe(`Every ${what}.`);
 
-      const code = doctorExitCode(report);
-      if (code !== 0) process.exit(code);
+/** `ok` beside a check's lists: the AND of them, and the one field to gate on. */
+const Ok = (what: string) => z.boolean().describe(`Whether ${what} passes.`);
+
+/** A two-state declaration: the lists it resolved to, or the sentence saying why it could not be read. */
+const Declaration = (what: string, read: z.ZodRawShape) =>
+  z
+    .discriminatedUnion("state", [
+      z.object({ state: z.literal("read").describe("The declaration parsed."), ...read }).describe(`${what}, read.`),
+      z
+        .object({
+          state: z.literal("invalid").describe("The declaration is present and malformed."),
+          problem: z.string().describe("What is wrong with it, naming the entry."),
+        })
+        .describe(`${what}, present and unreadable.`),
+    ])
+    .describe(`${what} in this Worker's \`pithy.config.ts\`, or why it could not be read.`);
+
+/**
+ * One Worker in `project.health`: its five checks, each finding list with its `fix` (`healthWithFixes`), or
+ * the fact that it could not be checked at all.
+ */
+const WorkerHealthPayload = z
+  .discriminatedUnion("state", [
+    z
+      .object({
+        state: z.literal("checked").describe("The plan was built and every check ran."),
+        worker: z.string().describe("The Worker's name, as `pithy worker list` shows it."),
+        directory: z
+          .string()
+          .describe("The Worker's directory under `apps/`, which `--worker` takes and every `fix` names."),
+        ok: z.boolean().describe("The AND of its five checks."),
+        config: z
+          .object({
+            ok: Ok("its config"),
+            drift: HealthFinding("capability whose options `pithy.config.ts` is missing", {
+              capability: z.string().describe("The capability."),
+              keys: z.array(z.string().describe("An option key.")).describe("The options it is missing."),
+            }),
+          })
+          .describe("Its `pithy.config.ts` against every capability schema."),
+        bindings: z
+          .object({
+            ok: Ok("its bindings"),
+            missing: HealthFinding("binding missing from `wrangler.jsonc`", {
+              name: z.string().describe("The binding name."),
+              type: z.string().describe("The kind of Cloudflare resource it refers to."),
+              envs: z.array(z.string().describe("An environment.")).describe("The environments it is missing from."),
+            }),
+            missingExports: z
+              .array(z.string().describe("A class name."))
+              .describe("Durable Object classes `wrangler.jsonc` binds that its entry does not export."),
+            declinedBindings: Declaration("`declinedBindings`", {
+              declines: Fixed("declined optional binding, resolved"),
+            }),
+            generatedValues: Declaration("`pinnedBindings`", {
+              drift: z
+                .array(GeneratedValueDrift.extend({ fix: DoctorFix }))
+                .describe("Every generated binding value the kit would write differently, each with its `fix`."),
+              stalePins: HealthFinding("pin that keeps nothing", {
+                name: z.string().describe("The binding named in `pinnedBindings`."),
+                reason: z.string().describe("The adopter's own reason."),
+              }),
+            }),
+          })
+          .describe("Its `wrangler.jsonc` bindings against what it composes."),
+        migrations: z
+          .object({ ok: Ok("its migrations"), environments: Fixed("environment's migrations") })
+          .describe("Its migrations, per environment."),
+        entitlements: z
+          .object({ ok: Ok("its entitlement gates"), gap: EntitlementGap })
+          .describe("Gated routes against a provider."),
+        prerequisites: z
+          .object({
+            ok: Ok("its prerequisites"),
+            missing: z
+              .array(MissingPrerequisite.extend({ fix: DoctorFix }))
+              .describe("Every composed capability's missing peer, each with its `fix`."),
+          })
+          .describe("Every composed capability's peers."),
+      })
+      .describe("A Worker whose checks ran."),
+    z
+      .object({
+        state: z.literal("unavailable").describe("The plan could not be built, so nothing is known."),
+        worker: z.string().describe("The Worker's name, as `pithy worker list` shows it."),
+        directory: z.string().describe("The Worker's directory under `apps/`, which `--worker` takes."),
+      })
+      .describe("A Worker that could not be checked."),
+  ])
+  .describe("One Worker's health, or that it could not be checked.");
+
+/** `project.health`: every Worker's checks and the project-wide ones, each finding with its `fix` (#697). */
+const ProjectHealthPayload = z
+  .object({
+    ok: z.boolean().describe("The AND of every check below. It fails the exit."),
+    workers: z.array(WorkerHealthPayload).describe("One entry per Worker, in report order."),
+    manifests: z
+      .object({
+        ok: Ok("every manifest"),
+        faults: z
+          .array(ManifestFault.extend({ fix: DoctorFix }))
+          .describe("Every installed package whose manifest cannot be used, each with its `fix`."),
+      })
+      .describe("Installed packages whose `pithy.manifest.json` is present and unusable."),
+    bindingScope: z
+      .object({
+        ok: Ok("every project-global binding"),
+        split: Fixed("project-global binding a stanza names otherwise"),
+        divergent: Fixed("project-global binding that opens more than one resource"),
+        partial: z.boolean().describe("Whether some part of the answer could not be read."),
+      })
+      .describe("Resources the whole project shares, bound to more than one of it."),
+    capabilityReach: z
+      .object({
+        ok: Ok("every composed capability's reach"),
+        reachable: z.array(z.string().describe("A capability.")).describe("Every composed capability the CLI reaches."),
+        unreachable: HealthFinding("composed capability installed nowhere the CLI resolves it", {
+          capability: z.string().describe("The capability, as `pithy add` names it."),
+          package: z.string().describe("The npm package that carries it."),
+          workers: z.array(z.string().describe("A Worker.")).describe("Every Worker composing it."),
+        }),
+        split: HealthFinding("composed capability its Workers resolve at two or more versions", {
+          capability: z.string().describe("The capability, as `pithy <capability>` names it."),
+          package: z.string().describe("The npm package that carries it."),
+          at: z
+            .array(
+              z
+                .object({
+                  worker: z.string().describe("A composing Worker."),
+                  version: z.string().describe("The version its copy declares."),
+                })
+                .describe("One Worker's copy."),
+            )
+            .describe("Every composing Worker that resolves a copy, with its version."),
+        }),
+      })
+      .describe("Composed capabilities the CLI can and cannot resolve."),
+  })
+  .describe("Each Worker's config, binding and migration health, and the project-wide checks.");
+
+/** `pithy doctor --json`: every block of the report, as one object. `docs/commands/doctor.md`. */
+const DoctorPayload = z
+  .object({
+    cli: z
+      .object({
+        installed: z.string().describe("The installed CLI version."),
+        latest: z.string().nullable().describe("The latest known version, or `null` when none could be read."),
+        installer: z.string().describe("How the CLI was installed — `brew`, `npm`, `bun`, …"),
+        state: z.string().describe("Where the installed version stands against the latest."),
+        upgradeCommand: z.string().describe("The command that upgrades it, for that installer."),
+      })
+      .describe("The CLI itself."),
+    shell: z.string().nullable().describe("The detected shell, `null` when none was."),
+    alias: z
+      .object({
+        state: z.enum(["installed", "not-installed", "unknown"]).describe("Whether the `p.` alias is installed."),
+        rcPath: z.string().nullable().describe("The rc file, absolute, or `null` when no shell was detected."),
+        reason: z.string().nullable().describe("The refusal's own sentence on `unknown`, else `null`."),
+      })
+      .describe("The `p.` shortcut."),
+    configDir: z.string().describe("The config directory."),
+    stateFile: z.string().describe("The notifier state file."),
+    notifier: z.enum(["enabled", "disabled"]).describe("Whether the update notifier is on."),
+    offline: z.boolean().describe("Whether this run refused ambient credentials and the network."),
+    project: z
+      .looseObject({
+        present: z.literal(true).describe("A project is here."),
+        loadError: z.string().optional().describe("Why its config would not load. Instead of the two below."),
+        capabilities: z
+          .array(z.looseObject({}).describe("One installed capability — its versions, state and upgrade command."))
+          .optional()
+          .describe("Every installed capability."),
+        health: ProjectHealthPayload.optional(),
+      })
+      .nullable()
+      .describe("The project, or `null` outside one."),
+    cloudflare: z
+      .object({
+        state: z.string().describe("Whether Cloudflare access works, or why not."),
+        missing: z.array(z.string().describe("A missing credential.")).describe("Credentials not found."),
+        tokenStatus: z.string().nullable().describe("The token's status, as Cloudflare reported it."),
+        credentialSplit: z.looseObject({}).nullable().describe("Where each credential came from, when split."),
+        configPath: z.string().nullable().describe("The credentials file this run resolved, absolute."),
+        accountName: z.string().nullable().describe("The account nickname the project names."),
+        accountMismatch: z.looseObject({}).nullable().describe("A pin the credentials contradict, or `null`."),
+        credentialSource: z
+          .string()
+          .nullable()
+          .describe("Whether the credentials came from the file or the environment."),
+        detail: z.string().describe("The sentence."),
+      })
+      .describe("Cloudflare access."),
+    projectName: Check("The project name checked against every resource name, or `null` outside a project.", {
+      state: State("`ok`, `misnamed`, `could-not-check`"),
+      project: z.string().nullable().describe("The project name."),
+      misnamed: Fixed("resource whose name leads with another project"),
+      detail: z.string().describe("The sentence."),
     }),
-});
+    workerNames: Check("Each Worker's stamped names, or `null` outside a project.", {
+      state: State("`ok`, `drifted`, `could-not-check`"),
+      mismatches: Fixed("stamp that disagrees with its directory"),
+      reserved: Fixed("stanza naming a capability's own host Worker"),
+      convention: Findings("Worker still on wrangler's environment suffix"),
+    }),
+    featureRatelimitIds: Check("Rate-limit ids in the feature range, or `null` outside a project.", {
+      state: State("`ok`, `reserved`, `could-not-check`"),
+      findings: z.array(z.string().describe("One finding.")).describe("One sentence per id in the feature range."),
+    }),
+    docsMcp: Check("AI clients the docs server is not connected to, or `null` outside a project.", {
+      state: State("`ok`, `unconnected`, `could-not-check`"),
+      findings: z.array(z.string().describe("One finding.")).describe("One line per unconnected client."),
+      clients: z
+        .array(
+          z
+            .object({
+              client: z.string().describe("The id `pithy docs connect --client` takes."),
+              label: z.string().describe("The name a person knows it by."),
+              fix: z.string().describe("The command that connects it."),
+            })
+            .describe("One unconnected client."),
+        )
+        .describe("The same clients as `findings`, as data, in the same order."),
+      detail: z.string().describe("The sentence."),
+    }),
+    selfBinding: Check("The `SELF` binding `administersItself` needs, or `null` outside a project.", {
+      state: State("`ok`, `unbound`, `could-not-check`"),
+      declared: z.boolean().describe("Whether the root config says `administersItself` at all."),
+      missing: Fixed("stanza binding no `SELF`"),
+    }),
+    environments: Check("The declared environments against each Worker's stanzas, or `null` outside a project.", {
+      state: State("`ok`, `drifted`, `could-not-check`"),
+      declared: z.array(z.string().describe("An environment.")).describe("The environments the root config names."),
+      drift: Fixed("Worker-and-environment that disagrees"),
+    }),
+    turnstileSitekeys: Check("Turnstile sitekeys nothing renders or nothing reads, or `null`.", {
+      state: State("`ok`, `findings`, `could-not-check`"),
+      unrendered: Fixed("build rendering no widget"),
+      stranded: Fixed("sitekey var nothing reads"),
+      detail: Lines,
+    }),
+    supportSearchTriggers: Check("Support search triggers per environment, or `null`.", {
+      state: State("`ok`, `not-applicable`, `findings`, `could-not-check`"),
+      environments: Fixed("deployed environment"),
+      detail: Lines,
+    }),
+    environmentInheritance: Check("Non-inherited keys a stanza does not repeat, or `null`.", {
+      state: State("`ok`, `unrepeated`, `could-not-check`"),
+      unrepeated: Fixed("key a stanza does not repeat"),
+    }),
+    environmentConfigs: Check("Declared environments whose config throws when composed, or `null`.", {
+      unresolved: Fixed("environment whose config throws"),
+      detail: Lines,
+    }),
+    origins: Check("Named against served origins, or `null` outside a project.", {
+      state: State("`ok`, `drifted`, `could-not-check`"),
+      drift: Fixed("Worker-and-environment whose origins disagree"),
+    }),
+    workflows: Check("Declared Workflows and crons against each stanza, or `null` outside a project.", {
+      state: State("`ok`, `drifted`, `could-not-check`"),
+      drift: Fixed("Worker-and-environment whose table disagrees"),
+    }),
+    extensions: Check("The capability extensions each Worker composes, or `null`.", {
+      extensions: Findings("extension"),
+    }),
+    devPreferences: Check("The `dev.json` this project resolves, or `null` outside a project.", {
+      state: State("`present`, `absent`, `could-not-check`"),
+      path: z.string().optional().describe("The file, absolute."),
+      detail: z.string().describe("The sentence."),
+    }),
+    portsRegistry: Check("The machine's dev port registry.", {
+      path: z.string().describe("The registry file, absolute."),
+      present: z.boolean().describe("Whether it exists."),
+      detail: z.string().nullable().describe("The sentence, or `null` when there is nothing to say."),
+    }),
+    devSecretsFile: Check("The dev secrets file, or `null` outside a project.", {
+      path: z.string().optional().describe("The file, absolute."),
+      present: z.boolean().optional().describe("Whether it exists."),
+    }),
+    devSecrets: Check("The dev-secrets findings, or `null` when nothing composes secrets.", {
+      healthy: z.boolean().optional().describe("The one field to gate on — every fault in this block."),
+    }),
+    secretBindings: Check("Registry secrets a declared environment does not bind, or `null`.", {
+      state: State("`ok`, `unbound`, `could-not-check`"),
+      missing: Fixed("unbound secret"),
+      detail: Lines,
+    }),
+    settings: Check("Settings each composed capability checks, or `null` when none declares a check.", {
+      state: State("`ok`, `faults`, `could-not-check`"),
+      account: z.looseObject({}).describe("Whether the account tier ran, and why not."),
+      checked: Findings("worker-and-capability pair checked"),
+      findings: Fixed("setting that does not work"),
+      unchecked: Findings("worker-and-capability-and-tier nobody could answer for"),
+      detail: z.string().describe("The sentence for the account tier."),
+    }),
+    sharedRuntimes: Check("Duplicated copies of zod, kysely and hono, or `null`.", {
+      duplicated: z.array(z.string().describe("A package name.")).describe("Each one resolved more than once."),
+      copies: z
+        .record(z.string().describe("A package name."), z.array(z.string().describe("A directory.")).describe("Where."))
+        .describe("Every directory each one resolved from."),
+      detail: z.string().describe("The sentence."),
+    }),
+    localDelivery: Check("Whether mail sent from this machine leaves it, or `null`.", {
+      live: z.boolean().describe("Whether a message sent from here leaves it."),
+      capability: z.string().describe("The capability that answers for delivery."),
+      detail: z.string().describe("The sentence."),
+    }),
+    devVarsLocal: Check("Every `.dev.vars.local` key, classified, or `null`.", {}),
+    devVars: Check("The root `.dev.vars` classification, names only, or `null`.", {
+      empty: z
+        .array(
+          z
+            .object({
+              worker: z.string().describe("The Worker that gets no values."),
+              file: z.string().describe("Its generated `.dev.vars`, relative to the project root."),
+              fix: DoctorFix,
+            })
+            .describe("One Worker whose generated `.dev.vars` holds nothing."),
+        )
+        .optional()
+        .describe("Every Worker whose generated `.dev.vars` holds nothing, each with the `fix` that seeds it."),
+    }),
+    os: z.string().describe("The operating system and its version."),
+    runtime: z
+      .object({
+        name: z.string().describe("`Bun` or `Node`."),
+        version: z.string().describe("Its version."),
+        nodeCompat: z.string().nullable().describe("The Node version it emulates, or `null` on Node."),
+      })
+      .describe("The interpreter that ran."),
+    node: z.string().describe("The Node version it emulates."),
+    failures: DoctorFailures,
+  })
+  .describe("What `pithy doctor --json` writes — every block of the report.");
+
+export default withContract(
+  defineCommand({
+    meta: { name: "doctor", description: "Check the toolchain, project, and for a new CLI version" },
+    args: {
+      worker: { type: "string", description: "Check only this worker (default: every worker under apps/)" },
+      "disable-notifier": { type: "boolean", default: false, description: "Turn off the update notifier (persisted)" },
+      "enable-notifier": {
+        type: "boolean",
+        default: false,
+        description: "Turn the update notifier back on (persisted)",
+      },
+      // No `default: false`. An unpassed flag has to stay absent so `PITHY_OFFLINE` can answer, and citty's
+      // default would make every run an explicit "not offline" that overrode the variable.
+      offline: { type: "boolean", description: "Use no ambient credentials and make no network call" },
+      json: { type: "boolean", default: false, description: "Machine-readable output" },
+    },
+    run: ({ args }) =>
+      withErrorReporting(args.json, async () => {
+        if (args["disable-notifier"] && args["enable-notifier"]) {
+          throw new ValidationError({
+            message: "Pass either --disable-notifier or --enable-notifier, not both.",
+            action: "Choose one.",
+          });
+        }
+        const file = stateFilePath();
+        if (args["disable-notifier"]) await setNotifierFlag(file, false);
+        if (args["enable-notifier"]) await setNotifierFlag(file, true);
+
+        const report = await buildDoctorReport({
+          projectDir: process.cwd(),
+          stateFile: file,
+          ...(args.worker ? { worker: args.worker } : {}),
+          ...(args.offline === undefined ? {} : { offline: args.offline }),
+        });
+        const output = args.json ? formatJsonLine(renderDoctorJson(report)) : renderDoctorText(report);
+        process.stdout.write(`${output}\n`);
+
+        const code = doctorExitCode(report);
+        if (code !== 0) process.exit(code);
+      }),
+  }),
+  {
+    output: "document",
+    schemaVersion: 1,
+    payload: DoctorPayload,
+    // The default run, as every contract's `mutates` is (`commandContract.ts`). It writes nothing of the
+    // project's, the account's or a database's: the update-notifier cache it refreshes is the CLI's own
+    // bookkeeping, which any command may write. `--disable-notifier` and `--enable-notifier` persist a
+    // preference in that same file, and each says so in its description.
+    mutates: false,
+    idempotent: true,
+    needsNetwork: true,
+    flagGroups: [
+      {
+        kind: "atMostOne",
+        flags: ["--disable-notifier", "--enable-notifier"],
+        rule: "Pass either --disable-notifier or --enable-notifier, not both.",
+      },
+    ],
+  },
+);
 
 // Re-export the shared plan-builder reference so a test can assert the engine is shared with upgrade.
 export { buildReconcilePlan };
