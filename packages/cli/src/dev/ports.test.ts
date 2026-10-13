@@ -3,13 +3,7 @@
 
 import { ConflictError } from "@pithy-sh/core/src/error/pithyError";
 import { describe, expect, test, vi } from "vitest";
-import {
-  isReapableDevCommand,
-  parseNetstatListening,
-  sweepStaleDevPorts,
-  verifyPinnedPort,
-  waitForExit,
-} from "./ports";
+import { isReapableDevCommand, parseCimPids, sweepStaleDevPorts, verifyPinnedPort, waitForExit } from "./ports";
 
 describe("verifyPinnedPort", () => {
   test("returns when the port is free on both families", async () => {
@@ -135,36 +129,25 @@ describe("sweepStaleDevPorts", () => {
   });
 });
 
-describe("parseNetstatListening", () => {
-  /** The real shape of `netstat -ano -p TCP` on Windows 11, with a 8787 story written into it. */
-  const TABLE = [
-    "Active Connections",
-    "",
-    "  Proto  Local Address          Foreign Address        State           PID",
-    "  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1704",
-    "  TCP    127.0.0.1:8787         0.0.0.0:0              LISTENING       27200",
-    "  TCP    [::1]:8787             [::]:0                 LISTENING       27200",
-    "  TCP    127.0.0.1:8787         127.0.0.1:57875        ESTABLISHED     27200",
-    "  TCP    127.0.0.1:57875        127.0.0.1:8787         ESTABLISHED     2872",
-    "  TCP    127.0.0.1:51066        127.0.0.1:8787         TIME_WAIT       0",
-  ].join("\r\n");
-
-  test("names the listener on both families once, from a real table shape", () => {
-    expect(parseNetstatListening(TABLE, 8787)).toEqual([27200]);
+describe("parseCimPids", () => {
+  test("a listener on both families is one pid, named once", () => {
+    // `Get-NetTCPConnection -State Listen -LocalPort 8787` answers one row per listening address: a
+    // server bound to 127.0.0.1 and ::1 is the same pid on two rows.
+    expect(parseCimPids("27200\r\n27200\r\n")).toEqual([27200]);
   });
 
-  test("an ESTABLISHED client connection to the port is not a holder of it", () => {
-    // pid 2872 has the port as its *foreign* address — a browser tab, not the server. Reaping it for
-    // a stale dev port would kill the operator's browser, not the orphan.
-    expect(parseNetstatListening(TABLE, 8787)).not.toContain(2872);
+  test("distinct listeners on one port are all named", () => {
+    expect(parseCimPids("27200\r\n31108\r\n")).toEqual([27200, 31108]);
   });
 
-  test("a table with no listener for the port is empty, and TIME_WAIT is not a listener", () => {
-    expect(parseNetstatListening(TABLE, 5173)).toEqual([]);
+  test("no listener, empty output, and the pid 0 of a kernel row answer the sweep with nothing to reap", () => {
+    expect(parseCimPids("")).toEqual([]);
+    expect(parseCimPids("\r\n\r\n")).toEqual([]);
+    expect(parseCimPids("0\r\n")).toEqual([]);
   });
 
-  test("the header row and the CRLF line endings of the real binary are absorbed", () => {
-    expect(parseNetstatListening(TABLE, 135)).toEqual([1704]);
+  test("a line that is not a number is not a pid", () => {
+    expect(parseCimPids("OwningProcess\r\n7716\r\n")).toEqual([7716]);
   });
 });
 
@@ -183,6 +166,10 @@ describe("isReapableDevCommand", () => {
     ["C:\\Users\\x\\node_modules\\@cloudflare\\workerd\\bin\\workerd.exe serve", true],
     ['"C:\\Program Files\\nodejs\\node.exe" C:\\proj\\node_modules\\wrangler\\bin\\wrangler.js dev', true],
     ["C:\\Users\\x\\AppData\\Roaming\\npm\\node_modules\\bun\\bin\\bun.exe x wrangler dev", true],
+    // CIM reports a path as it was launched and Windows filenames are not case-preserved: WORKERD.EXE
+    // is the same binary, and the filter must not fail safe past it.
+    ["C:\\TOOLS\\WORKERD.EXE serve", true],
+    ['"C:\\Program Files\\nodejs\\NODE.EXE" C:\\proj\\node_modules\\wrangler\\bin\\wrangler.js dev', true],
     ['"C:\\Program Files\\Git\\usr\\bin\\git.exe" status', false],
     ["C:\\Windows\\System32\\netstat.exe -ano", false],
   ])("%s → %s", (command, expected) => {

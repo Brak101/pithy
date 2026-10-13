@@ -51,8 +51,10 @@ const runProcess = promisify(execFile);
 
 /**
  * The system copy of a Windows binary, by full path: `%SystemRoot%\System32\<name>.exe`, and the
- * bare name when `SystemRoot` is absent — which it is on no real Windows. The census reads this
- * helper's literal argument as the spelled name of the executable (`ci/childProcesses.ts`).
+ * bare name when `SystemRoot` is absent — which it is on no real Windows. The name may carry a
+ * subpath inside System32 where the binary lives deeper: `WindowsPowerShell/v1.0/powershell`. The
+ * census reads this helper's literal argument as the spelled name of the executable
+ * (`ci/childProcesses.ts`).
  */
 export function systemExecutable(name: string): string {
   const root = environmentValue(process.env, "SystemRoot");

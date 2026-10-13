@@ -5,7 +5,7 @@ import { execFile } from "node:child_process";
 import net from "node:net";
 import { promisify } from "node:util";
 import { ConflictError } from "@pithy-sh/core/src/error/pithyError";
-import { defaultKillFor } from "../platform/killTree";
+import { defaultKillFor, systemExecutable } from "../platform/killTree";
 
 const run = promisify(execFile);
 
@@ -94,36 +94,41 @@ export const lsofPort: LsofPort = async (port) => {
 };
 
 /**
- * The pids listening on a TCP `port`, read from `netstat -ano` — the Windows {@link LsofPort} (#701
- * item 3). Windows has no `lsof`, and the POSIX default reads a missing binary as "nothing holds this
- * port", so the sweep reaps nothing and a pinned port that outlived a crash silently blocks startup.
+ * The pids listening on a TCP `port`, asked of CIM — the Windows {@link LsofPort} (#701 item 3).
+ * Windows has no `lsof`, and the POSIX default reads a missing binary as "nothing holds this port",
+ * so the sweep reaps nothing and a pinned port that outlived a crash silently blocks startup.
+ *
+ * This is `Get-NetTCPConnection`, not `netstat`: `netstat -ano -p TCP` lists IPv4 only (IPv6 needs
+ * `-p TCPv6`), so a `workerd` listening on `[::1]` alone never appears — and the `LISTENING` state
+ * column is localized, so a non-English Windows prints `ABHÖREN` and a parsed table matches nothing.
+ * `-State Listen` is an enum in the cmdlet, not a printed word, and the query covers every listening
+ * address, on every family, at once.
  */
-export const netstatPort: LsofPort = async (port) => {
+export const cimPortHolders: LsofPort = async (port) => {
   try {
-    const { stdout } = await run("netstat", ["-ano", "-p", "TCP"]);
-    return parseNetstatListening(stdout, port);
+    const { stdout } = await run(systemExecutable("WindowsPowerShell/v1.0/powershell"), [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      // The port is interpolated as a number literal — the same rule {@link cimProcess} keeps, so no
+      // text ever reaches the cmdlet's parameters.
+      `Get-NetTCPConnection -State Listen -LocalPort ${Math.trunc(port)} | Select-Object -ExpandProperty OwningProcess`,
+    ]);
+    return parseCimPids(stdout);
   } catch {
     return [];
   }
 };
 
 /**
- * The LISTENING pids for one port out of `netstat -ano`'s table.
- *
- * A row is `TCP  <local>  <foreign>  <state>  <pid>`, and the state column is what tells a listener
- * from a connection: an `ESTABLISHED` row's fourth token is a pid, not a state, so only a literal
- * `LISTENING` there is kept — a client connection to a port must not read as a holder of it. The
- * local address is `127.0.0.1:8787` on IPv4 and `[::1]:8787` on IPv6 — the port is the text after
- * the last colon, and both families count, because the dev ports are verified on both.
+ * The pids out of `Select-Object -ExpandProperty OwningProcess`'s output — one per line, CRLF, and a
+ * pid repeats once per listening address (IPv4 and IPv6 are two rows of the same server), which is
+ * why this returns a set. `pid 0` is the kernel's table owner, never a process to reap.
  */
-export function parseNetstatListening(stdout: string, port: number): number[] {
+export function parseCimPids(stdout: string): number[] {
   const pids = new Set<number>();
   for (const line of stdout.split(/\r?\n/)) {
-    const tokens = line.trim().split(/\s+/);
-    if (tokens.length < 5 || tokens[0] !== "TCP" || tokens[3] !== "LISTENING") continue;
-    const local = tokens[1] ?? "";
-    if (Number(local.slice(local.lastIndexOf(":") + 1)) !== port) continue;
-    const pid = Number(tokens[4]);
+    const pid = Number(line.trim());
     if (Number.isInteger(pid) && pid > 0) pids.add(pid);
   }
   return [...pids];
@@ -174,10 +179,17 @@ export const cimParent: ParentPid = async (pid) => {
  */
 export const cimCommand: ProcessCommand = async (pid) => (await cimProcess(pid, "CommandLine")) ?? null;
 
-/** One CIM property of one pid, asked with the pid as a numeric filter literal. Null when CIM finds nothing. */
+/**
+ * One CIM property of one pid, asked with the pid as a numeric filter literal. Null when CIM finds nothing.
+ *
+ * `powershell.exe -Command` is a script string, not an argv — #701 item 3 asked for a query that needs no
+ * shell parsing. The trade: Windows has had no shell-free way to read a command line since `wmic` was
+ * removed, and the pid goes in as a `Math.trunc`'d number literal, so no text ever reaches the WQL filter.
+ * The System32 path, like `taskkill`, keeps the working directory — the project — out of the lookup.
+ */
 async function cimProcess(pid: number, property: "ParentProcessId" | "CommandLine"): Promise<string | null> {
   try {
-    const { stdout } = await run("powershell.exe", [
+    const { stdout } = await run(systemExecutable("WindowsPowerShell/v1.0/powershell"), [
       "-NoProfile",
       "-NonInteractive",
       "-Command",
@@ -191,13 +203,14 @@ async function cimProcess(pid: number, property: "ParentProcessId" | "CommandLin
 }
 
 /**
- * The port holder for the platform: `lsof` where it exists, `netstat -ano` on Windows (#701 item 3).
- * Windows has no `lsof`, and {@link lsofPort} reads a missing binary as an empty answer — so there the
- * sweep finds nothing, reaps nothing, and a pinned port that outlived a crashed session blocks every
- * startup with a message that says "stop whatever is holding it" while the holder stays invisible.
+ * The port holder for the platform: `lsof` where it exists, CIM's `Get-NetTCPConnection` on Windows
+ * (#701 item 3). Windows has no `lsof`, and {@link lsofPort} reads a missing binary as an empty answer —
+ * so there the sweep finds nothing, reaps nothing, and a pinned port that outlived a crashed session
+ * blocks every startup with a message that says "stop whatever is holding it" while the holder stays
+ * invisible.
  */
 export function defaultPortHolders(platform: NodeJS.Platform = process.platform): LsofPort {
-  return platform === "win32" ? netstatPort : lsofPort;
+  return platform === "win32" ? cimPortHolders : lsofPort;
 }
 
 /** The command-line lookup for the platform — CIM is the Windows `ps`. */
@@ -210,17 +223,18 @@ export function defaultParentOf(platform: NodeJS.Platform = process.platform): P
   return platform === "win32" ? cimParent : psParent;
 }
 
-/** The binaries the sweep owns: the Workers runtime and its supervisor. */
-const WORKER_BINARY = /^(workerd|wrangler)(\.[cm]?js)?$/;
+/** The binaries the sweep owns: the Workers runtime and its supervisor. Case-insensitively: Windows
+ * filenames are, and CIM echoes a path as it was launched — `WORKERD.EXE` is the same binary. */
+const WORKER_BINARY = /^(workerd|wrangler)(\.[cm]?js)?$/i;
 /** Launchers that run a script — the script name, not the launcher, says what the process is. */
-const SCRIPT_RUNNER = /^(node|bun|deno|npx|bunx)$/;
+const SCRIPT_RUNNER = /^(node|bun|deno|npx|bunx)$/i;
 
 /** The last path segment of `token`, stripped of a Windows `.exe` suffix and of the quotes CIM wraps
  * around a program path (every path with a space, which on Windows includes Program Files). Both
  * separators count: the command line arrives from `ps` on POSIX and from CIM on Windows. */
 function commandBase(token: string): string {
   const bare = token.replace(/^"|"$/g, "");
-  return (bare.split(/[/\\]/).pop() ?? "").replace(/\.exe$/, "");
+  return (bare.split(/[/\\]/).pop() ?? "").replace(/\.exe$/i, "");
 }
 
 /**

@@ -89,12 +89,13 @@ const BROWSER_COMMANDS: ReadonlySet<string> = new Set([
 
 /**
  * Named exceptions to the reservation above: `<module> → executables>` whose spawn in that module is
- * not an opener, with its reason. `dev/ports.ts` runs `powershell.exe` to query the CIM process table
- * — a table read by the same right that reserves the name for the opener; it opens nothing. Every
- * other module stays held: the name is reserved, the exception is the one line, spelled.
+ * not an opener, with its reason. `dev/ports.ts` runs PowerShell to query the CIM process table and the
+ * listening-socket table — a table read by the same right that reserves the name for the opener; it
+ * opens nothing, in either spelling (the bare name and the `systemExecutable` path under System32).
+ * Every other module stays held: the name is reserved, the exception is the one line, spelled.
  */
 const NOT_OPENER: Readonly<Record<string, ReadonlySet<string>>> = {
-  "dev/ports.ts": new Set(["powershell.exe"]),
+  "dev/ports.ts": new Set(["powershell.exe", "WindowsPowerShell/v1.0/powershell"]),
 };
 
 /**
@@ -114,9 +115,9 @@ const NOT_OPENER: Readonly<Record<string, ReadonlySet<string>>> = {
  */
 const SPAWNS: Readonly<Record<string, string>> = {
   'dev/ports.ts "lsof"': "Finds what already holds a dev port, to name the process rather than the number.",
-  'dev/ports.ts "netstat"': "The Windows port table: `netstat -ano` names the pids LISTENING on a dev port (#701 item 3).",
-  'dev/ports.ts "powershell.exe"': "Asks the Windows process table (CIM) a pid's name and parent, so the sweep tells workerd from a stranger.",
   'dev/ports.ts "ps"': "Names the process holding a port, when lsof is not installed.",
+  'dev/ports.ts systemExecutable("WindowsPowerShell/v1.0/powershell"':
+    "Asks CIM, on Windows, which pid listens on a dev port and what command line and parent that pid has — a query, not an opener; the helper names the system copy, the literal names the binary.",
   "dev/orchestrator.ts command": "Runs each worker's dev server — the command is the resolved package manager.",
   'feature/ports.ts "git"': "Reads the branch a feature's port block belongs to.",
   'feature/worktree.ts "git"': "Creates and removes the worktree a feature branch lives in.",
@@ -194,7 +195,11 @@ describe("one opener, one key reader, one sentence", () => {
       if (file === BROWSER) continue;
       for (const call of calls) {
         const executable = literalExecutable(call.executable);
-        if (executable !== null && BROWSER_COMMANDS.has(executable) && !NOT_OPENER[relative(CLI_SRC, file)]?.has(executable)) {
+        if (
+          executable !== null &&
+          BROWSER_COMMANDS.has(executable) &&
+          !NOT_OPENER[relative(CLI_SRC, file)]?.has(executable)
+        ) {
           offenders.push(`${shown(file)} ${call.primitive}(${call.executable})`);
         }
       }
