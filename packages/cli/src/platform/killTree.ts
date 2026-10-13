@@ -57,6 +57,16 @@ function environmentValue(env: NodeJS.ProcessEnv, name: string): string | undefi
 }
 
 /**
+ * The system copy of a Windows binary, by full path: `%SystemRoot%\System32\<name>.exe`, and the
+ * bare name when `SystemRoot` is absent — which it is on no real Windows. The census reads this
+ * helper's literal argument as the spelled name of the executable (`ci/childProcesses.ts`).
+ */
+export function systemExecutable(name: string): string {
+  const root = environmentValue(process.env, "SystemRoot");
+  return root ? win32.join(root, "System32", `${name}.exe`) : name;
+}
+
+/**
  * Build the kill for `platform`. `run` is the seam that starts `taskkill`, so a test can prove the tree
  * kill — with `/T /F`, the pid as its own argument, no shell — is the one used on `win32`.
  */
@@ -67,18 +77,11 @@ export function defaultKillFor(
   if (platform !== "win32") {
     return (pid, signal) => void process.kill(pid, signal);
   }
-  // The kill binaries are named by full path: CreateProcess looks up a bare name in the *working
+  // The kill binary is named by full path: CreateProcess looks up a bare name in the *working
   // directory* before PATH, and the working directory is the project's — a `taskkill.exe` planted
-  // there would own every teardown. The bare `"taskkill"` is the last-good spelling when `SystemRoot`
-  // is absent (it is on no real Windows), and the literal sits at the spawn call site, where
-  // `ci/childProcesses.ts` reads it: the kill is bounded the same way `ps` and `lsof` are, and a
-  // bounded executable is spelled there, by name or by the basename of its system path.
-  const run: RunKill =
-    deps.run ??
-    ((args) => {
-      const systemRoot = environmentValue(process.env, "SystemRoot");
-      return runProcess(systemRoot ? win32.join(systemRoot, "System32", "taskkill.exe") : "taskkill", args);
-    });
+  // there would own every teardown. The census (ci/childProcesses.ts) reads
+  // `systemExecutable("taskkill")` as a spelled call site: the helper's argument is the literal.
+  const run: RunKill = deps.run ?? ((args) => runProcess(systemExecutable("taskkill"), args));
   return (pid) => {
     // Fire-and-forget, like `process.kill` is: the caller watches the child's own exit, and a taskkill
     // that fails has failed on a process that is already going.

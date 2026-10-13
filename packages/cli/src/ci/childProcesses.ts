@@ -129,19 +129,17 @@ const SPECIFIER = String.raw`["'\x60](?:node:)?child_process["'\x60]`;
 const IDENT = String.raw`[A-Za-z_$][\w$]*`;
 
 /**
- * Is this executable expression a bounded executable? Every plain string literal inside it contributes
- * its basename, minus a `.exe` suffix — the name alone and a full system path both spell the binary
- * they run, and the census reads what is spelled at the call site. A variable holding the name
- * contributes nothing: `runProcess(path, args)` is judged like any other computed executable.
+ * Is this executable expression a bounded executable? Two spellings, both judged by a literal at
+ * the call site: a **lone string literal** (`"git"`, `"ps"`), and the one named system-path shape
+ * the CLI uses — `systemExecutable("taskkill")`, judged by its literal argument. Nothing looser:
+ * a literal *inside* a wider expression is the census's catch, not its exemption —
+ * `tool ?? "git"` runs the tool when it is set, and only reaches git when it is not.
  */
 export function isBoundedExecutable(executable: string, bounded: ReadonlySet<string>): boolean {
-  for (const match of executable.matchAll(/["']([^"'`$]*)["']/g)) {
-    const literal = match[1];
-    if (literal === undefined || literal === "") continue;
-    const base = literal.split(/[\\/]/).pop() ?? literal;
-    if (bounded.has(base.toLowerCase().endsWith(".exe") ? base.slice(0, -4) : base)) return true;
-  }
-  return false;
+  const lone = /^["']([^"'`$]*)["']$/.exec(executable)?.[1];
+  if (lone !== undefined && bounded.has(lone)) return true;
+  const system = /^systemExecutable\(\s*["']([^"'`$]*)["']\s*\)$/.exec(executable)?.[1];
+  return system !== undefined && bounded.has(system);
 }
 
 /** An identifier occurrence, not a property access, not inside a longer name, not inside a quote. */

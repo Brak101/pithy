@@ -113,6 +113,8 @@ const SPAWNS: Readonly<Record<string, string>> = {
   "platform/browser.ts command": "The one browser opener. The command is this platform's, from `openCommand`.",
   "platform/editor.ts command":
     "The one editor launcher. The command is `$VISUAL`, `$EDITOR`, or the platform default.",
+  'platform/killTree.ts systemExecutable("taskkill")':
+    "Ends the worker tree a dev session spawned. A kill, not an opener; the helper names the system copy, the literal names the binary.",
   "project/deploy.ts command": "Runs wrangler to deploy, through the project's own package manager.",
   "project/packageManager.ts command": "Runs the adopter's package manager — the command is which one they use.",
   'project/templateFiles.ts "git"': "Reads a template's tracked files, so a scaffold copies what git knows.",
