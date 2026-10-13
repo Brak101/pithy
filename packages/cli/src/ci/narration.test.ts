@@ -50,17 +50,9 @@ import { isTestFile, readSource, sourcePaths } from "./sourceFiles";
  *    sink, and `eventsProgress` is the one sink a `--json` run can have. `terminal/progress.test.ts` holds both
  *    at runtime.
  *
-<<<<<<< HEAD
- * **Not every child needs a step, and there are two exceptions.** A child whose executable is written as
- * the literal `"git"`, `"lsof"`, `"ps"` or `"taskkill"` is bounded local work — git's metadata, the process
- * table, a short kill — judged at
- * the call site, so the same `execFile` with `"npm"` beside it is held. And a `spawn` in one of three named
- * modules that hand the child's streams on rather than collecting them — the editor that owns the terminal,
- * the browser opener that detaches, `pithy dev`'s servers whose output *is* the narration — is not captured.
- * Only `spawn` there: an `execFile` in any of them is held like anywhere else.
-=======
  * **Not every child needs a step, and there are two exceptions.** A child whose executable is written as the
- * literal `"git"`, `"lsof"` or `"ps"` is a bounded local query — git's metadata, the process table — judged at
+ * literal `"git"`, `"lsof"`, `"ps"` or `"taskkill"` is bounded local work — git's metadata, the process
+ * table, a short kill — judged at
  * the call site, so the same `execFile` with `"npm"` beside it is held. And a streams-on spawn in one of
  * three named modules — the editor that owns the terminal, the browser opener that detaches, and the dev
  * orchestrator that pipes each worker's streams to the terminal and the session log — is not captured.
@@ -70,7 +62,6 @@ import { isTestFile, readSource, sourcePaths } from "./sourceFiles";
  * The spawner itself (`platform/command.ts`) is exempt by a third rule: the spawn *inside* it is the
  * mechanism, not a call site, and every `spawnCommand`/`execCommand` call in its callers is counted as
  * a spawn where it is written. The spawner's exemption exempts one file; it exempts nobody who calls it.
->>>>>>> 81a9938cfcc3214e9aa8a20a504b57a7c1834f7a
  *
  * **Where silence is reported.** A declaration that reaches a child without a step passes that on to whatever
  * names it, so the defect surfaces where a run begins: a `pithy <command>` module, or `bin.ts` and `main.ts`,
