@@ -5,6 +5,7 @@ import { execFile } from "node:child_process";
 import net from "node:net";
 import { promisify } from "node:util";
 import { ConflictError } from "@pithy-sh/core/src/error/pithyError";
+import { defaultKillFor } from "../platform/killTree";
 
 const run = promisify(execFile);
 
