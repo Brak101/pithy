@@ -51,8 +51,8 @@ import { isTestFile, readSource, sourcePaths } from "./sourceFiles";
  *    at runtime.
  *
  * **Not every child needs a step, and there are two exceptions.** A child whose executable is written as the
- * literal `"git"`, `"lsof"`, `"ps"`, `"taskkill"`, `"netstat"` or `"powershell.exe"` is bounded local work —
- * git's metadata, the process table (native and CIM, behind `netstat` and `powershell.exe`), a short kill — judged at
+ * literal `"git"`, `"lsof"`, `"ps"`, `"taskkill"` or `"WindowsPowerShell/v1.0/powershell"` (both via `systemExecutable`) is bounded local work — git's metadata, the process
+ * table, a short kill, and the CIM process table behind PowerShell — judged at
  * the call site, so the same `execFile` with `"npm"` beside it is held. And a streams-on spawn in one of
  * three named modules — the editor that owns the terminal, the browser opener that detaches, and the dev
  * orchestrator that pipes each worker's streams to the terminal and the session log — is not captured.
@@ -132,7 +132,7 @@ const WRAP = /\bwithErrorReporting\s*\(/;
 
 /** What needs no step. Each entry is argued in the docblock above. */
 const POLICY: ChildProcessPolicy = {
-  boundedExecutables: new Set(["git", "lsof", "ps", "taskkill", "netstat", "powershell.exe"]),
+  boundedExecutables: new Set(["git", "lsof", "ps", "taskkill", "WindowsPowerShell/v1.0/powershell"]),
   uncapturedModules: new Set(
     ["platform/browser.ts", "platform/editor.ts", "dev/orchestrator.ts"].map((path) => resolve(CLI_SRC, path)),
   ),
