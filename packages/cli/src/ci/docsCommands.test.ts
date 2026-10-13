@@ -4,7 +4,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { describe, expect, test } from "vitest";
-import { walkCommands } from "../docs/catalog";
+import { describeCli } from "../contract/describe";
 import { main } from "../main";
 
 /**
@@ -59,7 +59,7 @@ function docFiles(dir: string): [string, string][] {
 
 describe("commands named in docs", () => {
   test("every `pithy <command> <subcommand>` in a doc names a real subcommand", async () => {
-    const commands = await walkCommands(main);
+    const { commands } = await describeCli(main);
     const paths = new Set(commands.map((command) => command.path));
     // Only a command that *has* subcommands can be followed by a wrong one. `pithy add payments` is a
     // command and its argument, not a path, and asking `add` for a subcommand named `payments` would fail
@@ -84,11 +84,25 @@ describe("commands named in docs", () => {
     expect(wrong).toEqual([]);
   });
 
+  // No remedy names `pithy init` inside an existing project (#711): `init` refuses to scaffold over one, so an Errors
+  // entry sending a reader there sends them to a second refusal. Only `init`'s own page may offer it.
+  test("no command page's Errors section offers `pithy init` as the fix", () => {
+    const offered: string[] = [];
+    for (const [file, markdown] of docFiles(join(REPO_ROOT, "docs", "commands"))) {
+      if (file === "init.md") continue;
+      const errors = markdown.split(/^## /m).find((section) => section.startsWith("Errors\n"));
+      for (const line of errors?.split("\n") ?? []) {
+        if (/\b(?:run|with|use)\s+`pithy init`/i.test(line)) offered.push(`docs/commands/${file}: ${line}`);
+      }
+    }
+    expect(offered).toEqual([]);
+  });
+
   // The floor. A reader that found no commands, or no docs, reports every page clean — which is the one
   // result this test must never produce quietly. `secrets create` is asserted by name because it is the
   // spelling #503 was wrong about, so a walk that silently stopped returning subcommands fails here.
   test("the walk and the docs are both non-empty", async () => {
-    const commands = await walkCommands(main);
+    const { commands } = await describeCli(main);
     expect(commands.map((command) => command.path)).toContain("secrets create");
     expect(docFiles(join(REPO_ROOT, "docs")).length).toBeGreaterThan(10);
   });

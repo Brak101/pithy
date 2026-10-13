@@ -1,0 +1,6 @@
+# Off, so an issue filed on the web arrives on a form and carries needs-triage (#707).
+blank_issues_enabled: false
+contact_links:
+  - name: Report a vulnerability
+    url: https://github.com/pithy-sh/pithy/security/advisories/new
+    about: Privately. Never as a public issue.

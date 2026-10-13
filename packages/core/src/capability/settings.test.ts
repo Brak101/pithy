@@ -39,6 +39,13 @@ describe("a settings finding", () => {
     });
     expect(finding.environment).toBeNull();
   });
+
+  test("may carry the command that resolves it, and never an empty one (#697)", () => {
+    const base = { setting: "EMAIL_SUPPRESSIONS", environment: null, problem: "Missing.", action: "Run it." };
+    expect(SettingsFinding.parse({ ...base, fix: "pithy email provision" }).fix).toBe("pithy email provision");
+    expect(SettingsFinding.parse(base).fix).toBeUndefined();
+    expect(SettingsFinding.safeParse({ ...base, fix: "" }).success).toBe(false);
+  });
 });
 
 describe("host env problems become settings findings", () => {
@@ -48,6 +55,8 @@ describe("host env problems become settings findings", () => {
 
     expect(findings.map((finding) => finding.setting)).toEqual(["BASE_URL", "LINK_TTL_DAYS"]);
     expect(findings.every((finding) => finding.environment === "prod")).toBe(true);
+    // The provider's command, where it names one, is the finding's `fix`; a field nothing writes has none (#697).
+    expect(findings.map((finding) => finding.fix)).toEqual(["pithy email provision", undefined]);
     // The provider sentence is the action, so doctor and the host's own refusal say the same words.
     expect(findings[0]?.action).toContain("Var BASE_URL in the host's wrangler.jsonc.");
     expect(findings[0]?.action).toContain("pithy email provision");
@@ -76,7 +85,9 @@ describe("the declaration hangs off the capability", () => {
         local: () => hostEnvFindings(checkHostEnv(declaration, {}), "dev"),
       },
     });
-    expect(capability.settings?.local({ project: "acme", worker: "api", environments: [] })).toHaveLength(1);
+    expect(
+      capability.settings?.local({ project: "acme", worker: "api", workerDirectory: "api", environments: [] }),
+    ).toHaveLength(1);
     // Nothing declares an account tier by default — the tier that costs a call is opt-in.
     expect(capability.settings?.account).toBeUndefined();
   });

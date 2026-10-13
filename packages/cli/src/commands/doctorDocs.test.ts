@@ -9,6 +9,7 @@ import { ConflictError } from "@pithy-sh/core/src/error/pithyError";
 import { blankComments } from "@pithy-sh/core/src/text/comments";
 import { describe, expect, test } from "vitest";
 import type { ResolvedWorker } from "../project/workerScope";
+import { formatJsonLine } from "../terminal/output";
 import {
   cleanPlanFor,
   doctorHarness,
@@ -19,6 +20,8 @@ import {
   workerSet,
   zsh,
 } from "../test-utils/doctorHarness";
+import { asCommand, expectConforms } from "../test-utils/payloadContract";
+import { dirOf } from "../test-utils/workerDir";
 import { buildDoctorReport, type DoctorReportOptions, renderDoctorJson, renderDoctorText } from "./doctor";
 
 /**
@@ -162,7 +165,7 @@ function transcript(blocks: string[], where: string, index: number, prompt: stri
 const harness = doctorHarness();
 
 /** The runtime every transcript is taken under — Bun, which is what gives the `(Node … compat)` suffix. */
-const BUN = { name: "Bun", version: "1.2.4", nodeCompat: "22.10.0" };
+const BUN = { name: "Bun", version: "1.4.2", nodeCompat: "26.3.0" };
 
 /**
  * What every transcript shares, layered over whichever harness fixture a test starts from.
@@ -638,7 +641,7 @@ describe("docs/commands/doctor.md", () => {
     report.project.health = {
       ok: false,
       workers: [
-        { state: "unavailable", worker: "api" },
+        { state: "unavailable", worker: "api", directory: dirOf("api") },
         ...report.project.health.workers.filter((worker) => worker.worker === "collab"),
       ],
       manifests: { ok: true, faults: [] },
@@ -708,7 +711,7 @@ describe("docs/commands/doctor.md", () => {
       capabilityReach: {
         ok: false,
         reachable: ["auth"],
-        unreachable: [{ capability: "payments", package: "@pithy-sh/payments", workers: ["api"] }],
+        unreachable: [{ capability: "payments", package: "@pithy-sh/payments", workers: [dirOf("api")] }],
         split: [],
       },
     };
@@ -801,6 +804,7 @@ describe("docs/commands/doctor.md", () => {
             expected: "acme-global-email-suppressions",
             credential: null,
             repointable: true,
+            composing: [dirOf("api")],
             stale: [
               { worker: "api", env: "dev", name: "acme-dev-email-suppressions" },
               { worker: "api", env: "staging", name: "acme-staging-email-suppressions" },
@@ -853,6 +857,7 @@ describe("docs/commands/doctor.md", () => {
             expected: "acme-global-email-suppressions",
             credential: null,
             repointable: true,
+            composing: [dirOf("api")],
             ids: [
               { id: "sup-1", at: [{ worker: "api", env: "staging" }] },
               { id: "sup-2", at: [{ worker: "api", env: "prod" }] },
@@ -913,6 +918,7 @@ describe("docs/commands/doctor.md", () => {
             expected: "acme-global-email-suppressions",
             credential: null,
             repointable: true,
+            composing: [dirOf("api")],
             stale: [{ worker: "api", env: "staging", name: "acme-staging-email-suppressions" }],
           },
         ],
@@ -925,6 +931,7 @@ describe("docs/commands/doctor.md", () => {
             expected: "acme-global-email-suppressions",
             credential: null,
             repointable: true,
+            composing: [dirOf("api")],
             ids: [
               { id: "sup-1", at: [{ worker: "api", env: "staging" }] },
               { id: "sup-2", at: [{ worker: "api", env: "prod" }] },
@@ -1093,7 +1100,7 @@ describe("docs/commands/doctor.md", () => {
             capability: "email",
             lines: [
               "Email: no Cloudflare credentials, so real delivery is not possible here — using the simulator.",
-              "  run: pithy init, or set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN",
+              "  set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN for real delivery",
             ],
           }),
         }),
@@ -1141,10 +1148,14 @@ function rendererBlockLabels(source: string): string[] {
  * renderer's return value is opaque by construction. Extracting any of them needs the type checker rather
  * than a scan, and that is the honest edge of this gate: `keys` is a floor, never a contract, and a caller
  * that treated an empty one as a clean pass would be reporting on a file it could not read.
+ *
+ * A `provision --json` report is written through `writeProvisionReport({ … }, readiness, rerun)` rather than
+ * `formatJsonLine`, so it writes one outcome (#711). Its first argument is the payload literal, and it is a
+ * site like any other: moving a report behind the helper must not take its page out of this gate.
  */
 function payloadKeys(source: string): { keys: string[]; spreadSites: number; unparsedSites: number } {
   const keys = new Set<string>();
-  const sites = [...source.matchAll(/formatJsonLine\(\{([^{}]*)\}/g)];
+  const sites = [...source.matchAll(/(?:formatJsonLine|writeProvisionReport)\(\s*\{([^{}]*)\}/g)];
   for (const site of sites) {
     for (const part of (site[1] ?? "").split(",")) {
       const name = /^([A-Za-z_$][\w$]*)\s*(?::|$)/.exec(part.trim());
@@ -1154,7 +1165,7 @@ function payloadKeys(source: string): { keys: string[]; spreadSites: number; unp
   return {
     keys: [...keys].sort(),
     spreadSites: sites.filter((site) => (site[1] ?? "").includes("...")).length,
-    unparsedSites: [...source.matchAll(/formatJsonLine\(/g)].length - sites.length,
+    unparsedSites: [...source.matchAll(/(?:formatJsonLine|writeProvisionReport)\(/g)].length - sites.length,
   };
 }
 
@@ -1196,6 +1207,7 @@ const SPREAD_BUILT = [
   "media",
   "migrate",
   "provision",
+  "schema",
   "seed",
   "storage",
   "support",
@@ -1234,7 +1246,26 @@ describe("the docs say what the code emits", () => {
     const block = JSON_SAMPLES[0];
     if (block === undefined) throw new Error(`${WHERE} no longer pastes a \`pithy doctor --json\` sample.`);
     const sample: unknown = JSON.parse(block.split("\n").slice(1).join("\n"));
-    expect(Object.keys(sample as Record<string, unknown>).sort()).toEqual(Object.keys(renderDoctorJson(report)).sort());
+    // The line as the command writes it, `schemaVersion` included (#697).
+    const line = await asCommand("doctor", async () => formatJsonLine(renderDoctorJson(report)));
+    expect(Object.keys(sample as Record<string, unknown>).sort()).toEqual(
+      Object.keys(JSON.parse(line) as Record<string, unknown>).sort(),
+    );
+  });
+
+  /**
+   * The payload, held to the schema `pithy schema doctor` publishes (#697): a real report from the harness,
+   * one from outside any project, and the sample this page pastes — so the published schema, the code and
+   * the documented example are one shape.
+   */
+  test("the --json line, inside a project and out of one, and the page's sample, conform to the published payload", async () => {
+    const healthy = await buildDoctorReport(docOptions(harness.healthyOptions()));
+    await expectConforms("doctor", () => formatJsonLine(renderDoctorJson(healthy)));
+    const outside = await buildDoctorReport(docOptions(harness.baseOptions()));
+    await expectConforms("doctor", () => formatJsonLine(renderDoctorJson(outside)));
+    const block = JSON_SAMPLES[0];
+    if (block === undefined) throw new Error(`${WHERE} no longer pastes a \`pithy doctor --json\` sample.`);
+    await expectConforms("doctor", JSON.stringify(JSON.parse(block.split("\n").slice(1).join("\n"))));
   });
 
   /**
@@ -1327,7 +1358,11 @@ describe("the docs say what the code emits", () => {
     // one report each are now the one spread `pithy provision` builds for both.
     // 32 since #380: `pithy feature destroy` builds a second spread for the teardown that failed
     // partway, which reports what it destroyed before the failure rather than nothing at all.
-    expect(scanned.reduce((total, [, read]) => total + read.spreadSites, 0)).toBe(32);
+    // 33 since #697: `pithy schema` spreads the document it describes the CLI with behind its `command`.
+    // 34 since #697's `--dry-run`: `pithy add` spreads its planned result beside `dryRun: true`, a second
+    // spread next to the add's own, because the plan is the add's result plus the plan rather than a third
+    // payload shape.
+    expect(scanned.reduce((total, [, read]) => total + read.spreadSites, 0)).toBe(34);
   });
 
   /**
@@ -1533,6 +1568,8 @@ function sharedKeys(pages: Record<string, string[]>): Record<string, string[]> {
  * would have said it. Neither claim can be made by accident, which is the whole point.
  */
 const SHARED_JSON_KEYS: Record<string, string[]> = {
+  // The Pithy block in `AGENTS.md`: `init` writes it and `upgrade` refreshes it, through one merge (#697).
+  agents: ["init", "upgrade"],
   branch: ["dev", "feature"],
   alias: ["alias", "doctor"],
   changed: ["secrets", "ui"],
@@ -1551,6 +1588,7 @@ const SHARED_JSON_KEYS: Record<string, string[]> = {
     "migrate",
     "payments",
     "provision",
+    "schema",
     "secrets",
     "seed",
     "storage",
@@ -1566,8 +1604,21 @@ const SHARED_JSON_KEYS: Record<string, string[]> = {
   deployedAs: ["add", "ui", "upgrade", "worker"],
   devSecrets: ["doctor", "seed"],
   domains: ["init", "worker"],
-  // The same question on three commands: was anything written. `feature prune` joined in #637.
-  dryRun: ["feature", "seed", "upgrade"],
+  // The same question on every command that takes `--dry-run`: was anything written. `feature prune` joined in
+  // #637, and #697 put it on every one of them, beside the plan.
+  dryRun: [
+    "add",
+    "deploy",
+    "feature",
+    "migrate",
+    "payments",
+    "provision",
+    "secrets",
+    "seed",
+    "ui",
+    "upgrade",
+    "worker",
+  ],
   env: [
     "deploy",
     "email",
@@ -1584,13 +1635,23 @@ const SHARED_JSON_KEYS: Record<string, string[]> = {
     "vector",
   ],
   environments: ["doctor", "email", "init", "media", "payments", "secrets", "storage", "support"],
+  // The status a `provision --json` report's run exits with, on the one outcome that run writes (#711).
+  exitCode: ["email", "media", "payments", "storage", "support", "testers"],
   from: ["email", "worker"],
   // Three commands whose work is a fan-out with no transaction across it: a run that failed part-way
   // says what it wrote, and this is the flag that says the report beside it is truncated (#324, #380).
   interrupted: ["feature", "migrate", "secrets"],
   manifestFaults: ["add", "provision", "upgrade"],
   name: ["secrets", "token"],
+  // The follow-up a run left required, as `[{ command, why }]`, and absent otherwise — never empty (#697,
+  // `terminal/nextSteps.ts`). One shape on every command that can carry it.
+  next: ["add", "deploy", "provision", "ui", "upgrade"],
   packageManager: ["add", "ui"],
+  // A file path in `secrets edit`, and the command path `pithy schema <command>` was asked about. Both a
+  // string, and both where the answer is: the file to open, the command the document describes.
+  path: ["schema", "secrets"],
+  // What `--dry-run` would change, in the one shape every planning command shares (#697, `plan/plan.ts`).
+  plan: ["add", "deploy", "feature", "migrate", "payments", "provision", "secrets", "seed", "ui", "upgrade", "worker"],
   project: ["doctor", "migrate"],
   // A port a worker is pinned to, in both: `pithy worker list` reports the pin, and a `pithy dev logs`
   // `spawned` record reports the port that worker actually started on. One meaning, read two ways.
@@ -1598,6 +1659,36 @@ const SHARED_JSON_KEYS: Record<string, string[]> = {
   removed: ["alias", "dashboard"],
   routing: ["email", "support"],
   runs: ["vector", "worker"],
+  // On every payload, `doctor`'s included: the version of the payload's shape, stamped by the formatter (#697).
+  schemaVersion: [
+    "add",
+    "alias",
+    "dashboard",
+    "deploy",
+    "dev",
+    "docs",
+    "doctor",
+    "email",
+    "env",
+    "feature",
+    "init",
+    "media",
+    "migrate",
+    "payments",
+    "provision",
+    "schema",
+    "secrets",
+    "seed",
+    "storage",
+    "support",
+    "testers",
+    "token",
+    "turnstile",
+    "ui",
+    "upgrade",
+    "vector",
+    "worker",
+  ],
   // Both report an environment's `secrets_store_secrets`: provision says which entries it wrote, doctor
   // says which a declared environment still has no binding for. One subject, two directions.
   secretBindings: ["doctor", "provision"],
@@ -1608,6 +1699,9 @@ const SHARED_JSON_KEYS: Record<string, string[]> = {
   // shared name carrying two types is the defect #235 is about.
   skippedEnvironments: ["email", "media", "payments", "storage", "support", "testers"],
   staleAutostart: ["dev", "worker"],
+  // A credential's or a connection's state, one word each: `dashboard`'s connection (`connected`, …) and the
+  // minted token's lifecycle as Cloudflare reports it (`active`, …), published since #697.
+  status: ["dashboard", "token"],
   storageDeleted: ["media", "storage", "support"],
   to: ["email", "worker"],
   worker: ["add", "init", "ui", "upgrade", "worker"],
@@ -1635,6 +1729,7 @@ const SHARED_JSON_KEYS: Record<string, string[]> = {
  * type is telling the truth about how much it says.
  */
 const SHARED_JSON_KEY_TYPES: Record<string, string> = {
+  agents: "object",
   branch: "string",
   changed: "boolean",
   command: "string",
@@ -1643,18 +1738,24 @@ const SHARED_JSON_KEY_TYPES: Record<string, string> = {
   domains: "object",
   dryRun: "boolean",
   env: "string",
+  exitCode: "number",
   from: "string",
   interrupted: "boolean",
   manifestFaults: "unknown[]",
   name: "string",
+  next: "object[]",
   packageManager: "string",
+  path: "string",
+  plan: "object",
   port: "number",
   removed: "boolean",
   routing: "object",
   runs: "object[]",
+  schemaVersion: "number",
   shell: "string",
   skippedEnvironments: "object[]",
   staleAutostart: "object[]",
+  status: "string",
   storageDeleted: "boolean",
   to: "string",
   worker: "string",

@@ -17,7 +17,9 @@ import type { CommandDef } from "citty";
 import { beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import { scaffoldProject } from "../project/scaffold";
 import { readWranglerConfig, writeWranglerConfig } from "../project/wrangler";
+import { EXIT } from "../terminal/exitClass";
 import { linkKitPackages } from "../test-utils/linkKit";
+import { expectConforms } from "../test-utils/payloadContract";
 
 /**
  * **Requirement 4 of pithy-sh/pithy#512, driven rather than grepped: a run in which every environment was
@@ -82,6 +84,12 @@ const fixture = vi.hoisted(() => ({ dir: "", workerDir: "" }));
  */
 const recorded = vi.hoisted(() => ({ calls: [] as string[] }));
 
+/** Whether the stubbed support bucket is new to this run, or one an earlier run made and this one reused. */
+const supportBucket = vi.hoisted(() => ({ created: true }));
+
+/** Whether the stubbed suppression database is new to this run, or one an earlier run made and this one reused. */
+const suppressionDatabase = vi.hoisted(() => ({ created: true }));
+
 /** The project's Workers, carrying every capability the six commands look for. */
 const scope = vi.hoisted(() => ({ workers: [] as unknown[] }));
 
@@ -140,7 +148,7 @@ vi.mock("../capabilities/emailProvisioner", async (importOriginal) => ({
   CloudflareEmailProvisioner: class {
     async preflight() {}
     async ensureSuppressionDatabase() {
-      return step("email:suppressionDatabase", null, { databaseId: "sup-db", created: true });
+      return step("email:suppressionDatabase", null, { databaseId: "sup-db", created: suppressionDatabase.created });
     }
     async migrateSuppression() {
       return step("email:migrateSuppression", null, undefined);
@@ -204,7 +212,11 @@ vi.mock("../capabilities/supportProvisioner", async (importOriginal) => ({
   CloudflareSupportProvisioner: class {
     async preflight() {}
     async ensureBucket() {
-      return step("support:bucket", null, { bucket: "acme-global-support", created: true, skipped: false });
+      return step("support:bucket", null, {
+        bucket: "acme-global-support",
+        created: supportBucket.created,
+        skipped: false,
+      });
     }
     async deployWorker(env: ManagedEnvironment) {
       return step("support:deployWorker", env, undefined);
@@ -478,39 +490,95 @@ describe("a run in which every environment was skipped", () => {
     expect(fanOutCommands()).toEqual(["email", "media", "payments", "storage", "support", "testers"]);
   });
 
-  test.each(fanOutCommands())("pithy %s provision exits 1 and names every skipped environment", async (command) => {
+  /**
+   * **What a run did before it refused, said inside the one outcome (#711).** `email provision` creates and migrates
+   * the project's suppression database, and `support provision` creates the project's support bucket, whatever
+   * environments skip — each is shared by all of them — so a refusal that left it out would say nothing happened.
+   * Every other provision does nothing before the partition.
+   */
+  const DID: Record<string, string> = {
+    email: " It created and migrated the project's suppression database (sup-db), which every environment shares.",
+    support: " It created the project's support bucket (acme-global-support), which every environment shares.",
+  };
+
+  /**
+   * The caller's own run again, as the refusal's last sentence names it. `testers provision` with no `--env` acts on
+   * every environment, production included (#711), so its run again is a person's decision, said as one.
+   */
+  const rerunOf = (command: string, flags: string) =>
+    command === "testers"
+      ? `this run is next: \`pithy testers provision${flags} --worker ${WORKER}\` runs against every environment, production included. That is a person's decision, not a fix.`
+      : `run \`pithy ${command} provision${flags} --worker ${WORKER}\` again.`;
+
+  test.each(fanOutCommands())("pithy %s provision exits 3 and names every skipped environment", async (command) => {
     const run = await runProvision(command, false);
 
-    expect(run.exitCode).toBe(1);
+    expect(run.exitCode).toBe(EXIT.precondition);
     expect(run.stdout).toContain(
-      "  staging  skipped — env.staging has no DB database_id. Run pithy provision --env staging.",
+      "  staging  skipped — env.staging has no DB database_id. Run pithy provision --env staging --yes.",
     );
     expect(run.stdout).toContain(
-      "  prod     skipped — env.prod has no DB database_id. Run pithy provision --env prod.",
+      "  prod     skipped — env.prod has no DB database_id. `pithy provision --env prod --yes` with its --confirm phrase, which only a person gives, runs against prod, a production environment. That is a person's decision, not a fix.",
     );
     // A run that did nothing must never read as one that did something.
     expect(run.stdout).not.toContain("Done.");
     expect(run.stderr).toContain("No environment is ready — staging and prod have no DB database_id.");
+    // Every environment the fault applies to is named, each as what it is (#711).
     expect(run.stderr).toContain(
-      `Run pithy provision --env staging to create its app database, then run pithy ${command} provision again.`,
+      `Run pithy provision --env staging --yes to create its app database. \`pithy provision --env prod --yes\` with its --confirm phrase, which only a person gives, runs against prod, a production environment. That is a person's decision, not a fix. Once their app databases exist, ${rerunOf(command, "")}`,
     );
   });
 
+  /**
+   * **One outcome (#711).** No `provision` is a command whose report is the answer (`AGENTS.md`, `docs/CLI.md`
+   * §3.8), so a run that provisioned nothing writes the error line alone: its exit, and its `fix`. A report
+   * beside it would be a second answer to one run.
+   */
   test.each(fanOutCommands())(
-    "pithy %s provision --json carries the skips on stdout and the error on stderr",
+    "pithy %s provision --json writes the error line alone, and nothing on stdout",
     async (command) => {
       const run = await runProvision(command, true);
 
-      expect(run.exitCode).toBe(1);
-      const report = JSON.parse(run.stdout) as { command: string; skippedEnvironments: { env: string }[] };
-      expect(report.command).toBe(`${command} provision`);
-      // Per-environment structure, not one aggregate — the report must answer "did production get its worker".
-      expect(report.skippedEnvironments.map((entry) => entry.env)).toEqual(["staging", "prod"]);
-      const failure = JSON.parse(run.stderr) as { error: { code: string; message: string } };
-      expect(failure.error.code).toBe("validation/invalid_input");
-      expect(failure.error.message).toBe("No environment is ready — staging and prod have no DB database_id.");
+      expect(run.exitCode).toBe(EXIT.precondition);
+      expect(run.stdout).toBe("");
+      const failure = JSON.parse(run.stderr) as {
+        error: { code: string; message: string; exit: number; fix?: string; action?: string };
+      };
+      expect(failure.error).toMatchObject({ code: "core/precondition_failed", exit: EXIT.precondition });
+      expect(failure.error.message).toBe(
+        `No environment is ready — staging and prod have no DB database_id.${DID[command] ?? ""}`,
+      );
+      // The command that rights it, runnable as written (#697).
+      expect(failure.error.fix).toBe("pithy provision --env staging --yes");
+      // The sentence names the same command, and the caller's own run to repeat, every flag carried and its
+      // Worker named (#711).
+      expect(failure.error.action).toBe(
+        `Run ${failure.error.fix} to create its app database. \`pithy provision --env prod --yes\` with its --confirm phrase, which only a person gives, runs against prod, a production environment. That is a person's decision, not a fix. Once their app databases exist, ${rerunOf(command, " --json")}`,
+      );
     },
   );
+
+  /**
+   * **The issue's own repro (#711):** `pithy testers provision --env staging --worker api --json` in a project with
+   * two Workers. The command to repeat is the call as written — its Worker and its environment — because a bare
+   * rerun is refused there, and one without `--env` widens the run to every environment.
+   */
+  test("pithy testers provision --worker api --env staging --json, in a two-Worker project, names that call to repeat", async () => {
+    scope.workers = [
+      ...projectWorkers(fixture.workerDir),
+      { name: "web", dir: join(fixture.dir, "apps", "web"), config: {}, capabilities: [], target: {} },
+    ];
+    const run = await runProvision("testers", true, { env: "staging", worker: WORKER });
+
+    expect(run.exitCode).toBe(EXIT.precondition);
+    expect(run.stdout).toBe("");
+    const failure = JSON.parse(run.stderr) as { error: { fix?: string; action?: string } };
+    expect(failure.error.fix).toBe("pithy provision --env staging --yes");
+    expect(failure.error.action).toBe(
+      `Run pithy provision --env staging --yes to create its app database, then run \`pithy testers provision --json --env staging --worker ${WORKER}\` again.`,
+    );
+    expect(stepsFor("staging")).toEqual([]);
+  });
 
   test.each(fanOutCommands())("pithy %s provision creates nothing for a skipped environment", async (command) => {
     await runProvision(command, false);
@@ -527,10 +595,57 @@ describe("a run in which every environment was skipped", () => {
    * Requirement 3, at the command level rather than at the orchestrator's: the project-global resource is
    * created on the first run however many environments skip. It must not wait for prod.
    */
+  // A database an earlier run made is not this run's doing: the refusal says what this run did with it (#711).
+  test("email provision --json, reusing the suppression database, does not claim it created it", async () => {
+    suppressionDatabase.created = false;
+    try {
+      const run = await runProvision("email", true);
+      const failure = JSON.parse(run.stderr) as { error: { message: string } };
+      expect(failure.error.message).toBe(
+        "No environment is ready — staging and prod have no DB database_id. It reused the project's suppression database (sup-db), which every environment shares, and applied any migration it lacked.",
+      );
+    } finally {
+      suppressionDatabase.created = true;
+    }
+  });
+
+  // `--env prod` names a production run, and running it again is a person's decision: said as one, never thrown.
+  test("pithy testers provision --env prod --json, prod skipped, refuses with the run again as a person's decision", async () => {
+    const run = await runProvision("testers", true, { env: "prod", worker: WORKER });
+
+    expect(run.exitCode).toBe(EXIT.precondition);
+    expect(run.stdout).toBe("");
+    const failure = JSON.parse(run.stderr) as { error: { code: string; fix?: string; action?: string } };
+    expect(failure.error.code).toBe("core/precondition_failed");
+    expect(failure.error.fix).toBeUndefined();
+    expect(failure.error.action).toBe(
+      `\`pithy provision --env prod --yes\` with its --confirm phrase, which only a person gives, runs against prod, a production environment. That is a person's decision, not a fix. Once its app database exists, this run is next: \`pithy testers provision --json --env prod --worker ${WORKER}\` runs against prod, a production environment. That is a person's decision, not a fix.`,
+    );
+  });
+
   test("email provision still creates the suppression database, and makes no routing rule", async () => {
     await runProvision("email", false);
 
     expect(recorded.calls).toEqual(["email:suppressionDatabase", "email:migrateSuppression"]);
+  });
+
+  // A bucket an earlier run made is not this run's doing: the refusal says nothing about it.
+  test("support provision --json, reusing the bucket, refuses without claiming it", async () => {
+    supportBucket.created = false;
+    try {
+      const run = await runProvision("support", true);
+      const failure = JSON.parse(run.stderr) as { error: { message: string } };
+      expect(failure.error.message).toBe("No environment is ready — staging and prod have no DB database_id.");
+    } finally {
+      supportBucket.created = true;
+    }
+  });
+
+  test("support provision says the bucket it created, beside the refusal", async () => {
+    const run = await runProvision("support", false);
+
+    expect(run.stdout).toContain("Bucket acme-global-support ready.");
+    expect(run.stderr).toContain(DID.support?.trim() ?? "");
   });
 
   test("support provision still creates the bucket, and makes no routing rule", async () => {
@@ -576,7 +691,7 @@ describe("a run in which one environment was ready", () => {
 
     expect(run.exitCode).toBeUndefined();
     expect(run.stdout).toContain(
-      "  prod     skipped — env.prod has no DB database_id. Run pithy provision --env prod.",
+      "  prod     skipped — env.prod has no DB database_id. `pithy provision --env prod --yes` with its --confirm phrase, which only a person gives, runs against prod, a production environment. That is a person's decision, not a fix.",
     );
     expect(run.stdout).toContain("Done.");
     // Not a chosen step or two: **every** step this run took for production, which must be none of them.
@@ -585,14 +700,33 @@ describe("a run in which one environment was ready", () => {
     expect(stepsFor("staging").length).toBeGreaterThan(0);
   });
 
-  test.each(fanOutCommands())("pithy %s provision --json reports prod skipped and exits 0", async (command) => {
-    const run = await runProvision(command, true);
+  // #711: the report is the whole answer, alone, and its exitCode is what the process exits with.
+  test.each(fanOutCommands())(
+    "pithy %s provision --json reports prod skipped, alone, with the exitCode the process ends with",
+    async (command) => {
+      const run = await runProvision(command, true);
 
-    expect(run.exitCode).toBeUndefined();
-    const report = JSON.parse(run.stdout) as { command: string; skippedEnvironments: { env: string }[] };
-    expect(report.command).toBe(`${command} provision`);
-    expect(report.skippedEnvironments.map((entry) => entry.env)).toEqual(["prod"]);
-    expect(run.stderr).toBe("");
+      expect(run.exitCode).toBeUndefined();
+      expect(run.stderr).toBe("");
+      const report = JSON.parse(run.stdout) as {
+        command: string;
+        skippedEnvironments: { env: string }[];
+        exitCode: number;
+      };
+      expect(report.command).toBe(`${command} provision`);
+      expect(report.skippedEnvironments.map((entry) => entry.env)).toEqual(["prod"]);
+      expect(report.exitCode).toBe(EXIT.ok);
+    },
+  );
+
+  /** Each one held to the schema `pithy schema` publishes for it (#697), from this real run. */
+  test("every provision --json line conforms to its published payload", async () => {
+    await expectConforms("email provision", (await runProvision("email", true)).stdout);
+    await expectConforms("media provision", (await runProvision("media", true)).stdout);
+    await expectConforms("payments provision", (await runProvision("payments", true)).stdout);
+    await expectConforms("storage provision", (await runProvision("storage", true)).stdout);
+    await expectConforms("support provision", (await runProvision("support", true)).stdout);
+    await expectConforms("testers provision", (await runProvision("testers", true)).stdout);
   });
 
   test("support provision deploys staging and makes the routing rule", async () => {
@@ -634,6 +768,38 @@ describe("a run in which one environment was ready", () => {
  * `before` was therefore read *after* the pollution it was meant to catch. Sharing a mutable fixture
  * across cases is exactly how a before/after comparison certifies the state it was supposed to reject.
  */
+/**
+ * **A production run that went ahead (#711).** `pithy testers provision --env prod` deploys and binds, then names
+ * itself to run again for a refusal it may not need. A production run of it is a person's decision, and the builder
+ * threw over that after the work was done: a successful production provision ended in `core/internal`.
+ */
+describe("a production run in which production was ready", () => {
+  beforeAll(async () => {
+    const built = await scaffoldedProject("pithy-skip-exit-prod-");
+    await provisionEnvironment(built.workerDir, "prod", "db-prod");
+    fixture.dir = built.dir;
+    fixture.workerDir = built.workerDir;
+  });
+
+  beforeEach(() => {
+    recorded.calls = [];
+    scope.workers = projectWorkers(fixture.workerDir);
+    stubCredentials();
+  });
+
+  for (const json of [true, false]) {
+    test(`pithy testers provision --env prod${json ? " --json" : ""} provisions prod and ends in success`, async () => {
+      const run = await runProvision("testers", json, { env: "prod", worker: WORKER });
+
+      expect(run.exitCode).toBeUndefined();
+      expect(run.stderr).toBe("");
+      expect(stepsFor("prod").length).toBeGreaterThan(0);
+      if (json) expect((JSON.parse(run.stdout) as { exitCode: number }).exitCode).toBe(EXIT.ok);
+      else expect(run.stdout).toContain("Done.");
+    });
+  }
+});
+
 describe("a skipped environment's stanza after a run", () => {
   beforeEach(async () => {
     // Exactly what `pithy provision --env staging` leaves: staging has an app database, production has
@@ -714,7 +880,7 @@ describe("a --worker that does not compose the capability", () => {
 
       const run = await runProvision(command, true, { worker: "web" });
 
-      expect(run.exitCode).toBe(1);
+      expect(run.exitCode).toBe(EXIT.usage);
       const failure = JSON.parse(run.stderr) as { error: { message: string } };
       expect(failure.error.message).toBe(`web does not compose the ${command} capability.`);
       expect(recorded.calls).toEqual([]);

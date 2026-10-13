@@ -2,14 +2,16 @@
 // SPDX-License-Identifier: MIT
 
 import { basename } from "node:path";
-import { ValidationError } from "@pithy-sh/core/src/error/pithyError";
-import { FEATURE_ENVIRONMENT, LOCAL_ENVIRONMENT } from "@pithy-sh/core/src/naming/environment";
+import { commandName } from "@pithy-sh/core/src/cli/command";
+import { PreconditionFailedError, ValidationError } from "@pithy-sh/core/src/error/pithyError";
+import { LOCAL_ENVIRONMENT } from "@pithy-sh/core/src/naming/environment";
 import type { FeatureResourceKind } from "@pithy-sh/core/src/naming/feature";
 import { parse } from "comment-json";
 import { NO_PROVISION_ARG, stanzaOf, wranglerEnvironment } from "../project/effectiveConfig";
 import { readOptionalFile } from "../project/readOptionalFile";
 import { discoverWorkers } from "../project/workers";
 import { wranglerConfigPath } from "./featureConfig";
+import { provisionRemedy, withProvisionFix } from "./provisionFix";
 
 /**
  * **Which of the bindings a deploy would ship still have no resource behind them.**
@@ -97,6 +99,44 @@ async function deployedConfig(workerDir: string, env: string | undefined): Promi
 }
 
 /**
+ * What a deploy for `env` would ship, read for ids: every binding with none, and how many carry a real one.
+ *
+ * `provisioned` counts D1 and KV bindings only. Their id is a separate field that a provision writes and a
+ * scaffold never does, so a real one is evidence an account was provisioned for the stanza. An R2 bucket's
+ * name is its id and the scaffold writes it, so a named bucket proves nothing either way.
+ */
+export interface BindingProvisioning {
+  /** Every binding with no id, in worker then binding order. See {@link unprovisionedBindings}. */
+  missing: UnprovisionedBinding[];
+  /** How many D1 and KV bindings carry a real id. */
+  provisioned: number;
+}
+
+/** {@link BindingProvisioning} for a deploy for `env` across the project's Workers. `undefined` is a bare deploy. */
+export async function bindingProvisioning(projectDir: string, env: string | undefined): Promise<BindingProvisioning> {
+  const missing: UnprovisionedBinding[] = [];
+  let provisioned = 0;
+  for (const target of await discoverWorkers(projectDir)) {
+    if (target.hasWrangler === false) continue;
+    const config = await deployedConfig(target.dir, env);
+    if (config === null) continue;
+    const stanza = stanzaOf(config, wranglerEnvironment(env));
+    const worker = basename(target.dir);
+    for (const entry of stanza.d1_databases ?? []) {
+      if (isId(entry.database_id)) provisioned += 1;
+      else missing.push({ worker, kind: "d1", binding: entry.binding ?? "" });
+    }
+    for (const entry of stanza.kv_namespaces ?? []) {
+      if (isId(entry.id)) provisioned += 1;
+      else missing.push({ worker, kind: "kv", binding: entry.binding ?? "" });
+    }
+    for (const entry of stanza.r2_buckets ?? [])
+      if (!isId(entry.bucket_name)) missing.push({ worker, kind: "r2", binding: entry.binding ?? "" });
+  }
+  return { missing, provisioned };
+}
+
+/**
  * Every binding a deploy for `env` would ship across the project's Workers that has no id yet, in worker
  * then binding order. `undefined` is a bare deploy. A Worker with no `env.<name>` stanza is held to the top
  * level, because that is what wrangler ships for it.
@@ -105,21 +145,7 @@ export async function unprovisionedBindings(
   projectDir: string,
   env: string | undefined,
 ): Promise<UnprovisionedBinding[]> {
-  const missing: UnprovisionedBinding[] = [];
-  for (const target of await discoverWorkers(projectDir)) {
-    if (target.hasWrangler === false) continue;
-    const config = await deployedConfig(target.dir, env);
-    if (config === null) continue;
-    const stanza = stanzaOf(config, wranglerEnvironment(env));
-    const worker = basename(target.dir);
-    for (const entry of stanza.d1_databases ?? [])
-      if (!isId(entry.database_id)) missing.push({ worker, kind: "d1", binding: entry.binding ?? "" });
-    for (const entry of stanza.kv_namespaces ?? [])
-      if (!isId(entry.id)) missing.push({ worker, kind: "kv", binding: entry.binding ?? "" });
-    for (const entry of stanza.r2_buckets ?? [])
-      if (!isId(entry.bucket_name)) missing.push({ worker, kind: "r2", binding: entry.binding ?? "" });
-  }
-  return missing;
+  return (await bindingProvisioning(projectDir, env)).missing;
 }
 
 /** How a report names one unprovisioned binding: the Worker, the binding, and the kind behind it. */
@@ -136,12 +162,11 @@ export function describeUnprovisioned(missing: readonly UnprovisionedBinding[]):
  * that do have resources, rather than to a provisioning command that would refuse `dev` — or worse, one
  * that would not.
  */
-function remedy(env: string | undefined): string {
+function remedy(env: string | undefined, productionEnvironments?: readonly string[]): string {
   if (env === undefined || env === LOCAL_ENVIRONMENT) {
-    return "The top-level stanza is dev's, which runs under pithy dev and has no Cloudflare resources. Deploy --env staging or --env prod.";
+    return `The top-level stanza is dev's, which runs under ${commandName("dev")} and has no Cloudflare resources. Deploy --env staging or --env prod.`;
   }
-  if (env === FEATURE_ENVIRONMENT) return "Run pithy provision --feature, then deploy.";
-  return `Run pithy provision --env ${env} --yes, then deploy.`;
+  return provisionRemedy(env, productionEnvironments).say((command) => `Run ${command}, then deploy.`);
 }
 
 /**
@@ -152,14 +177,26 @@ function remedy(env: string | undefined): string {
  * and the resources it would create are the long-lived ones. wrangler would have: its default is to create
  * what it cannot find, and a deploy now turns that off, so what reaches wrangler fails there instead — on
  * a field nobody wrote. This moves that failure to one sentence, before anything is built.
+ *
+ * **Two kinds of refusal (#697).** For a named environment the call is right and the account is not ready:
+ * `core/precondition_failed`, exit 3, with the provisioning command as its `fix` — none for a production
+ * environment, whose provisioning needs a person's `--confirm` phrase (see {@link withProvisionFix}). For a
+ * bare deploy or `--env dev` the call itself aimed at a stanza that never has resources: a usage error,
+ * exit 2. `productionEnvironments` is the project's `seed.productionEnvironments`.
  */
-export async function assertEnvironmentProvisioned(projectDir: string, env: string | undefined): Promise<void> {
+export async function assertEnvironmentProvisioned(
+  projectDir: string,
+  env: string | undefined,
+  productionEnvironments?: readonly string[],
+): Promise<void> {
   const missing = await unprovisionedBindings(projectDir, env);
   if (missing.length === 0) return;
   const stanza = env === undefined ? "The top-level stanza" : env;
-  throw new ValidationError({
+  const refusal = {
     message: `${stanza} declares bindings with no Cloudflare resource behind them: ${describeUnprovisioned(missing)}.`,
-    action: remedy(env),
+    action: remedy(env, productionEnvironments),
     detail: `A deploy runs wrangler with ${NO_PROVISION_ARG}, so a binding with no id fails inside wrangler rather than creating a resource.`,
-  });
+  };
+  if (env === undefined || env === LOCAL_ENVIRONMENT) throw new ValidationError(refusal);
+  throw withProvisionFix(new PreconditionFailedError(refusal), env, productionEnvironments);
 }

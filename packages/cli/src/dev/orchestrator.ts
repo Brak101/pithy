@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
-import { spawn as spawnChild } from "node:child_process";
+import { commandAlternatives, commandName, pithyCommand } from "@pithy-sh/core/src/cli/command";
 import { isContinuousIntegration } from "@pithy-sh/core/src/env/ci";
 import { messageOf, ValidationError } from "@pithy-sh/core/src/error/pithyError";
 import { LOCAL_ENVIRONMENT } from "@pithy-sh/core/src/naming/environment";
 import type { DevLogin, DevLogins } from "@pithy-sh/core/src/seed/devLogin";
-import { findEntitlementGap } from "../capabilities/entitlementGap";
+import { findEntitlementGap, providerExample } from "../capabilities/entitlementGap";
 import type { CloudflareAccountSelection } from "../cloudflare/config";
 import { type GenerateDevVarsResult, generateDevVars } from "../devSecrets/generate";
 import { renderDevSecretsNotes, renderDevVarsNotes } from "../devSecrets/report";
@@ -35,9 +35,11 @@ import {
 import { heldReservations } from "../feature/prune";
 import { currentBranch, defaultGit } from "../feature/worktree";
 import { openUrl as openUrlDefault } from "../platform/browser";
+import { spawnCommand } from "../platform/command";
 import { composeFor } from "../project/composeFor";
 import { allCapabilities } from "../project/config";
 import { detectPackageManager, execArgs } from "../project/packageManager";
+import { workerDirName } from "../project/workerIdentity";
 import { defaultWorkerDev } from "../project/workerManifest";
 import { discoverWorkers as discoverWorkersDefault, type WorkerTarget } from "../project/workers";
 import { type KeyReader, readKeys as readKeysDefault } from "../terminal/keys";
@@ -360,7 +362,7 @@ const realSleep: Sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms
 
 /** The real spawn: a group-leader child (POSIX `setsid` via `detached`) with piped stdout/stderr. */
 const spawnDefault: SpawnDev = (command, args, options) =>
-  spawnChild(command, args, {
+  spawnCommand(command, args, {
     cwd: options.cwd,
     env: options.env,
     detached: options.detached,
@@ -584,10 +586,10 @@ export async function startDev(options: StartDevOptions): Promise<DevHandle> {
   const loadDevConfig = options.loadDevConfig ?? ((dir: string) => readDevConfig(devConfigPath(dir)));
   const bind = options.tryBind ?? tryBindDefault;
   const spawn = options.spawn ?? spawnDefault;
-  const kill = options.kill ?? ((pid, signal) => process.kill(pid, signal));
   const isAlive = options.isAlive ?? isAliveDefault;
   const sleep = options.sleep ?? realSleep;
   const hasSetsid = options.hasSetsid ?? process.platform !== "win32";
+  const kill = options.kill ?? ((pid, signal) => process.kill(pid, signal));
   const stdout = options.stdout ?? ((text: string) => void process.stdout.write(text));
   const stderr = options.stderr ?? ((text: string) => void process.stderr.write(text));
   const readDevLogins = options.readDevLogins ?? readDevLoginsDefault;
@@ -680,7 +682,10 @@ export async function startDev(options: StartDevOptions): Promise<DevHandle> {
   if (selected.length === 0) {
     throw new ValidationError({
       message: "No autostart workers to run.",
-      action: "Add one with pithy worker add, or re-enable one with pithy dev --app <name> --enable-autostart.",
+      action:
+        discovered.length === 0
+          ? `Name a Worker and create it with ${commandName("worker add")}.`
+          : `Re-enable one: ${commandAlternatives(discovered.map((worker) => pithyCommand("dev", { flags: { "--app": worker.name, "--enable-autostart": true } })))}.`,
     });
   }
 
@@ -758,7 +763,7 @@ export async function startDev(options: StartDevOptions): Promise<DevHandle> {
     if (!pinned) {
       throw new ValidationError({
         message: `Worker "${member.worker.name}" has no port in .dev.config.json.`,
-        action: "Delete .dev.config.json and run pithy dev again to reassign this project's ports.",
+        action: "Delete .dev.config.json and run this again to reassign this project's ports.",
       });
     }
     roster.push({
@@ -1516,7 +1521,7 @@ export async function startDev(options: StartDevOptions): Promise<DevHandle> {
     if (gates.length === 0) continue;
     emitLine(`${worker.name}: routes gate on an entitlement, but no capability resolves one — they will deny.`);
     for (const gate of gates) emitLine(dim(`  ${gate}`));
-    emitLine(dim("  run: pithy add payments"));
+    emitLine(dim(`  ${providerExample(workerDirName(worker))}`));
   }
 
   // Secrets are seeded before anything spawns, for the same reason the `.dev.vars` link is wired before

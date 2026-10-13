@@ -7,25 +7,38 @@ import { CONFIG_SEAMS } from "@pithy-sh/core/src/capability/manifest";
 import { ValidationError } from "@pithy-sh/core/src/error/pithyError";
 import { LOCAL_ENVIRONMENT } from "@pithy-sh/core/src/naming/environment";
 import { defineCommand } from "citty";
+import { z } from "zod";
 import { type CliAuditEmit, type CreateCliAuditOptions, createRemoteCliAudit } from "../audit/cliAudit";
 import type { ConfigValue } from "../capabilities/add";
-import { buildCatalogListing } from "../capabilities/catalog";
+import { addListCommand } from "../capabilities/addCommand";
+import { addFollowUp, readyEnvironments } from "../capabilities/addFollowUp";
+import { buildCatalogListing, CATALOG } from "../capabilities/catalog";
+import { EjectResult } from "../capabilities/eject";
 import {
   type ConfigPrompt,
   coerceConfigValue,
   collectSetFlags,
   isHandWritten,
   type PrerequisitePrompt,
+  type RunAddOptions,
   runAdd,
 } from "../capabilities/flow";
-import { availableManifests } from "../capabilities/manifests";
+import { availableManifests, ManifestFault } from "../capabilities/manifests";
+import { type AddPlan, planAdd } from "../capabilities/planAdd";
 import { requiredOptionRefusal } from "../capabilities/requiredOptions";
 import { cloudflareClients } from "../cloudflare/clients";
 import { type CloudflareAccountSelection, cloudflareEnv } from "../cloudflare/config";
-import type { DatabaseRun } from "../migrations/run";
+import { withContract } from "../contract/commandContract";
+import { DatabaseRun } from "../migrations/run";
+import { DRY_RUN_ARG, PlanKey, planText } from "../plan/plan";
+import { ProposedName } from "../project/bindingEntries";
 import { resolveSingleWorkerFor } from "../project/composeFor";
 import { loadProject, projectCloudflareAccount, requireProjectName } from "../project/config";
+import { WorkerIdentity } from "../project/workerIdentity";
 import type { ResolvedWorker, ResolveOptions } from "../project/workerScope";
+import { canceled } from "../terminal/exitClass";
+import { mayPrompt } from "../terminal/inputMode";
+import { NextKey } from "../terminal/nextSteps";
 import { formatDone, formatJsonLine, formatList, withErrorReporting } from "../terminal/output";
 
 /** What {@link buildAudit} needs, plus the factory seam a test observes. */
@@ -80,7 +93,7 @@ export async function buildAudit(options: BuildAuditOptions): Promise<CliAuditEm
 
 /**
  * Pick the Worker interactively when a project has several and none was named. Supplied only when a
- * human is attached — an agent run (`--json`, no TTY) gets the actionable error from
+ * human is attached — an agent run (`--json`, `--no-input`, no TTY) gets the `input/required` error from
  * {@link resolveSingleWorker} instead of a prompt it cannot answer.
  */
 export async function promptWorker(choices: ResolvedWorker[]): Promise<string> {
@@ -89,10 +102,7 @@ export async function promptWorker(choices: ResolvedWorker[]): Promise<string> {
     message: "Which worker?",
     options: choices.map((choice) => ({ value: choice.name, label: choice.name })),
   });
-  if (isCancel(answer)) {
-    process.stderr.write("Canceled.\n");
-    process.exit(1);
-  }
+  if (isCancel(answer)) canceled();
   return answer as string;
 }
 
@@ -249,10 +259,7 @@ const promptConfigValues: ConfigPrompt = async (manifest, provided) => {
             ? {}
             : { defaultValue: String(option.default), placeholder: String(option.default) }),
         });
-    if (isCancel(answer)) {
-      process.stderr.write("Canceled.\n");
-      process.exit(1);
-    }
+    if (isCancel(answer)) canceled();
     // An unanswered required option is refused rather than written. `text` returns "" for a bare enter and
     // `select` returns the sentinel, and both mean the same thing: nobody chose. Writing either would put
     // an empty key into the adopter's config for them to find later — which is worse than the question.
@@ -277,128 +284,245 @@ const promptPrerequisites: PrerequisitePrompt = async ({ capability, missing }) 
   const answer = await confirm({
     message: `${capability} requires ${missing.join(", ")}. Compose ${one ? "it" : "them"} too?`,
   });
-  if (isCancel(answer)) {
-    process.stderr.write("Canceled.\n");
-    process.exit(1);
-  }
+  if (isCancel(answer)) canceled();
   return answer === true;
 };
 
-export default defineCommand({
-  meta: { name: "add", description: "Add a capability" },
-  args: {
-    // Optional so `pithy add --list` runs without a capability.
-    capability: { type: "positional", required: false, description: "Capability name, e.g. auth" },
-    list: { type: "boolean", default: false, description: "List the capabilities you can add" },
-    worker: { type: "string", description: "Which worker to wire it into (apps/<name>)" },
-    set: { type: "string", description: "Override a config option: --set key=value (repeatable)" },
-    eject: {
-      type: "boolean",
-      default: false,
-      description: "Copy the capability's source into your repo and own it (no upgrades)",
-    },
-    force: {
-      type: "boolean",
-      default: false,
-      description: "With --eject, overwrite an existing local copy (discards edits)",
-    },
-    "with-prerequisites": {
-      type: "boolean",
-      default: false,
-      description: "Compose the capabilities this one requires, if they aren't composed yet",
-    },
-    json: { type: "boolean", default: false, description: "Machine-readable output" },
-  },
-  // `ctx` over `{ args }`: repeated `--set` only survives in rawArgs (citty keeps
-  // the last value of a repeated string flag), so collectSetFlags reads it there.
-  run: ({ args, rawArgs }) =>
-    withErrorReporting(args.json, async () => {
-      const projectDir = process.cwd();
-      if (args.list) {
-        await listCapabilities(projectDir, args.json);
-        return;
-      }
-      if (!args.capability) {
-        throw new ValidationError({
-          message: "Name a capability to add.",
-          action: "Run pithy add --list to see what's available.",
-        });
-      }
+/**
+ * The prompts `pithy add` hands the add flow: both when this run may ask (`terminal/inputMode.ts`), neither
+ * when it may not. The flow asks only through what it is handed, so with neither it reaches its own
+ * refusals instead — `input/required`, naming `--set` for a required option and `--with-prerequisites`
+ * for a missing prerequisite (#697).
+ */
+export function addPrompts(interactive: boolean): Pick<RunAddOptions, "prompt" | "askPrerequisites"> {
+  return interactive ? { prompt: promptConfigValues, askPrerequisites: promptPrerequisites } : {};
+}
 
-      const interactive = !args.json && Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
-      // Which Worker gets the wiring. One worker needs no ceremony; several never guess. Composed for dev,
-      // because what is read off it is dev's: the audit below names dev, and the migrate add finishes with
-      // is dev's. The wiring itself is file edits, composed by the add flow for itself.
-      const target = await targetWorker(LOCAL_ENVIRONMENT, {
-        projectDir,
-        interactive,
-        ...(args.worker === undefined ? {} : { worker: args.worker }),
-      });
+/**
+ * `pithy add --dry-run`, for a person: the prerequisites it would compose, the plan, and what the
+ * capability needs that only provisioning supplies — the same notes the real add prints.
+ */
+export function addPlanText(planned: AddPlan): string[] {
+  const lines: string[] = [];
+  if (planned.prerequisites.length > 0) {
+    lines.push(`Would compose ${planned.prerequisites.join(", ")} into ${planned.worker} first.`);
+  }
+  lines.push(`Would wire ${planned.capability} into ${planned.worker}.`);
+  lines.push(...planText(planned.plan), ...planned.notes, "Dry run. Nothing written.");
+  return lines;
+}
 
-      // Resolved once and used three times over: the store id `add secrets` records, the migrate it
-      // finishes with, and the audit trail. Every one of them belongs to the account this project names
-      // rather than to whichever `cloudflare.json` the machine happens to hold (#234).
-      const account = await projectCloudflareAccount(projectDir);
+const AddCommand = z.literal("add").describe('`"add"`.');
 
-      const result = await runAdd({
-        projectDir,
-        workerDir: target.dir,
-        worker: target.name,
-        project: await proposalProject(projectDir),
-        account,
-        capability: args.capability,
-        setFlags: collectSetFlags(rawArgs),
-        prompt: interactive ? promptConfigValues : undefined,
-        withPrerequisites: args["with-prerequisites"],
-        askPrerequisites: interactive ? promptPrerequisites : undefined,
-        eject: args.eject,
-        force: args.force,
-        audit: await buildAudit({
+/** `pithy add --json`: the catalog under `--list`, or what one add wired. `docs/commands/add.md`. */
+const AddPayload = z
+  .union([
+    z
+      .object({
+        command: AddCommand,
+        capabilities: z
+          .array(
+            z
+              .object({
+                name: z.string().describe("The capability name — the `pithy add <name>` argument."),
+                package: z.string().describe("The npm package it ships in."),
+                whenToEnable: z.string().describe("One line: why a project would enable it."),
+                installed: z.boolean().describe("Whether this project holds a usable manifest for it."),
+              })
+              .describe("One catalog entry."),
+          )
+          .describe("The built-in catalog, in catalog order, each entry tagged with whether it is installed."),
+        manifestFaults: z
+          .array(ManifestFault)
+          .describe("Installed packages whose manifest is present and unusable. Empty on a healthy install."),
+      })
+      .describe("`pithy add --list --json`."),
+    z
+      .object({
+        command: AddCommand,
+        dryRun: z.boolean().describe("Whether this was `--dry-run`. Nothing was written when it is `true`."),
+        ...WorkerIdentity.shape,
+        capability: z.string().describe("The capability's name, from its manifest."),
+        package: z.string().describe("The npm package the capability ships in."),
+        packageManager: z.string().describe("The project's package manager: `npm`, `pnpm`, `yarn` or `bun`."),
+        databases: z
+          .array(DatabaseRun)
+          .describe("The dev migration run, one entry per database touched. Empty under `--dry-run`, which runs none."),
+        kvNamespaces: z
+          .array(ProposedName)
+          .describe("KV namespace titles to create, one per environment that gained the binding."),
+        notes: z
+          .array(z.string().describe("One note."))
+          .describe("What add finished off-config, and what only a provision command can supply."),
+        prerequisites: z
+          .array(z.string().describe("A capability name."))
+          .describe("The capabilities composed on the way to this one, deepest first."),
+        eject: EjectResult.optional().describe("Present only when `--eject` ran, or under `--dry-run` would."),
+        plan: PlanKey,
+        next: NextKey,
+      })
+      .describe("`pithy add <capability> --json`."),
+  ])
+  .describe("What `pithy add --json` writes.");
+
+export default withContract(
+  defineCommand({
+    meta: { name: "add", description: "Add a capability" },
+    args: {
+      // Optional so `pithy add --list` runs without a capability.
+      capability: { type: "positional", required: false, description: "Capability name, e.g. auth" },
+      list: { type: "boolean", default: false, description: "List the capabilities you can add" },
+      worker: { type: "string", description: "Which worker to wire it into (apps/<name>)" },
+      set: { type: "string", description: "Override a config option: --set key=value (repeatable)" },
+      eject: {
+        type: "boolean",
+        default: false,
+        description: "Copy the capability's source into your repo and own it (no upgrades)",
+      },
+      force: {
+        type: "boolean",
+        default: false,
+        description: "With --eject, overwrite an existing local copy (discards edits)",
+      },
+      "with-prerequisites": {
+        type: "boolean",
+        default: false,
+        description: "Compose the capabilities this one requires, if they aren't composed yet",
+      },
+      "dry-run": DRY_RUN_ARG,
+      json: { type: "boolean", default: false, description: "Machine-readable output" },
+    },
+    // `ctx` over `{ args }`: repeated `--set` only survives in rawArgs (citty keeps
+    // the last value of a repeated string flag), so collectSetFlags reads it there.
+    run: ({ args, rawArgs }) =>
+      withErrorReporting(args.json, async () => {
+        const projectDir = process.cwd();
+        if (args.list) {
+          await listCapabilities(projectDir, args.json);
+          return;
+        }
+        if (!args.capability) {
+          throw new ValidationError({
+            message: "Name a capability to add.",
+            action: `Run ${addListCommand()} to see what's available.`,
+          });
+        }
+
+        const interactive = mayPrompt(args.json);
+        // Which Worker gets the wiring. One worker needs no ceremony; several never guess. Composed for dev,
+        // because what is read off it is dev's: the audit below names dev, and the migrate add finishes with
+        // is dev's. The wiring itself is file edits, composed by the add flow for itself.
+        const target = await targetWorker(LOCAL_ENVIRONMENT, {
           projectDir,
-          account,
-          worker: target.name,
-          env: "dev",
-          capabilities: target.capabilities,
-        }),
-      });
+          interactive,
+          ...(args.worker === undefined ? {} : { worker: args.worker }),
+        });
 
-      if (args.json) {
-        process.stdout.write(`${formatJsonLine({ command: "add", ...result })}\n`);
-        return;
-      }
-      // Said first, because it happened first, and because a capability composed on the adopter's behalf
-      // is the one thing in this output they did not type.
-      if (result.prerequisites.length > 0) {
-        process.stdout.write(
-          `Composed ${result.prerequisites.join(", ")} into ${result.worker} first — ${result.capability} requires ${result.prerequisites.length === 1 ? "it" : "them"}.\n`,
-        );
-      }
-      process.stdout.write(`Wired ${result.capability} into ${result.worker}.\n`);
-      for (const run of result.databases) {
-        process.stdout.write(`${describeRun(run)}\n`);
-      }
-      // KV titles are printed rather than written: a `kv_namespaces` entry has no title field, so the
-      // only place the name can land is the account. D1's went into wrangler.jsonc as `database_name`.
-      for (const kv of result.kvNamespaces) {
-        process.stdout.write(`Name the ${kv.binding} namespace for ${kv.env}: ${kv.name}\n`);
-      }
-      // What add finished off-config, and what only a provision command can supply. Printed here, at
-      // the moment the adopter is thinking about the capability — not left to the first 500.
-      for (const note of result.notes) {
-        process.stdout.write(`${note}\n`);
-      }
-      if (result.eject) {
-        // The fork lands beside the Worker's config, so report it project-relative: apps/<worker>/capabilities/<cap>.
-        const path = relative(projectDir, join(target.dir, result.eject.path));
-        process.stdout.write(
-          `Ejected ${result.capability} into ${path}/. It's yours now — ${result.package} no longer upgrades it.\n`,
-        );
-        if (result.eject.promotedDependencies.length > 0) {
+        // Resolved once and used three times over: the store id `add secrets` records, the migrate it
+        // finishes with, and the audit trail. Every one of them belongs to the account this project names
+        // rather than to whichever `cloudflare.json` the machine happens to hold (#234).
+        const account = await projectCloudflareAccount(projectDir);
+
+        const options: RunAddOptions = {
+          projectDir,
+          workerDir: target.dir,
+          worker: target.name,
+          project: await proposalProject(projectDir),
+          account,
+          capability: args.capability,
+          setFlags: collectSetFlags(rawArgs),
+          ...addPrompts(interactive),
+          withPrerequisites: args["with-prerequisites"],
+          eject: args.eject,
+          force: args.force,
+          json: args.json,
+          // The project's own production names, so a provision a note names for one is said as a person's decision.
+          productionEnvironments: (await loadProject(projectDir).catch(() => null))?.seed?.productionEnvironments ?? [],
+        };
+
+        if (args["dry-run"]) {
+          const planned = await planAdd(options);
+          if (args.json) {
+            process.stdout.write(`${formatJsonLine({ command: "add", dryRun: true, ...planned })}\n`);
+            return;
+          }
+          for (const line of addPlanText(planned)) process.stdout.write(`${line}\n`);
+          return;
+        }
+
+        // Read before the add writes anything, so its own bindings cannot hide which environments were ready.
+        // Only `--json` carries `next`, so only `--json` reads it (#697).
+        const ready = args.json ? await readyEnvironments({ projectDir }).catch(() => []) : [];
+        // The project's own production names, so a step whose provision needs a person's phrase is not one.
+        const productionEnvironments = options.productionEnvironments;
+
+        const result = await runAdd({
+          ...options,
+          audit: await buildAudit({
+            projectDir,
+            account,
+            worker: target.name,
+            env: "dev",
+            capabilities: target.capabilities,
+          }),
+        });
+
+        if (args.json) {
+          const next = await addFollowUp({
+            projectDir,
+            account,
+            worker: result.worker,
+            capability: result.capability,
+            ready,
+            productionEnvironments,
+            brought: result.databases.some((run) => run.results.some((one) => one.status === "Success")),
+          });
+          process.stdout.write(`${formatJsonLine({ command: "add", dryRun: false, ...result, next })}\n`);
+          return;
+        }
+        // Said first, because it happened first, and because a capability composed on the adopter's behalf
+        // is the one thing in this output they did not type.
+        if (result.prerequisites.length > 0) {
           process.stdout.write(
-            `Promoted ${result.eject.promotedDependencies.length} dependencies. ${result.package} is safe to remove.\n`,
+            `Composed ${result.prerequisites.join(", ")} into ${result.worker} first — ${result.capability} requires ${result.prerequisites.length === 1 ? "it" : "them"}.\n`,
           );
         }
-      }
-      process.stdout.write(`${formatDone()}\n`);
-    }),
-});
+        process.stdout.write(`Wired ${result.capability} into ${result.worker}.\n`);
+        for (const run of result.databases) {
+          process.stdout.write(`${describeRun(run)}\n`);
+        }
+        // KV titles are printed rather than written: a `kv_namespaces` entry has no title field, so the
+        // only place the name can land is the account. D1's went into wrangler.jsonc as `database_name`.
+        for (const kv of result.kvNamespaces) {
+          process.stdout.write(`Name the ${kv.binding} namespace for ${kv.env}: ${kv.name}\n`);
+        }
+        // What add finished off-config, and what only a provision command can supply. Printed here, at
+        // the moment the adopter is thinking about the capability — not left to the first 500.
+        for (const note of result.notes) {
+          process.stdout.write(`${note}\n`);
+        }
+        if (result.eject) {
+          // The fork lands beside the Worker's config, so report it project-relative: apps/<worker>/capabilities/<cap>.
+          const path = relative(projectDir, join(target.dir, result.eject.path));
+          process.stdout.write(
+            `Ejected ${result.capability} into ${path}/. It's yours now — ${result.package} no longer upgrades it.\n`,
+          );
+          if (result.eject.promotedDependencies.length > 0) {
+            process.stdout.write(
+              `Promoted ${result.eject.promotedDependencies.length} dependencies. ${result.package} is safe to remove.\n`,
+            );
+          }
+        }
+        process.stdout.write(`${formatDone()}\n`);
+      }),
+  }),
+  {
+    output: "document",
+    schemaVersion: 1,
+    payload: AddPayload,
+    mutates: true,
+    idempotent: true,
+    needsNetwork: true,
+    flags: { capability: { enum: CATALOG.map((entry) => entry.name) }, set: { repeatable: true } },
+  },
+);

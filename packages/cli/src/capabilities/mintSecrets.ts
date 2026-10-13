@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import type { CreateSecretOutcome } from "@pithy-sh/cloudflare/src/secrets/secretsStoreManager";
+import { personDecision } from "@pithy-sh/core/src/cli/command";
 import { ConflictError, InternalError } from "@pithy-sh/core/src/error/pithyError";
 import type { DeclaredEnvironments } from "@pithy-sh/core/src/naming/environment";
 import type { SecretDispatcher, SecretProbe } from "@pithy-sh/secrets/src/cli/dispatch";
@@ -11,7 +12,8 @@ import { initialDevSecret } from "@pithy-sh/secrets/src/dev/devSecretsFile";
 import { devSecretPayload } from "@pithy-sh/secrets/src/dev/seedDevSecrets";
 import { mintSecretValue } from "@pithy-sh/secrets/src/mintValue";
 import { isMintableSecret, type SecretRegistry, type SecretRegistryEntry } from "@pithy-sh/secrets/src/registry";
-import type { ManagedEnvironment } from "@pithy-sh/secrets/src/scope";
+import { ManagedEnvironment } from "@pithy-sh/secrets/src/scope";
+import { z } from "zod";
 import type { CliAuditEmit } from "../audit/cliAudit";
 import type { MintedThisRunSink } from "../provision/mintedThisRun";
 import type { MintStoreSecret } from "../provision/secretBindings";
@@ -133,21 +135,25 @@ export function storeSecretMinter(options: {
   };
 }
 
-/** One secret this run accounted for: where it belongs, and where this run actually created it. */
-export interface MintedSecret {
-  /** The secret's registry name. Never its value. */
-  name: string;
-  /** The environments the secret belongs in — one for an `environment` secret, all for a `global` one. */
-  environments: ManagedEnvironment[];
-  /**
-   * The environments this run **created** it in, which is empty on every run after the first.
-   *
-   * Separate from {@link environments} because the two used to be one field saying only where a request
-   * was sent, and "sent" is not "made". A report that cannot tell a creation from a no-op is a report an
-   * operator cannot use to answer *did this run generate a production signing key*.
-   */
-  created: ManagedEnvironment[];
-}
+/**
+ * One secret this run accounted for: where it belongs, and where this run actually created it. The `--json`
+ * payloads state it with this schema, and the code reads its type, so the two cannot disagree.
+ */
+export const MintedSecret = z
+  .object({
+    name: z.string().describe("The secret's registry name. Never its value."),
+    environments: z
+      .array(ManagedEnvironment.describe("An environment."))
+      .describe("The environments it belongs in — one for an `environment` secret, all for a `global` one."),
+    // Separate from `environments` because the two used to be one field saying only where a request was sent,
+    // and "sent" is not "made". A report that cannot tell a creation from a no-op is a report an operator
+    // cannot use to answer *did this run generate a production signing key*.
+    created: z
+      .array(ManagedEnvironment.describe("An environment."))
+      .describe("The environments this run created it in. Empty on every run after the first."),
+  })
+  .describe("One `d1` secret a run accounted for. Names, never a value.");
+export type MintedSecret = z.infer<typeof MintedSecret>;
 
 /**
  * What a run reports about the secrets it accounted for, one line each — names and environments, never
@@ -302,7 +308,7 @@ export async function mintDeclaredSecrets(options: {
         // it is stated plainly with its cost rather than offered second as the safer-looking option.
         throw new ConflictError({
           message: `Secret '${name}' is global, and only some environments have it.`,
-          action: `Its value cannot be copied to ${absent.join(", ")} — it is sealed under a master key no command can read. Remove it everywhere with pithy secrets rm ${name}, then run this again. That destroys a live key: everything signed by the value ${present.join(", ")} holds stops verifying.`,
+          action: `Its value cannot be copied to ${absent.join(", ")} — it is sealed under a master key no command can read. The one way through is to remove it everywhere and run this again. ${personDecision("secrets rm", { args: [name] })} It destroys a live key: everything signed by the value ${present.join(", ")} holds stops verifying.`,
           detail: `global secret '${name}': present in ${present.join(", ")}, absent in ${absent.join(", ")}`,
         });
       }

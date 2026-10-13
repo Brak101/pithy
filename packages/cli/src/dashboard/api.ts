@@ -130,12 +130,15 @@ function transportCode(error: unknown): string | undefined {
  * the abort is identified by `name`, and undici buries the errno in `cause`, so nothing here may lean on
  * `instanceof` — the CLI ships on Bun, whose transport errors are not node's classes.
  *
- * **The two runtimes do not classify the same failure the same way, and this was checked rather than
+ * **The two runtimes do not report the same failure the same way, and this was checked rather than
  * assumed.** Node wraps in a `TypeError: fetch failed` and puts `ENOTFOUND` or `ECONNREFUSED` on the
- * `cause`; Bun throws a plain `Error` and reports a dead host, a bogus TLD and a refused port all as one
- * `code: "ConnectionRefused"`. Bun cannot tell those two apart — so on Bun this must not either, and its
- * branch names both possibilities. Node keeps the sharper split it has earned. Both verified live
- * against Bun 1.3.14 and Node 22; TLS is the one place the codes already agree.
+ * `cause`. Bun throws a `TypeError` with the code on the error itself: `ENOTFOUND` for a host that does
+ * not resolve, and its own `ConnectionRefused` for a port nobody is listening on. Verified live against
+ * Bun 1.4.2 and Node 24; TLS is the one place the codes already agree.
+ *
+ * Bun 1.3 reported a dead host, a bogus TLD and a refused port all as `ConnectionRefused`, so this branch
+ * used to hedge across both. 1.4 split them, and the kit reads 1.4 (#709), so `ConnectionRefused` now
+ * means what `ECONNREFUSED` means. `FailedToOpenSocket` was not reproduced on 1.4.2, so it keeps the hedge.
  */
 function transportAction(error: unknown, origin: string, timeoutMs: number): string {
   if (prop(error, "name") === "AbortError" || prop(error, "name") === "TimeoutError") {
@@ -147,9 +150,9 @@ function transportAction(error: unknown, origin: string, timeoutMs: number): str
     case "EAI_AGAIN":
       return `That host does not resolve. Check the origin with --origin (currently ${origin}).`;
     case "ECONNREFUSED":
-      return `Nothing is listening at ${origin}. Start it, or point --origin somewhere that is.`;
-    // Bun's own codes. One of them covers what node splits in two, so the sentence covers both.
     case "ConnectionRefused":
+      return `Nothing is listening at ${origin}. Start it, or point --origin somewhere that is.`;
+    // Bun's own code for a socket it could not open. Not reproduced on 1.4.2, so it names both causes.
     case "FailedToOpenSocket":
       return `Nothing at ${origin} answered. Check that it is listening, and that the origin is right (--origin).`;
     case "ConnectionClosed":
@@ -170,7 +173,8 @@ function transportAction(error: unknown, origin: string, timeoutMs: number): str
 /** What to tell an operator about a status the client itself returned — reachable, and refusing. */
 function statusAction(status: number): string {
   if (status === 401 || status === 403) {
-    return "Sign in again with pithy login — that credential was refused, not the request.";
+    // Every dashboard command signs in for itself, by device code: there is no separate sign-in command.
+    return "That sign-in was refused, not the request. Run the command again to sign in afresh.";
   }
   if (status === 404) return "That route is not on this management client. Check the origin with --origin.";
   if (status === 429) return "Rate limited. Wait, then run the command again.";

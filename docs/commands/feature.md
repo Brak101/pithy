@@ -30,7 +30,7 @@ pithy feature prune [--dry-run] [--json]
 | `--branch <name>` | `destroy` | the checkout's own branch | The feature to tear down, named rather than inferred — `feature/<issue>-<slug>`. Only the issue and the slug come from it: the project is this checkout's, so it names a feature of this project and reaches no other's. The issue is canonical, so `feature/012-x` and `feature/12-x` are the same feature; a feature created under a padded issue is still found, because the local half tries the canonical spelling first and the one it was given second. Anything else is refused before anything is deleted |
 | `--env <environment>` | `destroy` | `feature` | The environment whose teardown is recorded on the audit trail. It never changes what is deleted: teardown deletes by recorded and recomputed feature name regardless |
 | `--local-only` | `destroy` | `false` | Tear down only the worktree and its ports, leaving the Cloudflare resources in place |
-| `--dry-run` | `prune` | `false` | List the blocks it would free, and write nothing |
+| `--dry-run` | `prune` | `false` | Show the plan and write nothing. Lists the blocks it would free |
 | `--json` | all four | `false` | One line of machine-readable output |
 
 ## What it does
@@ -55,7 +55,7 @@ pithy feature prune [--dry-run] [--json]
 
 **It answers on its own `workers.dev` address and nothing else.** Its stanza states `routes: []`, because wrangler would otherwise hand it the top level's routes — a branch deploy taking the project's custom domain — and the run names the routes it gave up.
 
-**`destroy`** deletes the feature's Worker scripts, then its Cloudflare resources — each first from the worktree's manifest, then by recomputing every name the branch could have produced and deleting what still exists, with the capabilities composed for `feature`, the environment `provision --feature` composed them for — then frees the port block, prunes the worktree, and deletes the branch if it has been merged. That second pass is what catches a partly-failed `provision`.
+**`destroy`** deletes the feature's Worker scripts, then its Cloudflare resources — each first from the worktree's manifest, then by recomputing every name the branch could have produced and deleting what still exists, with the capabilities composed for `feature`, the environment `provision --feature` composed them for — then frees the port block, prunes the worktree and removes its directory, and deletes the branch if it has been merged. The directory is kept while a `pithy dev` session may still be running in it. That second pass is what catches a partly-failed `provision`.
 
 Every kit host the feature could have stood up is one of the scripts: `destroy` recomputes each name from the branch — for every host the registry knows, whatever the branch composes now, since a host deployed before its capability left the branch is still the feature's. **Their Workflows go first, explicitly**, found on the account by the exact name of the script that hosts them: Cloudflare documents that deleting a Workflow leaves its script alone, and says nothing of the reverse, so teardown does not rely on a script taking its Workflows with it. Then the feature's own Vectorize indexes, every store entry the feature named — a `global` secret's included. Its rate-limit namespaces are fixed per limiter and shared by every feature, so there is nothing of them to remove. There is no token to revoke. A feature provisioned by a release before the double hyphen in its names is destroyed with that release's CLI: its old names are exactly the ones another project could hold, so this one does not delete them.
 
@@ -65,7 +65,7 @@ Every kit host the feature could have stood up is one of the scripts: `destroy` 
 
 **One name it deployed under is not among them.** Before scripts were recorded, a feature with a Secrets Store had its generated config rewritten without the script name, and wrangler deployed it as `<script>-feature` — `acme-api-feature`. That name carries no issue and no slug, and every such branch of the project deployed over the same one, so no single feature's teardown can claim it: deleting it would take down whichever open branch deployed last. `destroy` leaves it and does not report it. Once no feature branch from before that fix is still deployed, delete it by hand with `wrangler delete --name <script>-feature`. Names are matched exactly, never by prefix, so a sibling feature whose slug extends this one's is left alone. A Worker removed from the branch after it deployed is found through the manifest instead, which keeps every script name a provision ever wrote.
 
-**`destroy` does not count retained rows.** A feature has its own copy of every `d1` binding, `SECRETS` and `EMAIL_SUPPRESSIONS` included, and `destroy` deletes them with the rest, rows and all. `pithy migrate --rollback`, `pithy secrets deprovision` and `pithy email deprovision --suppression` refuse over the same tables unless `--destroy-retained <n>` matches the count. `destroy` takes no such flag: the database is the branch's own, and the teardown runs headlessly when a branch merges, where nobody can type a count. Every name it deletes is recomputed from the feature's identity, so it never reaches a declared environment's database.
+**`destroy` does not count retained rows.** A feature has its own copy of every `d1` binding, `SECRETS` and `EMAIL_SUPPRESSIONS` included, and `destroy` deletes them with the rest, rows and all. `pithy migrate --rollback --group <value>`, `pithy secrets deprovision` and `pithy email deprovision --suppression` refuse over the same tables unless `--destroy-retained <n>` matches the count. `destroy` takes no such flag: the database is the branch's own, and the teardown runs headlessly when a branch merges, where nobody can type a count. Every name it deletes is recomputed from the feature's identity, so it never reaches a declared environment's database.
 
 **`destroy --branch` is how a merged pull request tears its own environment down.** Every other subcommand here infers the feature from the checkout, which is right for a developer and impossible for a runner: on `pull_request: closed` the branch is already deleted and `refs/pull/<n>/head` checks out detached, so there is no branch to read. The pipeline holds the name anyway — `github.event.pull_request.head.ref` is a snapshot in the event payload and outlives the branch it names — and this is how it says it. The name goes through the same parser the inferred path uses, so the two cannot disagree about what a feature is called, and the **project** still comes from this checkout's `pithy.config.ts`, which is what keeps the flag inside this project. With no `--branch`, nothing changes: the checkout's branch decides, exactly as before. `provision` and `create` take no such flag; teardown is the only half with a caller standing outside the worktree.
 
@@ -106,15 +106,17 @@ One line, one object, one shape per subcommand. The `command` field is the subco
 
 ```
 $ pithy feature create media-cli --issue 69 --json
-{"command":"feature.create","branch":"feature/69-media-cli","worktree":"/repo/.worktrees/69-media-cli","worktreeCreated":true,"dev":{"version":1,"branch":"feature/69-media-cli","ports":{"index":1,"base":8807,"size":20},"workers":{"api":{"port":8807,"origin":"http://localhost:8807"}}}}
+{"command":"feature.create","schemaVersion":1,"branch":"feature/69-media-cli","worktree":"/repo/.worktrees/69-media-cli","worktreeCreated":true,"dev":{"version":1,"branch":"feature/69-media-cli","ports":{"index":1,"base":8807,"size":20},"workers":{"api":{"port":8807,"origin":"http://localhost:8807"}}}}
 ```
 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"feature.create"` | The subcommand that produced the line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `branch` | `string` | The feature branch created or attached |
 | `worktree` | `string` | The absolute worktree path |
 | `worktreeCreated` | `boolean` | Whether a new worktree was created. False on an idempotent re-run over an existing one |
+| `base` | `string \| null` | The ref the branch was cut from — the trunk's name, or `"HEAD"`. `null` when nothing was cut: an already-registered worktree, or a branch that already existed and was attached to |
 | `behindRemote` | `number \| null` | How many commits local `main` is behind `origin/main`, or null when it is level, has no remote, or the repository has no local `main`. The branch is cut from **local** `main` either way — this reports it rather than refusing |
 | `dev` | `object` | The feature's dev config — the document written to the worktree's `.dev.config.json` |
 | `dev.version` | `1` | Dev-config schema version |
@@ -129,12 +131,13 @@ $ pithy feature create media-cli --issue 69 --json
 
 ```
 $ pithy feature sync --json
-{"command":"feature.sync","branch":"feature/69-media-cli","block":{"block":1,"base":8807,"size":20},"dev":{…},"addedWorkers":["web"],"removedWorkers":[],"data":true}
+{"command":"feature.sync","schemaVersion":1,"branch":"feature/69-media-cli","block":{"block":1,"base":8807,"size":20},"dev":{…},"addedWorkers":["web"],"removedWorkers":[],"data":true}
 ```
 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"feature.sync"` | The subcommand that produced the line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `branch` | `string` | The feature branch |
 | `block` | `object` | The feature's reserved port block, as the central registry holds it |
 | `block.block` | `number` | The block index, 0-based |
@@ -151,12 +154,13 @@ The payload for a feature's Cloudflare environment is [`provision.md`](provision
 
 ```
 $ pithy feature destroy --json
-{"command":"feature.destroy","deletedResources":[{"kind":"worker","name":"acme-f69-media-cli--api","id":"acme-f69-media-cli--api"},{"kind":"d1","name":"acme-f69-media-cli--db-d1","id":"…"}],"remote":true,"portsFreed":true,"branch":"feature/69-media-cli","worktreePruned":true,"branchDeleted":false,"manifestRead":true,"manifestPath":"/repo/.worktrees/69-media-cli/.pithy-feature.json"}
+{"command":"feature.destroy","schemaVersion":1,"deletedResources":[{"kind":"worker","name":"acme-f69-media-cli--api","id":"acme-f69-media-cli--api"},{"kind":"d1","name":"acme-f69-media-cli--db-d1","id":"…"}],"remote":true,"portsFreed":true,"branch":"feature/69-media-cli","worktreePruned":true,"branchDeleted":false,"manifestRead":true,"manifestPath":"/repo/.worktrees/69-media-cli/.pithy-feature.json"}
 ```
 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"feature.destroy"` | The subcommand that produced the line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `deletedResources` | `object[]` | Every Worker script and Cloudflare resource deleted, from the manifest and from the name reconcile, scripts first. Empty when nothing remained, or when the remote half was skipped |
 | `deletedResources[].kind` | `"worker" \| "d1" \| "kv" \| "r2"` | The resource kind. `worker` is a Worker script |
 | `deletedResources[].name` | `string` | The resource name |
@@ -168,16 +172,17 @@ $ pithy feature destroy --json
 | `manifestPath` | `string` | Where that manifest is — read, or merely named when `manifestRead` is `false` |
 | `worktreePruned` | `boolean` | Whether a registered worktree was pruned |
 | `branchDeleted` | `boolean` | Whether the feature branch was deleted. Only when it has been merged |
-| `interrupted` | `boolean` | Present and `true` only on a teardown that failed partway (#380). It says `deletedResources` is a record of what went before the failure rather than of the whole teardown, and that `portsFreed`, `worktreePruned` and `branchDeleted` are all `false` because the local half deliberately did not run — the worktree is where the re-run happens from, and the manifest naming what is left lives in it. The failure itself is the `{"error":{…}}` line on stderr, and the exit is 1 |
+| `interrupted` | `boolean` | Present and `true` only on a teardown that failed partway (#380). It says `deletedResources` is a record of what went before the failure rather than of the whole teardown, and that `portsFreed`, `worktreePruned` and `branchDeleted` are all `false` because the local half deliberately did not run — the worktree is where the re-run happens from, and the manifest naming what is left lives in it. The failure itself is the `{"error":{…}}` line on stderr, and the exit is non-zero by the failure's kind (`docs/CLI.md` §3.8) |
 
 ```
 $ pithy feature prune --json
-{"command":"feature.prune","root":"/repo","dryRun":false,"freedBlocks":[{"branch":"feature/70-old-idea","block":2,"base":8827,"size":20}]}
+{"command":"feature.prune","schemaVersion":1,"root":"/repo","dryRun":false,"freedBlocks":[{"branch":"feature/70-old-idea","block":2,"base":8827,"size":20}]}
 ```
 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"feature.prune"` | The subcommand that produced the line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `root` | `string` | The main checkout root whose blocks were judged — the registry key they are filed under |
 | `dryRun` | `boolean` | Whether this was `--dry-run`. Nothing was written when it is `true` |
 | `freedBlocks` | `object[]` | The blocks freed, in port order — or under `--dry-run`, the blocks that would be. Empty when every block is held |
@@ -185,12 +190,13 @@ $ pithy feature prune --json
 | `freedBlocks[].block` | `number` | The block index, 0-based |
 | `freedBlocks[].base` | `number` | The first port in the block |
 | `freedBlocks[].size` | `number` | How many ports the block spans |
+| `plan` | `object` | Present only under `--dry-run`, in the shape every `--dry-run` shares (`docs/CLI.md` §1.2): one `edit` of the machine's port registry — its absolute path, since it lives outside every project — with a change per block it would free. Empty when every block is held |
 
 A teardown deletes real infrastructure one resource at a time, with no transaction across them. So a failure on the fourth delete still fails the command, and stdout still names the three that went: an operator finishing the teardown by hand needs the record more on that run than on the one that worked.
 
 ## Errors
 
-Each one is a `PithyError` — the problem, then the action. Under `--json` they arrive on stderr as `{"error":{…}}`, and the process exits 1.
+Each one is a `PithyError` — the problem, then the action. Under `--json` they arrive on stderr as `{"error":{…}}`, with `exit`, `retryable` and, where the cause is known, `fix`, and the process exits by its kind — 2 for a call to fix, 3 for something to set up first, 4 to retry, 5 for a person (`docs/CLI.md` §3.8).
 
 **A bad issue number.** Checked before the branch or worktree exists, so nothing is left behind.
 
@@ -220,7 +226,7 @@ Cloudflare credentials are missing, so the feature's resources cannot be deleted
 Set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN to tear down the remote environment, or pass --local-only to remove just the worktree and its ports.
 ```
 
-**The project has no name.** `pithy.config.ts`'s `name` is the first segment of every feature resource name and the only key teardown has to find them by, so it is required with no guessed fallback: a wrong guess means `destroy` computes names that match nothing, deletes nothing, and exits 0.
+**The project has no name.** `pithy.config.ts`'s `name` is the first segment of every feature resource name and the only key teardown has to find them by, so it is required with no guessed fallback: a wrong guess means `destroy` computes names that match nothing, deletes nothing, and exits 0. It is `core/precondition_failed`, exit 3: the call is right and the project is missing what it depends on.
 
 **The branch is not a feature branch.** `sync` and `destroy` derive the issue and slug from the checked-out branch, so they must be run from inside the worktree — as does `pithy provision --feature`.
 
@@ -247,14 +253,14 @@ Tear that feature down from its own worktree, or pass --branch feature/70-other 
 
 ```
 Could not resolve the repo's git directory.
-Run pithy from inside a git repository.
+Run this from inside a git repository.
 ```
 
 **`prune` in a bare repository's worktree or a submodule.** The registry files a checkout under the directory that holds its git directory. For a bare repository that is the directory the repository sits in, beside any other; for a submodule it is the superproject's `.git/modules`, the same for every submodule it has. Another repository's blocks may be filed under the same key, and their branches are not this repository's, so every one would look deleted. It refuses and names the key.
 
 ```
 This checkout is in a bare repository or a submodule, whose registry key other repositories can share.
-Free these blocks with pithy feature destroy from each feature's worktree. Prune cannot judge blocks other repositories may hold.
+Free these blocks from each feature's worktree, where tearing the feature down releases them. `pithy feature destroy` deletes the feature's worktree, its branch and every resource it provisioned. That is a person's decision, not a fix. Prune cannot judge blocks other repositories may hold.
 ```
 
 **A `.dev.config.json` that will not parse.** It sits in a directory on disk holding some block, and nobody can say which, so `prune` refuses rather than guess. Fix or delete the file.

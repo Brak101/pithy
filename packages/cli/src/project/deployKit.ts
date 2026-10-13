@@ -8,14 +8,20 @@ import { FEATURE_ENVIRONMENT } from "@pithy-sh/core/src/naming/environment";
 import type { FeatureIdentity } from "@pithy-sh/core/src/naming/feature";
 import type { WorkflowHostTemplate } from "@pithy-sh/core/src/workflow/host";
 import { parse } from "comment-json";
+import { z } from "zod";
+import { type AddPlan, addAction } from "../capabilities/addCommand";
 import {
   deployHostWorker,
+  type HostDeployOptions,
   kitPackageVersion,
+  planHostDeploy,
   type ReadWorkerVars,
   type RunHostDeploy,
 } from "../capabilities/hostDeploy";
 import { hostEntrySource } from "../capabilities/hostEntry";
 import { hostTemplatePath, readHostTemplate as readHostTemplateDefault } from "../capabilities/hostRegistry";
+import { resolveAdd } from "../capabilities/notComposed";
+import { capabilityProvisionRemedy } from "../capabilities/provisionCommand";
 import { cloudflareClients } from "../cloudflare/clients";
 import { type CloudflareAccountSelection, cloudflareAccountConfirmation, cloudflareEnv } from "../cloudflare/config";
 import { discoverHostWorkers, type HostWorker } from "../dev/hostWorkers";
@@ -26,12 +32,14 @@ import {
   featureOwnedIds,
 } from "../feature/hosts";
 import { isSourceEnvironment, wranglerConfigPath } from "../provision/featureConfig";
+import { provisionRemedy } from "../provision/provisionFix";
 import { cloudflareProvisioners } from "../provision/resources";
 import { settleStep } from "../terminal/progress";
 import { red } from "../terminal/style";
 import { loadWorkerConfig, loadWorkerDomains, type WorkerConfig } from "./config";
 import { readOptionalFile } from "./readOptionalFile";
 import { type AddressStanza, inheritAddressKeys, resolveWorkerAddress } from "./workerAddress";
+import { workerDirName } from "./workerIdentity";
 import { discoverWorkers, type WorkerTarget } from "./workers";
 import { readOptionalWranglerConfig } from "./wrangler";
 
@@ -74,20 +82,19 @@ import { readOptionalWranglerConfig } from "./wrangler";
  */
 
 /** What one kit Worker's deploy did. The `--json` row and the terminal line both read from this. */
-export interface KitWorkerDeploy {
-  /** The capability that owns the Worker — the row's label, and the key into the registry. */
-  capability: string;
-  /** The deployed script name, or `null` when this run never got far enough to derive one. */
-  worker: string | null;
-  /**
-   * `deployed` — wrangler ran. `unchanged` — the stamp matched, so it did not.
-   * `skipped` — this project cannot deploy it yet, and the reason names what to run.
-   * `failed` — it was attempted and did not work.
-   */
-  outcome: "deployed" | "unchanged" | "skipped" | "failed";
-  /** One sentence. Never empty: an outcome nobody can explain is the failure this issue is about. */
-  reason: string;
-}
+export const KitWorkerDeploy = z
+  .object({
+    capability: z.string().describe("The capability that owns the Worker — the row's label."),
+    worker: z.string().nullable().describe("The deployed script name, or `null` when none was derived."),
+    outcome: z
+      .enum(["deployed", "unchanged", "skipped", "failed"])
+      .describe(
+        "`deployed` — wrangler ran. `unchanged` — the stamp matched, so it did not. `skipped` — this project cannot deploy it yet, and the reason names what to run. `failed` — it was attempted and did not work.",
+      ),
+    reason: z.string().describe("One sentence. Never empty: an outcome nobody can explain is a failure."),
+  })
+  .describe("What one kit Worker's deploy did.");
+export type KitWorkerDeploy = z.infer<typeof KitWorkerDeploy>;
 
 /**
  * What the kit half of one deploy did: a row per capability, and anything that stopped it saying more.
@@ -107,6 +114,21 @@ export interface KitDeployReport {
   workers: KitWorkerDeploy[];
   /** One sentence per thing that stopped this run knowing the set. Non-empty fails the command. */
   problems: string[];
+  /**
+   * **Under `dryRun` only: each Worker the run would upload, and why (#697).** Not a row, because a row's
+   * `deployed` says an upload happened. The rows that remain are the outcomes a run reaches without one.
+   */
+  planned?: PlannedKitUpload[];
+}
+
+/** One kit Worker `pithy deploy --dry-run` would upload. */
+export interface PlannedKitUpload {
+  /** The capability that owns the Worker. */
+  capability: string;
+  /** The script name the deploy would publish. */
+  worker: string;
+  /** The sentence the run would print beside `deployed`. */
+  reason: string;
 }
 
 /** Options for {@link deployKitWorkers}. */
@@ -117,10 +139,20 @@ export interface DeployKitOptions {
   project: string;
   /** The environment being deployed. Required: a kit Worker is per environment, always. */
   env: string;
+  /**
+   * The project's `seed.productionEnvironments`, beyond `prod`: a skip naming a provision for one of them names it
+   * as a person's decision, never a command to run (#711).
+   */
+  productionEnvironments?: readonly string[];
   /** The account the project belongs to. Stated by the caller, never defaulted (#206). */
   account: CloudflareAccountSelection | null;
   /** Ship every kit Worker regardless of its stamp. */
   force?: boolean;
+  /**
+   * `pithy deploy --dry-run` (#697): every gate is asked and every stamp read, and no Worker is uploaded. A
+   * Worker the run would upload lands in {@link KitDeployReport.planned} instead of `workers`.
+   */
+  dryRun?: boolean;
   /** Test seam: the app Workers. Defaults to `discoverWorkers`. */
   workers?: readonly WorkerTarget[];
   /** Test seam: the capabilities one Worker composes. Defaults to loading its `pithy.config.ts`. */
@@ -287,16 +319,24 @@ function skipped(capability: string, reason: string): KitWorkerDeploy {
 export async function deployKitWorkers(options: DeployKitOptions): Promise<KitDeployReport> {
   const workers: KitWorkerDeploy[] = [];
   const problems: string[] = [];
+  const planned: PlannedKitUpload[] = [];
   try {
-    await runKitDeploy(options, workers, problems);
+    await runKitDeploy(options, { rows: workers, problems, planned });
   } catch (error) {
     problems.push(failureReason(error));
   }
-  return { workers, problems };
+  return options.dryRun ? { workers, problems, planned } : { workers, problems };
 }
 
-/** The pass itself. Rows and problems are the caller's arrays, so a throw never loses what it reached. */
-async function runKitDeploy(options: DeployKitOptions, rows: KitWorkerDeploy[], problems: string[]): Promise<void> {
+/** Where the pass puts what it reaches: the caller's arrays, so a throw never loses any of it. */
+interface KitSinks {
+  rows: KitWorkerDeploy[];
+  problems: string[];
+  planned: PlannedKitUpload[];
+}
+
+/** The pass itself. */
+async function runKitDeploy(options: DeployKitOptions, { rows, problems, planned }: KitSinks): Promise<void> {
   const workers = options.workers ?? (await discoverWorkers(options.projectDir));
   const { hosts, notes } = await discoverHostWorkers({
     projectDir: options.projectDir,
@@ -373,12 +413,17 @@ async function runKitDeploy(options: DeployKitOptions, rows: KitWorkerDeploy[], 
       storeId: options.ids?.storeId ?? vars.SECRETS_STORE_ID,
       accountId: options.ids?.accountId ?? vars.CLOUDFLARE_ACCOUNT_ID,
     });
+    if ("planned" in row) {
+      planned.push(row.planned);
+      settleStep(summarizePlannedKitDeploy(row.planned));
+      continue;
+    }
     rows.push(row);
     // **The row, as it settles (#578).** The `▸` line for the ones that actually upload comes from
     // `deployHostWorker`, which is where the spawn is; this is the outcome, and it covers the three
     // that never reach a spawn at all — unchanged, skipped, failed — so every capability in the set
     // accounts for itself while the run is still going rather than in a block at the end.
-    settleStep(summarizeKitDeploy(row));
+    settleStep(summarizeKitDeploy(row), { kit: row });
   }
 }
 
@@ -398,11 +443,13 @@ async function runKitDeploy(options: DeployKitOptions, rows: KitWorkerDeploy[], 
  * the hosts that bind it: email, media, storage, payments and secrets ask; support, testers and vector
  * hold no credential at all and deploy unaffected.
  */
-const REQUIRED_VARS: Record<string, (capability: string) => string> = {
-  SECRETS_STORE_ID: (capability) =>
-    `SECRETS_STORE_ID is not set, so ${capability}'s Worker would deploy unable to read its master key. Run pithy add secrets on this machine, or export SECRETS_STORE_ID for this run.`,
-  CLOUDFLARE_ACCOUNT_ID: (capability) =>
-    `CLOUDFLARE_ACCOUNT_ID is not set, so ${capability}'s Worker would deploy naming no account to manage. Export CLOUDFLARE_ACCOUNT_ID for this run, or record it with pithy add secrets.`,
+const REQUIRED_VARS: Record<string, (capability: string, recordWith: AddPlan) => string> = {
+  // The Worker that composes the capability composes `secrets` too, as every host that asks for the store
+  // declares it, so `pithy add secrets` on that Worker is the one that records it (#711).
+  SECRETS_STORE_ID: (capability, recordWith) =>
+    `SECRETS_STORE_ID is not set, so ${capability}'s Worker would deploy unable to read its master key. ${addAction(recordWith, (add) => `Run ${add} on this machine, or export SECRETS_STORE_ID for this run.`)}`,
+  CLOUDFLARE_ACCOUNT_ID: (capability, recordWith) =>
+    `CLOUDFLARE_ACCOUNT_ID is not set, so ${capability}'s Worker would deploy naming no account to manage. ${addAction(recordWith, (add) => `Export CLOUDFLARE_ACCOUNT_ID for this run, or record it with ${add}.`)}`,
 };
 
 /** The default stamp reader: the account's Workers REST client, loaded only once a run needs it. */
@@ -424,6 +471,8 @@ function readinessReason(input: {
   missingIds: readonly { kind: "database" | "namespace"; binding: string }[];
   missingVars: readonly string[];
   capability: string;
+  /** The `pithy add secrets` that records the account's values, on the Worker that composes it (#711). */
+  recordWith: AddPlan;
   env: string;
   provision: string;
 }): string | undefined {
@@ -436,7 +485,7 @@ function readinessReason(input: {
     .map((one) => `${one.bindings.join(", ")} ${one.kind}`);
   if (clauses.length > 0) reasons.push(`${input.env} has no ${clauses.join(" and no ")} yet. ${input.provision}`);
   for (const name of [...new Set(input.missingVars)].sort()) {
-    reasons.push(REQUIRED_VARS[name]?.(input.capability) ?? `${name} is not set.`);
+    reasons.push(REQUIRED_VARS[name]?.(input.capability, input.recordWith) ?? `${name} is not set.`);
   }
   return reasons.length > 0 ? reasons.join(" ") : undefined;
 }
@@ -456,15 +505,24 @@ async function deployOneKitWorker(input: {
   stanza: KitStanza | undefined;
   storeId: string | undefined;
   accountId: string | undefined;
-}): Promise<KitWorkerDeploy> {
+}): Promise<KitWorkerDeploy | { planned: PlannedKitUpload }> {
   const { host, options } = input;
   const capability = host.capability;
-  // No `--env`. A capability's provision spans every declared environment and none of the ones that host a
-  // kit Worker declares the flag, which the CLI refuses (#594) — a skip naming it names a fix that fails.
-  const provision =
-    options.env === FEATURE_ENVIRONMENT ? "Run pithy provision --feature." : `Run pithy ${capability} provision.`;
-
   if (!input.source) return skipped(capability, `No Worker in apps/ composes ${capability} any more.`);
+  // The builder names `--env` only for a provision that declares it: most span every environment and would refuse
+  // the flag (#594), while `vector provision` acts on one and defaults to dev, so a staging skip that left it out
+  // named a provision of dev that never clears the skip (#711). And the Worker that composes it, by name: in a
+  // project with several, a bare provision is refused (#711).
+  const remedy =
+    options.env === FEATURE_ENVIRONMENT
+      ? provisionRemedy(FEATURE_ENVIRONMENT)
+      : capabilityProvisionRemedy(
+          capability,
+          workerDirName(input.source),
+          options.env,
+          options.productionEnvironments ?? [],
+        );
+  const provision = remedy.say((command) => `Run ${command}.`);
   const baseUrl = await baseUrlFor(input.source, options.env, input.stanza);
   if (baseUrl === null) {
     return skipped(
@@ -538,14 +596,21 @@ async function deployOneKitWorker(input: {
       };
     }
   }
-  const shortfall = readinessReason({ missingIds, missingVars, capability, env: options.env, provision });
+  const shortfall = readinessReason({
+    missingIds,
+    missingVars,
+    capability,
+    recordWith: resolveAdd("secrets", { projectDir: options.projectDir, workerDir: input.source.dir }),
+    env: options.env,
+    provision,
+  });
   if (shortfall) return skipped(capability, shortfall);
 
   try {
     // The peers this composition hands a host that composes nothing — the ledger to payments' reconcile host,
     // auth to testers' — written as the entry it deploys from. Undefined for every other host (#645).
     const entry = hostEntrySource(options.projectDir, host.spec, host.composed, host.siblings);
-    const outcome = await deployHostWorker({
+    const hostOptions: HostDeployOptions = {
       capability,
       pkg: host.spec.package,
       version: await kitPackageVersion(options.projectDir, host.spec.package),
@@ -560,7 +625,15 @@ async function deployOneKitWorker(input: {
       // incomplete would have arrived here as `null` and read the default credentials file (#555).
       account: options.account,
       force: options.force,
-    });
+    };
+    if (options.dryRun) {
+      // The gate, and nothing after it: the same verdict and the same refusals, no temporary config, no upload.
+      const plan = await planHostDeploy(hostOptions);
+      return plan.deploy
+        ? { planned: { capability, worker: plan.worker, reason: plan.reason } }
+        : { capability, worker: plan.worker, outcome: "unchanged", reason: plan.reason };
+    }
+    const outcome = await deployHostWorker(hostOptions);
     return { capability, worker: outcome.worker, outcome: outcome.outcome, reason: outcome.reason };
   } catch (error) {
     return { capability, worker: config.name, outcome: "failed", reason: failureReason(error) };
@@ -576,6 +649,8 @@ export function kitDeployFailed(report: KitDeployReport): boolean {
   // **A run that shipped nothing because nothing was ready is a failure, not a quiet success.** A CI
   // job whose kit half skipped every Worker has deployed no kit Worker at all, and the operator has
   // to learn that from the exit code rather than from reading rows nobody prints on a green build.
+  // Under `--dry-run` a Worker it would upload is planned rather than a row, and it counts as shipping.
+  if ((report.planned?.length ?? 0) > 0) return false;
   return report.workers.length > 0 && report.workers.every((row) => row.outcome === "skipped");
 }
 
@@ -586,6 +661,11 @@ export function summarizeKitDeploy(row: KitWorkerDeploy): string {
   // Red for the one outcome that fails the command on its own. A skip is a fact about the project,
   // not a fault of this run, and coloring it as one would train an operator to ignore both.
   return row.outcome === "failed" ? red(line) : line;
+}
+
+/** One planned kit upload's line, under `--dry-run`: what would happen, and the reason the run would give. */
+export function summarizePlannedKitDeploy(planned: PlannedKitUpload): string {
+  return `${planned.worker}: would deploy. ${planned.reason}`;
 }
 
 /**

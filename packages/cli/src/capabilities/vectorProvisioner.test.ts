@@ -3,12 +3,19 @@
 
 import type { CloudflareClients } from "@pithy-sh/cloudflare/src/client/clients";
 import type { CloudflareWorkflowsClient } from "@pithy-sh/cloudflare/src/workflows/workflowsClient";
+import type { WorkerDir } from "@pithy-sh/core/src/cli/command";
 import { VectorConfig } from "@pithy-sh/vector/src/config/config";
 import { filterable } from "@pithy-sh/vector/src/index/filter";
 import { describe, expect, test, vi } from "vitest";
 import { z } from "zod";
 import { KIT_ROOT } from "../test-utils/kitRoot";
-import { CloudflareVectorProvisioner } from "./vectorProvisioner";
+import { dirOf } from "../test-utils/workerDir";
+import {
+  CloudflareVectorProvisioner,
+  METADATA_POLL_INTERVAL_MS,
+  METADATA_SETTLE_BUDGET_MS,
+  METADATA_STABLE_READS,
+} from "./vectorProvisioner";
 
 /** The project every provisioned name leads with — `requireProjectName`'s answer, never a guess. */
 const PROJECT = "acme";
@@ -66,8 +73,29 @@ function fakeWorkflows() {
   return { client: { dispatchAndPoll } as unknown as CloudflareWorkflowsClient, dispatchAndPoll };
 }
 
-function provisioner(cf: CloudflareClients, workflows: CloudflareWorkflowsClient) {
+/**
+ * A clock that only moves when the provisioner sleeps, so a five-minute budget runs in no real time and the
+ * test can still say how long the provisioner thought it waited.
+ */
+function virtualClock() {
+  let now = 0;
+  return {
+    now: () => now,
+    sleep: async (ms: number) => {
+      now += ms;
+    },
+    elapsed: () => now,
+  };
+}
+
+function provisioner(
+  cf: CloudflareClients,
+  workflows: CloudflareWorkflowsClient,
+  clock: ReturnType<typeof virtualClock> = virtualClock(),
+  target?: { worker: WorkerDir; env: string; productionEnvironments?: readonly string[] },
+) {
   return new CloudflareVectorProvisioner({
+    ...(target === undefined ? {} : { target: { productionEnvironments: [], ...target } }),
     projectDir: KIT_ROOT,
     project: PROJECT,
     cf,
@@ -76,8 +104,9 @@ function provisioner(cf: CloudflareClients, workflows: CloudflareWorkflowsClient
     config,
     resolveEnv: async () => ({ appDatabaseId: "db-1" }),
     workflows,
-    // No real waiting: the poll's *shape* is what matters, not its clock.
-    sleep: async () => {},
+    // No real waiting: the poll's *shape* is what matters, and the clock moves only when it sleeps.
+    sleep: clock.sleep,
+    now: clock.now,
   });
 }
 
@@ -140,14 +169,25 @@ describe("ensureIndex", () => {
   });
 });
 
+const OWNER = { propertyName: "ownerId", indexType: "string" };
+
 describe("ensureMetadataIndexes", () => {
-  test("creates what is missing and waits until it is visible, never assuming a write is live", async () => {
+  test("the wait is sized from measured Vectorize latency: 300s, three agreeing reads, a 2s poll", () => {
+    // A metadata index settled in about 97s on one live run and was still unsettled at 120s on the next
+    // (#709). The ten one-second polls this replaced gave up on both.
+    expect(METADATA_SETTLE_BUDGET_MS).toBe(300_000);
+    expect(METADATA_STABLE_READS).toBe(3);
+    expect(METADATA_POLL_INTERVAL_MS).toBe(2_000);
+  });
+
+  test("creates what is missing and waits for three agreeing reads, never assuming a write is live", async () => {
     const fake = fakeCf();
     // Accepted, then absent, then absent, then visible — exactly how Vectorize behaves.
     fake.listMetadataIndexes
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([{ propertyName: "ownerId", indexType: "string" }]);
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([OWNER]);
 
     const report = await provisioner(fake.cf, fakeWorkflows().client).ensureMetadataIndexes(
       "pithy-vector-docs-dev",
@@ -156,12 +196,44 @@ describe("ensureMetadataIndexes", () => {
 
     expect(fake.createMetadataIndex).toHaveBeenCalledWith("pithy-vector-docs-dev", "ownerId", "string");
     expect(report.missing).toEqual(declared);
-    expect(fake.listMetadataIndexes).toHaveBeenCalledTimes(3);
+    // The read before creating, two misses, then three in a row that agree.
+    expect(fake.listMetadataIndexes).toHaveBeenCalledTimes(6);
   });
 
-  test("is idempotent — everything present means nothing created and no waiting", async () => {
+  test("a read that flaps back to absent starts the count again", async () => {
+    // The list is not monotonic: a live probe watched it report an index, then drop it 18s later.
     const fake = fakeCf();
-    fake.listMetadataIndexes.mockResolvedValue([{ propertyName: "ownerId", indexType: "string" }]);
+    fake.listMetadataIndexes
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([OWNER])
+      .mockResolvedValueOnce([OWNER])
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([OWNER]);
+
+    await provisioner(fake.cf, fakeWorkflows().client).ensureMetadataIndexes("pithy-vector-docs-dev", declared);
+
+    expect(fake.listMetadataIndexes).toHaveBeenCalledTimes(7);
+  });
+
+  test("a read that agrees on the count but not the names or types does not count", async () => {
+    const fake = fakeCf();
+    fake.listMetadataIndexes
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ propertyName: "legacy", indexType: "string" }])
+      .mockResolvedValueOnce([{ propertyName: "ownerId", indexType: "number" }])
+      .mockResolvedValueOnce([{ propertyName: "legacy", indexType: "string" }])
+      .mockResolvedValue([OWNER]);
+
+    await provisioner(fake.cf, fakeWorkflows().client).ensureMetadataIndexes("pithy-vector-docs-dev", declared);
+
+    expect(fake.listMetadataIndexes).toHaveBeenCalledTimes(7);
+  });
+
+  test("is idempotent — everything present means nothing created, still confirmed across three reads", async () => {
+    // One read is not a confirmation, on a re-run any more than on a first run: a re-run is what the
+    // not-live-yet error tells the operator to do, and its "ready" is what they wait for.
+    const fake = fakeCf();
+    fake.listMetadataIndexes.mockResolvedValue([OWNER]);
 
     const report = await provisioner(fake.cf, fakeWorkflows().client).ensureMetadataIndexes(
       "pithy-vector-docs-dev",
@@ -170,7 +242,21 @@ describe("ensureMetadataIndexes", () => {
 
     expect(fake.createMetadataIndex).not.toHaveBeenCalled();
     expect(report.missing).toEqual([]);
-    expect(fake.listMetadataIndexes).toHaveBeenCalledTimes(1);
+    expect(fake.listMetadataIndexes).toHaveBeenCalledTimes(METADATA_STABLE_READS);
+  });
+
+  test("a re-run that finds an index present once then absent waits for it, rather than calling it ready", async () => {
+    const fake = fakeCf();
+    fake.listMetadataIndexes.mockResolvedValueOnce([OWNER]).mockResolvedValueOnce([]).mockResolvedValue([OWNER]);
+
+    const report = await provisioner(fake.cf, fakeWorkflows().client).ensureMetadataIndexes(
+      "pithy-vector-docs-dev",
+      declared,
+    );
+
+    expect(fake.createMetadataIndex).not.toHaveBeenCalled();
+    expect(report.missing).toEqual([]);
+    expect(fake.listMetadataIndexes).toHaveBeenCalledTimes(5);
   });
 
   test("refuses a live metadata index of the wrong type rather than writing against it", async () => {
@@ -183,21 +269,77 @@ describe("ensureMetadataIndexes", () => {
     expect(fake.createMetadataIndex).not.toHaveBeenCalled();
   });
 
-  test("fails loudly when an accepted metadata index never becomes visible", async () => {
+  test("waits the whole measured budget before it says an accepted index is not live yet", async () => {
     const fake = fakeCf();
     fake.listMetadataIndexes.mockResolvedValue([]);
+    const clock = virtualClock();
 
+    const thrown = await provisioner(fake.cf, fakeWorkflows().client, clock, { worker: dirOf("api"), env: "dev" })
+      .ensureMetadataIndexes("pithy-vector-docs-dev", declared)
+      .catch((error: unknown) => error);
+
+    expect(thrown).toMatchObject({
+      payload: {
+        message: "The metadata indexes on `pithy-vector-docs-dev` were accepted but are not live yet.",
+        action:
+          "Re-run `pithy vector provision --worker api --env dev` in a minute. Do not write vectors until it reports them ready.",
+        detail: "waited 300s for ownerId",
+      },
+    });
+    expect(clock.elapsed()).toBeGreaterThanOrEqual(METADATA_SETTLE_BUDGET_MS);
+    expect(clock.elapsed()).toBeLessThan(METADATA_SETTLE_BUDGET_MS + METADATA_POLL_INTERVAL_MS);
+  });
+
+  test("the re-run that error asks for finishes the job once the index is live", async () => {
+    // The action names a command; this is that command, run as written, against an index the first run
+    // created and Cloudflare has applied since. It creates nothing twice and reports the index ready.
+    const fake = fakeCf();
+    fake.listMetadataIndexes.mockResolvedValue([]);
     await expect(
       provisioner(fake.cf, fakeWorkflows().client).ensureMetadataIndexes("pithy-vector-docs-dev", declared),
     ).rejects.toThrow(/not live yet/);
+    expect(fake.createMetadataIndex).toHaveBeenCalledTimes(1);
+
+    fake.listMetadataIndexes.mockResolvedValue([OWNER]);
+    const report = await provisioner(fake.cf, fakeWorkflows().client).ensureMetadataIndexes(
+      "pithy-vector-docs-dev",
+      declared,
+    );
+
+    expect(report).toEqual({ missing: [], mismatched: [], extra: [] });
+    expect(fake.createMetadataIndex).toHaveBeenCalledTimes(1);
+  });
+
+  test("a re-run whose create is refused because the first run's create landed carries on and waits", async () => {
+    // The list can miss an index that exists, so a re-run can ask to create one twice. Whatever Cloudflare
+    // answers to that, an index listed under its own name and type right after is the one the first run
+    // created, and the re-run waits for it rather than failing on it.
+    const fake = fakeCf();
+    fake.listMetadataIndexes.mockResolvedValueOnce([]).mockResolvedValue([OWNER]);
+    fake.createMetadataIndex.mockRejectedValue(new Error("metadata index already exists"));
+
+    const report = await provisioner(fake.cf, fakeWorkflows().client).ensureMetadataIndexes(
+      "pithy-vector-docs-dev",
+      declared,
+    );
+
+    expect(report.missing).toEqual(declared);
+  });
+
+  test("a create that is refused for any other reason still fails, with Cloudflare's answer", async () => {
+    const fake = fakeCf();
+    fake.listMetadataIndexes.mockResolvedValue([]);
+    const refused = new Error("metadata index limit reached");
+    fake.createMetadataIndex.mockRejectedValue(refused);
+
+    await expect(
+      provisioner(fake.cf, fakeWorkflows().client).ensureMetadataIndexes("pithy-vector-docs-dev", declared),
+    ).rejects.toBe(refused);
   });
 
   test("reports a live metadata index the config does not declare — it still costs one of the ten slots", async () => {
     const fake = fakeCf();
-    fake.listMetadataIndexes.mockResolvedValue([
-      { propertyName: "ownerId", indexType: "string" },
-      { propertyName: "legacy", indexType: "string" },
-    ]);
+    fake.listMetadataIndexes.mockResolvedValue([OWNER, { propertyName: "legacy", indexType: "string" }]);
 
     const report = await provisioner(fake.cf, fakeWorkflows().client).ensureMetadataIndexes(
       "pithy-vector-docs-dev",
@@ -205,6 +347,88 @@ describe("ensureMetadataIndexes", () => {
     );
     expect(report.extra).toEqual([{ propertyName: "legacy", indexType: "string" }]);
   });
+});
+
+/**
+ * **Every command a refusal names runs as written (#711).** The Worker and environment are this run's, so the
+ * command runs in a project with several Workers. A reset of anything but `dev` takes the `--confirm-reset`
+ * phrase, which is a person's to give, so the sentence says so rather than naming a run an agent is refused.
+ * A feature's indexes are its own provisioning's: a feature run names that, and no rebuild, since none exists for one index.
+ */
+describe("the commands a refusal names", () => {
+  const live = { name: "pithy-vector-docs-staging", config: { dimensions: 384, metric: "cosine" as const } };
+  const action = async (target?: { worker: WorkerDir; env: string; productionEnvironments?: readonly string[] }) => {
+    const fake = fakeCf();
+    fake.findIndexByName.mockResolvedValue(live);
+    const error = await provisioner(fake.cf, fakeWorkflows().client, undefined, target)
+      .ensureIndex(live.name, { dimensions: 768, metric: "cosine" })
+      .catch((caught: unknown) => caught);
+    return (error as { payload: { action: string } }).payload.action;
+  };
+
+  test("a reset of a deployed environment names the Worker and the person's phrase", async () => {
+    expect(await action({ worker: dirOf("api"), env: "staging" })).toContain(
+      "Dimensions and metric are fixed when an index is created. Change the config back. Rebuilding it from the document corpus is the other way: `pithy vector reset --worker api --env staging` with its --confirm-reset phrase, which only a person gives, deletes every vector in the index. That is a person's decision, not a fix.",
+    );
+  });
+
+  test("a reset of dev needs no phrase", async () => {
+    expect(await action({ worker: dirOf("api"), env: "dev" })).toContain(
+      "Dimensions and metric are fixed when an index is created. Change the config back. Rebuilding it from the document corpus is the other way: `pithy vector reset --worker api --env dev` deletes every vector in the index. That is a person's decision, not a fix.",
+    );
+  });
+
+  /**
+   * No command rebuilds one index of a feature. `pithy feature destroy` takes every resource the feature owns and
+   * prunes its worktree, and `pithy provision --feature` runs only from inside that worktree, so naming the pair
+   * sends an agent to wipe the feature for one index and then a command it can no longer run.
+   */
+  test("a feature run names no rebuild, only the config change", async () => {
+    const said = await action();
+    expect(said).toBe("Dimensions and metric are fixed when an index is created. Change the config back.");
+    expect(said).not.toContain("pithy");
+  });
+
+  test("a feature's metadata type refusal names no rebuild either", async () => {
+    const fake = fakeCf();
+    fake.listMetadataIndexes.mockResolvedValue([{ propertyName: "ownerId", indexType: "number" }]);
+    const error = await provisioner(fake.cf, fakeWorkflows().client)
+      .ensureMetadataIndexes("pithy-vector-docs-feature", declared)
+      .catch((caught: unknown) => caught);
+    expect((error as { payload: { action: string } }).payload.action).toBe(
+      "A metadata index's type is fixed. Change the field's type back in the index's metadata schema.",
+    );
+  });
+
+  test("an index not live yet names this run's provision again", async () => {
+    const fake = fakeCf();
+    fake.listMetadataIndexes.mockResolvedValue([]);
+    const error = await provisioner(fake.cf, fakeWorkflows().client, undefined, {
+      worker: dirOf("api"),
+      env: "staging",
+    })
+      .ensureMetadataIndexes("pithy-vector-docs-staging", declared)
+      .catch((caught: unknown) => caught);
+    expect((error as { payload: { action: string } }).payload.action).toBe(
+      "Re-run `pithy vector provision --worker api --env staging` in a minute. Do not write vectors until it reports them ready.",
+    );
+  });
+});
+
+// #711: the project's own production environment is a person's decision too, not only `prod` and `production`.
+test("an index not live yet in the project's own production environment names no provision to run", async () => {
+  const fake = fakeCf();
+  fake.listMetadataIndexes.mockResolvedValue([]);
+  const error = await provisioner(fake.cf, fakeWorkflows().client, undefined, {
+    worker: dirOf("api"),
+    env: "live",
+    productionEnvironments: ["live"],
+  })
+    .ensureMetadataIndexes("pithy-vector-docs-live", declared)
+    .catch((caught: unknown) => caught);
+  expect((error as { payload: { action: string } }).payload.action).toContain(
+    "`pithy vector provision --worker api --env live` runs against live, a production environment. That is a person's decision, not a fix.",
+  );
 });
 
 describe("deleteIndex", () => {

@@ -1,0 +1,51 @@
+# Sets the issue type, and applies needs-triage: filed on a form, not yet evaluated (#707).
+# Keep `type:` and `labels:` on one line each. packages/cli/src/ci/contributorIntake.test.ts reads them as text.
+name: Bug report
+description: Something in Pithy does not work the way its docs say.
+type: Bug
+labels: [needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing. A report we can reproduce gets fixed first.
+
+        A security problem goes to [private disclosure](https://github.com/pithy-sh/pithy/security/advisories/new), never a public issue.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`pithy --version`, and the `@pithy-sh/*` package versions if a package is involved."
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: OS and shell
+      description: CI covers Linux closely and Windows only in part, so this decides who can reproduce it.
+      placeholder: Windows 11, PowerShell 7.4
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: What you ran
+      description: The command, or the smallest code that shows it.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: The output, in full. Remove any secret first.
+      render: text
+    validations:
+      required: true

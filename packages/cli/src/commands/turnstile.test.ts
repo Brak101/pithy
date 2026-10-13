@@ -1,11 +1,17 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
+import { callerOf } from "@pithy-sh/core/src/cli/command";
 import { turnstile as turnstileCapability } from "@pithy-sh/turnstile/src/capability";
 import type { ArgsDef, CommandDef } from "citty";
 import { describe, expect, test } from "vitest";
 import type { WorkerConfig } from "../project/config";
-import turnstile, { featureSitekeyNote, resolveTurnstileTarget } from "./turnstile";
+import turnstile, {
+  featureSitekeyNote,
+  resolveTurnstileDeprovisionTarget,
+  resolveTurnstileTarget,
+  startingOverLine,
+} from "./turnstile";
 
 /** A widget's sitekeys, blank — what the target is resolved by is which modes a Worker declares. */
 const SITEKEYS = { sitekeys: { dev: "", staging: "", prod: "" } };
@@ -68,6 +74,52 @@ describe("resolveTurnstileTarget", () => {
 });
 
 /**
+ * **A deprovision against a Worker that never composed turnstile has nothing to remove, and says so (#697).**
+ *
+ * The modes it deletes are the Worker's own declaration, never a sibling's, so a Worker declaring none has no
+ * widget this command could name. That is the answer `pithy remove` gives a capability that is not there —
+ * `Nothing to remove.`, exit 0 — and the one every idempotent teardown gives an absent resource. Refusing with
+ * `pithy add turnstile` as the step would send a teardown to compose the thing it is tearing down.
+ */
+describe("resolveTurnstileDeprovisionTarget", () => {
+  const configs: Record<string, WorkerConfig> = {
+    "/proj/apps/api": { capabilities: [turnstileCapability({ widgets: { visible: SITEKEYS } })] } as WorkerConfig,
+    "/proj/apps/docs": { capabilities: [] } as unknown as WorkerConfig,
+  };
+  const seams = {
+    projectDir: "/proj",
+    discoverWorkers: async () => [
+      { name: "api", dir: "/proj/apps/api" },
+      { name: "docs", dir: "/proj/apps/docs" },
+    ],
+    loadConfig: async (dir: string) => configs[dir] as WorkerConfig,
+  };
+
+  test("a Worker composing turnstile answers its own modes", async () => {
+    const { worker, config } = await resolveTurnstileDeprovisionTarget({ ...seams, worker: "api" });
+    expect(worker.dir).toBe("/proj/apps/api");
+    expect(Object.keys(config?.widgets ?? {})).toEqual(["visible"]);
+  });
+
+  test("a named Worker composing none answers no config, never a sibling's and never a refusal", async () => {
+    const { worker, config } = await resolveTurnstileDeprovisionTarget({ ...seams, worker: "docs" });
+    expect(worker.dir).toBe("/proj/apps/docs");
+    expect(config).toBeNull();
+  });
+
+  test("the project's only Worker, composing none, answers no config too", async () => {
+    const only = { ...seams, discoverWorkers: async () => [{ name: "docs", dir: "/proj/apps/docs" }] };
+    expect((await resolveTurnstileDeprovisionTarget(only)).config).toBeNull();
+  });
+
+  test("a Worker that does not exist is still the call's mistake", async () => {
+    await expect(resolveTurnstileDeprovisionTarget({ ...seams, worker: "nope" })).rejects.toMatchObject({
+      payload: { code: "validation/invalid_input" },
+    });
+  });
+});
+
+/**
  * **What `provision` says about a branch deployment has to be true of *this* config (#656).**
  *
  * A feature build resolves Cloudflare's test sitekey only where the config states none. Printed
@@ -112,5 +164,31 @@ describe("featureSitekeyNote", () => {
     const note = featureSitekeyNote(both, ["visible", "invisible"]);
     expect(note).toContain("visible");
     expect(note).toContain("invisible");
+  });
+});
+
+/**
+ * **Starting over names the caller's own provision to run again (#711)** — on the Worker the run wrote into, and
+ * with `--allow-shared-domain` when the caller needed it: without it, the rerun is refused by the domain guard
+ * the first run was let past.
+ */
+describe("startingOverLine", () => {
+  const worker = { dir: "/project/apps/api" };
+
+  test("the rerun keeps --allow-shared-domain when the caller passed it", () => {
+    const line = startingOverLine(
+      callerOf("turnstile provision", { json: false, worker: "api", "allow-shared-domain": true }),
+      worker,
+    );
+    expect(line).toContain("`pithy turnstile provision --worker api --allow-shared-domain` writes the secret again.");
+  });
+
+  test("the rerun names only the Worker when the caller passed nothing else", () => {
+    const line = startingOverLine(
+      callerOf("turnstile provision", { json: false, "allow-shared-domain": false }),
+      worker,
+    );
+    expect(line).toContain("`pithy turnstile provision --worker api` writes the secret again.");
+    expect(line).toContain("pithy turnstile deprovision --worker api");
   });
 });

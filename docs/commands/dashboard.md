@@ -35,11 +35,11 @@ pithy dashboard status [--env <environment>] [--worker <name>] [--verify] [--ori
 | `--key-id <id>` | `connect` | the JWK's `kid` | With `--public-key`: the key id, if the JWK carries none. Rejected off that path |
 | `--key-id <id>` | `revoke-key` | required | The key to revoke, as `status` reports it |
 | `--project <name>` | `connect` | `pithy.config.ts`'s `name` | Override the project name sent to the management client |
-| `--yes` | `revoke-key`, `disconnect` | `false` | Skip the confirmation. How CI runs the same command |
+| `--yes` | `revoke-key`, `disconnect` | `false` | Answer the confirmation. How CI runs the same command, and required wherever nothing can be asked: without it, `--json`, `--no-input`, `PITHY_NONINTERACTIVE=1` or a run with no terminal fails `input/required` rather than going ahead |
 | `--local` | `disconnect` | `false` | Delete the row without telling the management client |
 | `--verify` | `status` | `false` | Prove the connection with a signed ping |
 | `--no-open` | all five, acting on the four that sign in | offers | Never offer to open the approval page. `PITHY_NO_OPEN`, at any value, does the same |
-| `--json` | all five | `false` | One line of machine-readable output. Implies non-interactive: no prompt is ever shown |
+| `--json` | all five | `false` | One line of machine-readable output. Implies non-interactive: no prompt is ever shown. `--no-input` and `PITHY_NONINTERACTIVE=1` do the same without `--json`, and the `o` key is not offered |
 
 Every subcommand writes its machine output to stdout and its diagnostics — the device code, the waiting line — to stderr, so a `--json` consumer parses one clean line.
 
@@ -63,7 +63,7 @@ It works on `--update` too, which is the case it exists for: widening an existin
 
 ```
 $ pithy dashboard connect --env prod --scope all --json
-{"command":"dashboard.connect",…,"scopes":["manifest:read","keys:rotate","audit:events:read","audit:events:read_detail","support:threads:read","support:threads:archive","support:threads:reply"],…}
+{"command":"dashboard.connect","schemaVersion":1,…,"scopes":["manifest:read","keys:rotate","audit:events:read","audit:events:read_detail","support:threads:read","support:threads:archive","support:threads:reply"],…}
 ```
 
 `--scope all` beside another `--scope` is refused, because they are two answers to one question and keeping either silently would decide an authorization for you.
@@ -121,12 +121,13 @@ One line, one object, one shape per subcommand. The `command` field is the subco
 
 ```
 $ pithy dashboard connect --env prod --json
-{"command":"dashboard.connect","environment":"prod","connectionId":"b6a1f0c2-…","issuer":"https://app.pithy.sh","workerUrl":"https://api.example.com","scopes":["manifest:read"],"keyId":"cpk_2026_07","status":"connected","updated":false}
+{"command":"dashboard.connect","schemaVersion":1,"environment":"prod","connectionId":"b6a1f0c2-…","issuer":"https://app.pithy.sh","workerUrl":"https://api.example.com","scopes":["manifest:read"],"keyId":"cpk_2026_07","status":"connected","updated":false}
 ```
 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"dashboard.connect"` | The subcommand that produced the line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `environment` | `string` | The environment the connection is bound to |
 | `connectionId` | `string` | The connection's id — the token `aud`, and the row's primary key |
 | `issuer` | `string` | The management-client origin every token from this connection must carry |
@@ -139,12 +140,13 @@ $ pithy dashboard connect --env prod --json
 
 ```
 $ pithy dashboard rotate --env prod --json
-{"command":"dashboard.rotate","environment":"prod","connectionId":"b6a1f0c2-…","keyId":"cpk_2026_08","previousKeyIds":["cpk_2026_07"],"status":"connected"}
+{"command":"dashboard.rotate","schemaVersion":1,"environment":"prod","connectionId":"b6a1f0c2-…","keyId":"cpk_2026_08","previousKeyIds":["cpk_2026_07"],"status":"connected"}
 ```
 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"dashboard.rotate"` | The subcommand that produced the line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `environment` | `string` | The environment rotated |
 | `connectionId` | `string` | The connection the key was appended to |
 | `keyId` | `string` | The newly registered key |
@@ -154,12 +156,13 @@ $ pithy dashboard rotate --env prod --json
 
 ```
 $ pithy dashboard revoke-key --env prod --key-id cpk_2026_07 --yes --json
-{"command":"dashboard.revoke-key","environment":"prod","keyId":"cpk_2026_07","revoked":true,"connection":{"id":"b6a1f0c2-…","environment":"prod","issuer":"https://app.pithy.sh","workerUrl":"https://api.example.com","basePath":"/control-plane","scopes":["manifest:read"],"keys":[…],"createdAt":"2026-07-01T09:00:00.000Z","updatedAt":"2026-08-05T11:12:13.000Z"}}
+{"command":"dashboard.revoke-key","schemaVersion":1,"environment":"prod","keyId":"cpk_2026_07","revoked":true,"connection":{"id":"b6a1f0c2-…","environment":"prod","issuer":"https://app.pithy.sh","workerUrl":"https://api.example.com","basePath":"/control-plane","scopes":["manifest:read"],"keys":[…],"createdAt":"2026-07-01T09:00:00.000Z","updatedAt":"2026-08-05T11:12:13.000Z"}}
 ```
 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"dashboard.revoke-key"` | The subcommand that produced the line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `environment` | `string` | The environment the key was revoked on |
 | `keyId` | `string` | The key named by `--key-id` |
 | `revoked` | `boolean` | `false` when no key answered to that id. Re-running a revoke is not an error |
@@ -183,12 +186,13 @@ $ pithy dashboard revoke-key --env prod --key-id cpk_2026_07 --yes --json
 
 ```
 $ pithy dashboard disconnect --env prod --yes --json
-{"command":"dashboard.disconnect","environment":"prod","connectionId":"b6a1f0c2-…","removed":true,"dashboardNotified":true}
+{"command":"dashboard.disconnect","schemaVersion":1,"environment":"prod","connectionId":"b6a1f0c2-…","removed":true,"dashboardNotified":true}
 ```
 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"dashboard.disconnect"` | The subcommand that produced the line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `environment` | `string` | The environment revoked |
 | `connectionId` | `string \| null` | The connection that was removed, or `null` when there was nothing registered |
 | `removed` | `boolean` | Whether a row was deleted. `false` on a re-run, which is not an error |
@@ -197,12 +201,13 @@ $ pithy dashboard disconnect --env prod --yes --json
 
 ```
 $ pithy dashboard status --env prod --json
-{"command":"dashboard.status","environment":"prod","connected":true,"connectionId":"b6a1f0c2-…","issuer":"https://app.pithy.sh","workerUrl":"https://api.example.com","scopes":["manifest:read"],"keys":[{"keyId":"cpk_2026_07","live":true,"ageDays":35,"validFrom":"2026-07-01T09:00:00.000Z","validUntil":null,"revokedAt":null}],"status":"unverified"}
+{"command":"dashboard.status","schemaVersion":1,"environment":"prod","connected":true,"connectionId":"b6a1f0c2-…","issuer":"https://app.pithy.sh","workerUrl":"https://api.example.com","scopes":["manifest:read"],"keys":[{"keyId":"cpk_2026_07","live":true,"ageDays":35,"validFrom":"2026-07-01T09:00:00.000Z","validUntil":null,"revokedAt":null}],"status":"unverified"}
 ```
 
 | key | type | meaning |
 |---|---|---|
 | `command` | `"dashboard.status"` | The subcommand that produced the line |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `environment` | `string` | The environment inspected |
 | `connected` | `boolean` | Whether anything is registered at all. `false` is the shipped, denying state |
 | `connectionId` | `string \| null` | The connection's id, or `null` when nothing is registered |
@@ -221,16 +226,32 @@ $ pithy dashboard status --env prod --json
 
 ## Errors
 
-Each one is a `PithyError` — the problem, then the action. Under `--json` they arrive on stderr as `{"error":{…}}`, and the process exits 1. A `needs_reconnect` is **not** an error: the registration succeeded, the round-trip did not, and the command reports both and exits 0.
+Each one is a `PithyError` — the problem, then the action. Under `--json` they arrive on stderr as `{"error":{…}}`, with `exit`, `retryable` and, where the cause is known, `fix`, and the process exits by its kind — 2 for a call to fix, 3 for something to set up first, 4 to retry, 5 for a person (`docs/CLI.md` §3.8). A `needs_reconnect` is **not** an error: the registration succeeded, the round-trip did not, and the command reports both and exits 0.
 
-**No Worker resolves the database.** Every subcommand opens the registry, so this is the one door the check sits behind.
+**No Worker resolves the database.** Every subcommand opens the registry, so this is the one door the check sits behind. It is `core/precondition_failed`, exit 3: the project is missing what the call depends on, and the remedy is an edit, so it names no `fix`.
 
 ```
 No worker resolves the DB binding for this environment.
 Add the DB d1_databases binding to a worker's wrangler.jsonc, or pass --worker to name one.
 ```
 
-**Nothing is connected.** `rotate` against an environment with no registration raises `controlplane/not_connected`, whose action names `pithy dashboard connect --env <environment>`.
+**The Worker composes no control-plane seam.** `connect` targets the Worker that composes `controlplane()`, and this one does not, so there is nothing to connect.
+
+```
+<worker> does not compose the control-plane seam, so there is nothing to connect.
+Add `controlplane()` to that Worker's pithy.config.ts, deploy, then run connect again.
+```
+
+Named with `--worker`, it is a usage error, exit 2: another `--worker` is the fix. The Worker the project resolved on its own is `core/precondition_failed`, exit 3, with `pithy add controlplane --worker <worker>` as its `fix`, `<worker>` being the Worker's `apps/` directory (`docs/CLI.md` §3.8).
+
+**A confirmation nobody could answer.** `revoke-key` and `disconnect` ask before they act, and the answer they default to is no. So a run that cannot ask — `--json`, `--no-input`, `PITHY_NONINTERACTIVE=1`, no terminal — and did not pass `--yes` is refused before the registry is opened, never taken as yes.
+
+```
+$ pithy dashboard revoke-key --env prod --key-id cpk_2026_07 --json
+{"error":{"code":"input/required","status":400,"flag":"--yes","message":"Revoke key cpk_2026_07 on prod?","action":"Pass --yes to revoke it without asking."}}
+```
+
+**Nothing is connected.** `rotate` against an environment with no registration raises `controlplane/not_connected`, whose action names the `pithy dashboard connect --env <environment>` that runs as written: no `--worker` in a project with one Worker, and with several, one command for each Worker that composes `controlplane()`.
 
 **`--public-key` without `--issuer`.** The issuer is compared on every call, so there is no default to fall back on.
 

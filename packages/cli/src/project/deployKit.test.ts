@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Capability } from "@pithy-sh/core/src/capability/capability";
@@ -14,7 +14,7 @@ import { ledger } from "@pithy-sh/ledger/src/capability";
 import { media } from "@pithy-sh/media/src/capability";
 import { payments } from "@pithy-sh/payments/src/capability";
 import { testers } from "@pithy-sh/testers/src/capability";
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import { readHostTemplate } from "../capabilities/hostRegistry";
 import { DEPLOY_STAMP_VAR } from "../provision/deployStamp";
 import { narrate, type ProgressEvent } from "../terminal/progress";
@@ -26,6 +26,7 @@ import {
   kitDeployFailed,
   summarizeKitDeploy,
   summarizeKitProblem,
+  summarizePlannedKitDeploy,
 } from "./deployKit";
 import type { WorkerTarget } from "./workers";
 
@@ -104,9 +105,33 @@ async function writeApp(
   return dir;
 }
 
+/**
+ * One copy of `email` and `media` for the whole file, which every case's project links to.
+ *
+ * Copies, never the repository's own packages: a deploy writes each host's resolved config beside its worker
+ * module, and through a link to `packages/email` that is `packages/email/src/workflows/` — a file appearing and
+ * vanishing in a tree `turboInputs.test.ts` and `sourceFiles.test.ts` read while this runs (#711). The note on
+ * `payments` below is the same rule. Made once rather than per case because the cases run in turn, and a copy
+ * per case doubled this file's time.
+ */
+let kitCopies: string;
+
+beforeAll(async () => {
+  kitCopies = await mkdtemp(join(tmpdir(), "pithy-deploy-kit-copies-"));
+  await materializeKitPackage(kitCopies, "email");
+  await materializeKitPackage(kitCopies, "media");
+});
+
+afterAll(async () => {
+  await rm(kitCopies, { recursive: true, force: true });
+});
+
 beforeEach(async () => {
   projectDir = await mkdtemp(join(tmpdir(), "pithy-deploy-kit-"));
-  await linkKitPackages(projectDir, ["email", "media"]);
+  const scope = join(projectDir, "node_modules", "@pithy-sh");
+  await mkdir(scope, { recursive: true });
+  for (const name of ["email", "media"])
+    await symlink(join(kitCopies, "node_modules", "@pithy-sh", name), join(scope, name));
   deployed = [];
   // **The account's Secrets Store id, which every host that binds the store now requires.** Unset by
   // `vitest.shared`'s `NO_ACCOUNT` for every unit test, so a case that wants a deploy has to say so —
@@ -132,6 +157,8 @@ interface RunOptions {
   alsoWorkers?: WorkerTarget[];
   /** The capabilities one Worker composes, per directory. Defaults to `composes` for every Worker. */
   capabilitiesFor?: (dir: string) => Promise<Capability[]>;
+  /** `pithy deploy --dry-run`: plan the uploads, make none. */
+  dryRun?: boolean;
 }
 
 /** One `pithy deploy --kit` run against the fixture — the rows. {@link runReport} for the whole report. */
@@ -149,6 +176,7 @@ async function runReport(options: RunOptions = {}): Promise<KitDeployReport> {
     env: "prod",
     account: null,
     force: options.force,
+    ...(options.dryRun ? { dryRun: true } : {}),
     workers,
     capabilitiesFor: options.capabilitiesFor ?? (async () => options.composes ?? [EMAIL]),
     readTemplate: options.readTemplate ?? (async () => structuredClone(template)),
@@ -263,7 +291,7 @@ describe("deployKitWorkers", () => {
         capability: "email",
         worker: null,
         outcome: "skipped",
-        reason: "prod has no EMAIL_SUPPRESSIONS, SECRETS database yet. Run pithy email provision.",
+        reason: "prod has no EMAIL_SUPPRESSIONS, SECRETS database yet. Run pithy email provision --worker api.",
       });
       expect(deployed).toEqual([]);
     });
@@ -308,7 +336,7 @@ describe("deployKitWorkers", () => {
         worker: null,
         outcome: "skipped",
         reason:
-          "SECRETS_STORE_ID is not set, so email's Worker would deploy unable to read its master key. Run pithy add secrets on this machine, or export SECRETS_STORE_ID for this run.",
+          "SECRETS_STORE_ID is not set, so email's Worker would deploy unable to read its master key. Run `pithy add secrets --worker api` on this machine, or export SECRETS_STORE_ID for this run.",
       });
       expect(deployed).toEqual([]);
       // And it fails the command, because a run that skipped every kit Worker shipped none of them.
@@ -328,7 +356,7 @@ describe("deployKitWorkers", () => {
         capability: "media",
         worker: null,
         outcome: "skipped",
-        reason: "prod has no MEDIA namespace yet. Run pithy media provision.",
+        reason: "prod has no MEDIA namespace yet. Run pithy media provision --worker api.",
       });
       expect(deployed).toEqual([]);
     });
@@ -465,10 +493,65 @@ describe("deployKitWorkers", () => {
 
       expect(report.workers).toEqual([]);
       expect(report.problems).toEqual([
-        'A Worker in apps/ is named "email", which is also the email capability\'s host. Rename that Worker with pithy worker add, or move it, so EMAIL_ORIGIN names one process.',
+        'A Worker in apps/ is named "email", which is also the email capability\'s host. Rename that Worker with pithy worker rename, or move it, so EMAIL_ORIGIN names one process.',
       ]);
       expect(kitDeployFailed(report)).toBe(true);
     });
+  });
+});
+
+/**
+ * **`pithy deploy --dry-run`'s kit half (#697): every gate asked, no Worker uploaded.** A Worker the run would
+ * ship is planned rather than reported as a row — a row's `deployed` would be a sentence about an upload that
+ * never happened — and the rows that stay are the ones the run would print without uploading anything:
+ * unchanged, skipped, failed.
+ */
+describe("deployKitWorkers under --dry-run", () => {
+  test("a Worker the run would upload is planned, with the run's reason, and wrangler never runs", async () => {
+    const events: ProgressEvent[] = [];
+    const report = await narrate(
+      (event) => events.push(event),
+      () => runReport({ vars: null, dryRun: true }),
+    );
+    expect(report).toEqual({
+      workers: [],
+      problems: [],
+      planned: [{ capability: "email", worker: "acme-prod-email", reason: "It was not on the account." }],
+    });
+    expect(deployed).toEqual([]);
+    expect(events).toEqual([{ phase: "settled", line: "acme-prod-email: would deploy. It was not on the account." }]);
+  });
+
+  test("a current Worker is the row the run would print, and nothing is planned for it", async () => {
+    await run();
+    const stamp = deployed[0]?.vars?.[DEPLOY_STAMP_VAR] as string;
+    deployed = [];
+    const report = await runReport({ vars: { [DEPLOY_STAMP_VAR]: stamp }, dryRun: true });
+    expect(report.workers.map((row) => row.outcome)).toEqual(["unchanged"]);
+    expect(report.planned).toEqual([]);
+    expect(deployed).toEqual([]);
+  });
+
+  test("a Worker this environment cannot deploy yet is skipped exactly as the run skips it", async () => {
+    const report = await runReport({ bindings: [{ binding: "DB", database_id: "db-1" }], dryRun: true });
+    expect(report.workers.map((row) => row.outcome)).toEqual(["skipped"]);
+    expect(report.planned).toEqual([]);
+  });
+
+  test("a real run carries no planned list at all", async () => {
+    expect(await runReport({ vars: null })).not.toHaveProperty("planned");
+  });
+});
+
+describe("summarizePlannedKitDeploy", () => {
+  test("names the Worker, what would happen, and why", () => {
+    expect(
+      summarizePlannedKitDeploy({
+        capability: "email",
+        worker: "acme-prod-email",
+        reason: "It was not on the account.",
+      }),
+    ).toBe("acme-prod-email: would deploy. It was not on the account.");
   });
 });
 
@@ -507,6 +590,16 @@ describe("kitDeployFailed", () => {
       kitDeployFailed(
         rows([{ capability: "email", worker: "acme-prod-email", outcome: "unchanged", reason: "current" }]),
       ),
+    ).toBe(false);
+  });
+
+  test("a dry run whose only other rows are skips does not fail, because something would ship", () => {
+    expect(
+      kitDeployFailed({
+        workers: [{ capability: "email", worker: null, outcome: "skipped", reason: "run provision" }],
+        problems: [],
+        planned: [{ capability: "media", worker: "acme-prod-media", reason: "It was not on the account." }],
+      }),
     ).toBe(false);
   });
 
@@ -553,9 +646,9 @@ describe("summarizeKitDeploy", () => {
         capability: "email",
         worker: null,
         outcome: "skipped",
-        reason: "Run pithy email provision.",
+        reason: "Run pithy email provision --worker api.",
       }),
-    ).toBe("email: skipped. Run pithy email provision.");
+    ).toBe("email: skipped. Run pithy email provision --worker api.");
   });
 
   // Color is off for every unit test (`vitest.shared`), so this asserts the sentence rather than the
@@ -584,7 +677,7 @@ describe("each capability settles as it is decided", () => {
     );
 
     expect(events.filter((event) => event.phase === "settled")).toEqual(
-      rows.map((row) => ({ phase: "settled", line: summarizeKitDeploy(row) })),
+      rows.map((row) => ({ phase: "settled", line: summarizeKitDeploy(row), data: { kit: row } })),
     );
     // Not an empty set dressed up as agreement: the fixture composes email, so there is a row to settle.
     expect(rows).toHaveLength(1);
@@ -598,7 +691,8 @@ describe("each capability settles as it is decided", () => {
     );
 
     expect(rows[0]?.outcome).toBe("skipped");
-    expect(events).toEqual([{ phase: "settled", line: summarizeKitDeploy(rows[0] as KitWorkerDeploy) }]);
+    const row = rows[0] as KitWorkerDeploy;
+    expect(events).toEqual([{ phase: "settled", line: summarizeKitDeploy(row), data: { kit: row } }]);
   });
 });
 

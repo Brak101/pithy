@@ -5,16 +5,18 @@ import { readFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import type { D1Database } from "@cloudflare/workers-types";
 import type { Capability } from "@pithy-sh/core/src/capability/capability";
+import { type Caller, callerOf, pithyCommand } from "@pithy-sh/core/src/cli/command";
 import { composeDatabases } from "@pithy-sh/core/src/data/databases";
 import {
   InternalError,
   NotFoundError,
   PithyError,
+  PreconditionFailedError,
   sentenceOf,
   ValidationError,
 } from "@pithy-sh/core/src/error/pithyError";
 import { generatedMigrationGroup } from "@pithy-sh/core/src/migrations/groups";
-import { claimMigrationOwnership } from "@pithy-sh/core/src/migrations/owner";
+import { claimMigrationOwnership, foreignOwnerRefusal, readMigrationOwner } from "@pithy-sh/core/src/migrations/owner";
 import { createMigrationRegistry, type NamespacedMigrations } from "@pithy-sh/core/src/migrations/registry";
 import {
   assertRetainedAgreed,
@@ -44,13 +46,17 @@ import type { Migration, MigrationProvider, MigrationResult } from "kysely/migra
 import { z } from "zod";
 import { cloudflareClients } from "../cloudflare/clients";
 import { type CloudflareAccountSelection, cloudflareEnv } from "../cloudflare/config";
+import type { PlanMigration } from "../plan/plan";
 import { resolveWorkersFor } from "../project/composeFor";
 import { isPlaceholder } from "../project/envInventory";
+import { workerDirName } from "../project/workerIdentity";
 import { provisionConfigPath, wranglerConfigPath } from "../provision/featureConfig";
+import { withProvisionFix } from "../provision/provisionFix";
 import { startStep } from "../terminal/progress";
 import { assertRollbackConfirmed } from "./confirm";
 import { planGroupRollback, requireMigrationGroup, sharedGroupRefusal } from "./groups";
 import { assertLedgerDeclared, UndeclaredMigration } from "./ledger";
+import { inLocalStateCopy } from "./localStateCopy";
 import { collectMigrationSets } from "./registry";
 
 /**
@@ -128,6 +134,17 @@ export interface MigrationFanOutOptions {
   /** Test seam: build the remote D1 for a binding instead of the default REST-backed client. */
   remoteD1?: RemoteD1Factory;
   /**
+   * The caller's own `pithy migrate` (#711), the one input a refusal naming it again — a rollback of a named group —
+   * is built from, so the line keeps every flag and the scope the caller gave. `pithy migrate` passes its parsed
+   * arguments; absent, it is {@link migrateCallerOf} these options, for a caller with no command line behind it.
+   */
+  caller?: Caller<"migrate">;
+  /**
+   * The project's `seed.productionEnvironments`. Read only to decide whether an unprovisioned refusal can
+   * name a `fix`: provisioning production needs a person's `--confirm` phrase, so it gets none.
+   */
+  productionEnvironments?: readonly string[];
+  /**
    * The Workers to run against, already resolved. Skips `apps/` discovery for the run's **scope** — for a
    * caller that resolved the set itself (`pithy add` hands over the one Worker it just wired), and for
    * tests, whose fixture Workers carry no importable `pithy.config.ts`. The project is still discovered
@@ -182,31 +199,48 @@ export interface MigrateProjectOptions extends MigrationFanOutOptions {
 /** A reset never rolls back — it rolls *everything* back, then reapplies everything. */
 export type ResetProjectOptions = Omit<MigrateProjectOptions, "rollback" | "confirmRollback">;
 
-/** One database's migration run: which database, its binding, and what Kysely did. */
-export interface DatabaseRun {
-  /** The database name (a capability's `databases` key). */
-  database: string;
-  /** The D1 binding it resolves to in this Worker's `wrangler.jsonc`. */
-  binding: string;
-  /**
-   * The migrations this Worker's capabilities contributed, and how each fared. A shared database always
-   * migrates as a whole — a run narrowed to one Worker still applies what the Workers it shares with
-   * contributed — but every result is credited to the Worker that declared it, so a row never claims a
-   * migration its own capabilities do not own.
-   */
-  results: MigrationResult[];
-  /**
-   * The other Workers bound to this same physical D1. Present only when a database is shared: the
-   * merged registry ran once for all of them, and each Worker is credited with its own migrations.
-   */
-  sharedWith?: string[];
-  /**
-   * The other environments whose stanzas bind this same database. Present only when a rollback or a reset
-   * left it untouched for that reason: an environment-scoped command does not reverse a database another
-   * environment reads — `EMAIL_SUPPRESSIONS` is production's suppression list too (#588).
-   */
-  boundBy?: string[];
-}
+/** One migration Kysely ran, or did not, as a `--json` payload states it. Kysely's own `MigrationResult`. */
+export const MigrationResultJson = z
+  .object({
+    migrationName: z.string().describe("The migration's namespaced name, e.g. `0300_auth_0001_init`."),
+    direction: z.enum(["Up", "Down"]).describe("The direction it was executed in."),
+    status: z
+      .enum(["Success", "Error", "NotExecuted"])
+      .describe("How it fared. `NotExecuted` means an earlier migration failed."),
+  })
+  .describe("One migration and how it fared.");
+
+/**
+ * One database's migration run: which database, its binding, and what Kysely did.
+ *
+ * `results` holds the migrations this Worker's capabilities contributed. A shared database always
+ * migrates as a whole — a run narrowed to one Worker still applies what the Workers it shares with
+ * contributed — but every result is credited to the Worker that declared it, so a row never claims a
+ * migration its own capabilities do not own.
+ *
+ * `sharedWith` is present only when a database is shared: the merged registry ran once for all of them.
+ * `boundBy` is present only when a rollback or a reset left it untouched because another environment's
+ * stanza binds it: an environment-scoped command does not reverse a database another environment reads —
+ * `EMAIL_SUPPRESSIONS` is production's suppression list too (#588).
+ */
+export const DatabaseRun = z
+  .object({
+    database: z.string().describe("The database name — a capability's `databases` key."),
+    binding: z.string().describe("The D1 binding it resolves to in this Worker's `wrangler.jsonc`."),
+    results: z
+      .array(MigrationResultJson)
+      .describe("The migrations this Worker's capabilities contributed, and how each fared."),
+    sharedWith: z
+      .array(z.string().describe("Another Worker's name."))
+      .optional()
+      .describe("The other Workers bound to this same physical D1. Present only when it is shared."),
+    boundBy: z
+      .array(z.string().describe("Another environment's name."))
+      .optional()
+      .describe("The other environments binding this database. Present only when that left it untouched."),
+  })
+  .describe("One database's migration run: which database, its binding, and what Kysely did.");
+export type DatabaseRun = Omit<z.infer<typeof DatabaseRun>, "results"> & { results: MigrationResult[] };
 
 /** One Worker's slice of a fan-out run: the Worker, and each database its registry touched. */
 export interface WorkerMigrationRun {
@@ -368,14 +402,14 @@ function buildPlan(worker: WorkerScope): WorkerPlanEntry[] {
     if (!group) {
       throw new InternalError({
         message: `Database "${database}" has migrations but no capability declares it.`,
-        action: "Declare the database (binding and tables) in a capability. Run pithy migrate again.",
+        action: "Declare the database (binding and tables) in a capability, then run this again.",
       });
     }
     const owner = bindingOwner.get(group.binding);
     if (owner) {
       throw new InternalError({
         message: `Databases "${owner}" and "${database}" are both bound to "${group.binding}".`,
-        action: "Give each database its own binding. Run pithy migrate again.",
+        action: "Give each database its own binding, then run this again.",
       });
     }
     bindingOwner.set(group.binding, database);
@@ -439,7 +473,7 @@ async function mergeGroup(
       if (sameMigrations(prior.set, set)) continue;
       throw new InternalError({
         message: `Workers "${prior.worker}" and "${entry.worker}" both migrate "${binding}" under the "${set.namespace}" namespace, with different migrations.`,
-        action: "Rename one capability, or bind the workers to different databases. Run pithy migrate again.",
+        action: "Rename one capability, or bind the workers to different databases, then run this again.",
       });
     }
   }
@@ -482,7 +516,7 @@ async function buildGroups(workers: WorkerScope[], env: string, scope: Set<strin
       if (!scope.has(worker.name)) continue;
       throw new ValidationError({
         message: `${worker.name}: wrangler.jsonc has no env.${env} stanza.`,
-        action: `Add the ${env} environment to ${worker.name}'s wrangler.jsonc with its D1 bindings. Run pithy migrate --env ${env} again.`,
+        action: `Add the ${env} environment to ${worker.name}'s wrangler.jsonc with its D1 bindings, then run this again.`,
       });
     }
     const local = idsFor(config.d1_databases);
@@ -571,7 +605,7 @@ async function defaultRemoteD1(env: string, account: CloudflareAccountSelection 
   // (an operator mints it with `pithy token mint ci-system` and sets it as CI's CLOUDFLARE_API_TOKEN).
   const apiToken = vars.CLOUDFLARE_API_TOKEN ?? "";
   if (!accountId || !apiToken) {
-    throw new ValidationError({
+    throw new PreconditionFailedError({
       message: "Cloudflare credentials are missing.",
       action: `Set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN to migrate --env ${env}.`,
     });
@@ -593,6 +627,7 @@ async function remoteDriver(
   groups: DatabaseGroup[],
   account: CloudflareAccountSelection | null,
   override?: RemoteD1Factory,
+  productionEnvironments?: readonly string[],
 ): Promise<MigrationDriver> {
   // Build the REST-backed D1 per binding; the default reaches for creds, an override bypasses them.
   const resolveD1: RemoteD1Factory = override ?? (await defaultRemoteD1(env, account));
@@ -600,10 +635,11 @@ async function remoteDriver(
   const cache = new Map<string, D1Database>();
   for (const group of groups) {
     if (!group.databaseId) {
-      throw new ValidationError({
+      const refusal = new PreconditionFailedError({
         message: `wrangler.jsonc env.${env} has no database_id for the "${group.binding}" binding.`,
-        action: `Provision the ${env} D1 and set its id on ${group.binding}. Run pithy migrate --env ${env} again.`,
+        action: `Provision the ${env} D1 and set its id on ${group.binding}, then run this again.`,
       });
+      throw withProvisionFix(refusal, env, productionEnvironments);
     }
     cache.set(group.id, resolveD1({ binding: group.binding, databaseId: group.databaseId }));
   }
@@ -634,6 +670,8 @@ interface RunContext {
   project?: string;
   /** The one binding the run is narrowed to, when the caller named one. */
   binding?: string;
+  /** The caller's own run, which a refusal naming it again is built from (#711). */
+  caller: Caller<"migrate">;
   /**
    * The bindings a capability drop is confined to: its own databases. Set by {@link dropCapabilityTables}
    * alone, whose in-scope Worker composes more than the capability it drops — so without this every other
@@ -644,13 +682,15 @@ interface RunContext {
   destroyRetained?: number;
   /** Test seam for the remote D1 client. */
   remoteD1?: RemoteD1Factory;
+  /** The project's `seed.productionEnvironments`, carried from the run's options. */
+  productionEnvironments?: readonly string[];
 }
 
 /** Pick the driver for the target environment: Miniflare for `dev`, the D1 REST API otherwise. */
 function driverFor(context: RunContext, groups: DatabaseGroup[]): Promise<MigrationDriver> {
   return context.env === "dev"
     ? localDriver(context.persistRoot, groups)
-    : remoteDriver(context.env, groups, context.account, context.remoteD1);
+    : remoteDriver(context.env, groups, context.account, context.remoteD1, context.productionEnvironments);
 }
 
 /**
@@ -675,13 +715,15 @@ export async function resolveWorkerScopes(options: {
     });
   }
   if (options.worker === undefined) return options.workers;
-  const found = options.workers.filter(
-    (candidate) => candidate.name === options.worker || candidate.dir.endsWith(`/${options.worker}`),
-  );
+  // The directory first, as `pick` reads it: a Worker whose deployed name is another's directory must not
+  // answer for it.
+  const byDir = options.workers.filter((candidate) => workerDirName(candidate) === options.worker);
+  const found = byDir.length > 0 ? byDir : options.workers.filter((candidate) => candidate.name === options.worker);
   if (found.length === 0) {
-    throw new NotFoundError({
+    // The call's mistake (exit 2): nothing to run first, only a different `--worker` to pass.
+    throw new ValidationError({
       message: `No worker named "${options.worker}".`,
-      action: `Run pithy worker list to see this project's workers. Known: ${options.workers.map((w) => w.name).join(", ")}.`,
+      action: `Run ${pithyCommand("worker list")} to see this project's workers. Known: ${options.workers.map(workerDirName).join(", ")}.`,
     });
   }
   return found;
@@ -761,17 +803,35 @@ async function scopedGroups(context: RunContext): Promise<DatabaseGroup[]> {
  * by two commands and ignored by six. A nameless run is now impossible to *reach* the write with.
  */
 async function claimGroups(context: RunContext, driver: MigrationDriver, groups: DatabaseGroup[]): Promise<void> {
-  const project = context.project;
-  if (project === undefined) {
-    throw new ValidationError({
-      message: "A migration run needs a project name.",
-      action:
-        "Set `name` in pithy.config.ts. It stamps each database as this project's, so another project's database is refused instead of silently merged.",
-      detail: `No project on a run over ${groups.map((group) => group.binding).join(", ") || "no databases"}.`,
-    });
-  }
+  const project = requireRunProject(context, groups);
   for (const group of groups) {
     await claimMigrationOwnership(driver.database(group), { project, binding: group.binding });
+  }
+}
+
+/** The project a run claims its databases for, or the refusal for a run that names none. */
+function requireRunProject(context: RunContext, groups: DatabaseGroup[]): string {
+  if (context.project !== undefined) return context.project;
+  throw new ValidationError({
+    message: "A migration run needs a project name.",
+    action:
+      "Set `name` in pithy.config.ts. It stamps each database as this project's, so another project's database is refused instead of silently merged.",
+    detail: `No project on a run over ${groups.map((group) => group.binding).join(", ") || "no databases"}.`,
+  });
+}
+
+/**
+ * **The claim's refusal, reached by reading alone (#697).** A plan stamps nothing — a database nobody owns
+ * stays unowned until the run that migrates it — but a database another project owns is refused in the
+ * words {@link claimMigrationOwnership} refuses it with, because the plan's job is to fail where the run
+ * would. `migrations/dryRun.test.ts` holds the two refusals to one payload.
+ */
+async function assertClaimable(context: RunContext, driver: MigrationDriver, groups: DatabaseGroup[]): Promise<void> {
+  const project = requireRunProject(context, groups);
+  for (const group of groups) {
+    const owner = await readMigrationOwner(driver.database(group));
+    if (owner === undefined || owner.project === project) continue;
+    throw foreignOwnerRefusal(owner.project, project, group.binding);
   }
 }
 
@@ -881,6 +941,81 @@ export function migratedBeforeFailure(error: unknown): MigrationProgress | undef
   return progressReport.read(error);
 }
 
+/** What a pass is, apart from the work: what {@link runScope} and {@link preflight} decide from. */
+type PassShape = Pick<MigrationPass, "group" | "reverses" | "spansLedger">;
+
+/** The databases one pass is over, once narrowed and once the ones it must leave alone are set aside. */
+interface RunScope {
+  /** Every database in scope, in fan-out order. */
+  scoped: DatabaseGroup[];
+  /** The ones a reversing pass leaves alone, because another environment binds them (#588). */
+  kept: DatabaseGroup[];
+  /** The ones the pass acts on: `scoped` without `kept`. */
+  groups: DatabaseGroup[];
+}
+
+/**
+ * Narrow the run to its databases, set aside the ones a reversing pass may not touch, and refuse when the
+ * caller named one of those. Shared by the run and its plan, so the two are over the same databases.
+ */
+async function runScope(context: RunContext, pass: PassShape): Promise<RunScope> {
+  const scoped = await scopedGroups(context);
+  const kept = pass.reverses ? scoped.filter((group) => group.boundBy.length > 0) : [];
+  // Named on purpose, a shared database is refused rather than quietly skipped: the operator asked for
+  // exactly the thing this run will not do.
+  const [named] = context.binding !== undefined ? kept : [];
+  // A group rollback says which group it was refused for, here as in the pre-flight: the operator asked
+  // for a group, and "nothing in it was reversed" is the fact they act on (#694).
+  if (named) {
+    const requested = pass.group?.requested;
+    throw requested === undefined
+      ? sharedRefusal(named, context.env)
+      : sharedGroupRefusal(named.binding, named.boundBy, context.env, requested);
+  }
+  return { scoped, kept, groups: scoped.filter((group) => !kept.includes(group)) };
+}
+
+/**
+ * **Every check a pass makes before its first write, in the order the run makes them** — the claim, the
+ * ledger, the group pre-flight, the retained count. It returns the group's steps for a rollback.
+ *
+ * The run and its plan both come through here, so `pithy migrate --dry-run` refuses wherever the run would
+ * (#697). The one difference is the claim, which is the caller's: the run stamps the owner, and the plan
+ * only reads it.
+ */
+async function preflight(
+  context: RunContext,
+  pass: PassShape,
+  driver: MigrationDriver,
+  scope: RunScope,
+  claim: (groups: DatabaseGroup[]) => Promise<void>,
+): Promise<Map<DatabaseGroup, MigrationGroupStep> | undefined> {
+  const { kept, groups } = scope;
+  await claim(groups);
+  if (pass.spansLedger) await assertLedgerDeclared({ env: context.env, driver, groups });
+  // The group pre-flight before the retained count, because it decides which databases the count is
+  // over: a database holding none of the group reverses nothing there, so its retained rows are not
+  // at risk and demanding a budget for them would refuse a rollback that was never going to touch them.
+  const steps = pass.group
+    ? await planGroupRollback({
+        env: context.env,
+        driver,
+        databases: groups,
+        kept,
+        requested: pass.group.requested,
+        caller: context.caller,
+        workerDir: (name) => {
+          const scope = context.groupWorkers.find((one) => one.name === name);
+          return scope === undefined ? name : workerDirName(scope);
+        },
+      })
+    : undefined;
+  if (pass.reverses) {
+    await assertRetainedCounted(context, driver, steps ? groups.filter((group) => steps.has(group)) : groups);
+  }
+  return steps;
+}
+
 /**
  * Open the driver, run the pass per group, fold the results into a per-Worker report, and tear down.
  *
@@ -905,20 +1040,8 @@ export function migratedBeforeFailure(error: unknown): MigrationProgress | undef
  */
 async function runGroups(context: RunContext, pass: MigrationPass): Promise<WorkerMigrationRun[]> {
   const report = emptyReport(context.workers);
-  const scoped = await scopedGroups(context);
-  const kept = pass.reverses ? scoped.filter((group) => group.boundBy.length > 0) : [];
-  // Named on purpose, a shared database is refused rather than quietly skipped: the operator asked for
-  // exactly the thing this run will not do.
-  const [named] = context.binding !== undefined ? kept : [];
-  // A group rollback says which group it was refused for, here as in the pre-flight: the operator asked
-  // for a group, and "nothing in it was reversed" is the fact they act on (#694).
-  if (named) {
-    const requested = pass.group?.requested;
-    throw requested === undefined
-      ? sharedRefusal(named, context.env)
-      : sharedGroupRefusal(named.binding, named.boundBy, context.env, requested);
-  }
-  const groups = scoped.filter((group) => !kept.includes(group));
+  const scope = await runScope(context, pass);
+  const { scoped, kept, groups } = scope;
   if (groups.length === 0) {
     for (const group of kept) record(report, group, [], group.boundBy);
     return report;
@@ -931,23 +1054,7 @@ async function runGroups(context: RunContext, pass: MigrationPass): Promise<Work
   // pre-flight asks whether one of them holds part of the group it was asked to reverse (#694).
   const driver = await driverFor(context, scoped);
   try {
-    await claimGroups(context, driver, groups);
-    if (pass.spansLedger) await assertLedgerDeclared({ env: context.env, driver, groups });
-    // The group pre-flight before the retained count, because it decides which databases the count is
-    // over: a database holding none of the group reverses nothing there, so its retained rows are not
-    // at risk and demanding a budget for them would refuse a rollback that was never going to touch them.
-    const steps = pass.group
-      ? await planGroupRollback({
-          env: context.env,
-          driver,
-          databases: groups,
-          kept,
-          requested: pass.group.requested,
-        })
-      : undefined;
-    if (pass.reverses) {
-      await assertRetainedCounted(context, driver, steps ? groups.filter((group) => steps.has(group)) : groups);
-    }
+    const steps = await preflight(context, pass, driver, scope, (claimed) => claimGroups(context, driver, claimed));
     // The operator's number, spent across the whole run by the runner's own guard — never the count the
     // preflight just made, which would make the floor agree with whatever the check above it concluded.
     const budget = new RetainedBudget(context.destroyRetained);
@@ -1126,6 +1233,24 @@ async function discoverNeighbors(projectDir: string, env: string, named: string)
  * built from) and the run's own scope (what is reported, and which databases are visited). The scope is
  * always the caller's set narrowed by `--worker`, so an unknown name still fails naming the same Workers.
  */
+/**
+ * **`pithy migrate --rollback` as a run with no command line behind it names itself (#711)** — a test, or a caller
+ * that drives {@link migrateProject} directly: its environment, and the Worker and binding it was narrowed to. The
+ * command passes its own parsed arguments instead, so every flag the caller gave carries.
+ */
+export function migrateCallerOf(options: {
+  readonly env: string;
+  readonly worker?: string | undefined;
+  readonly binding?: string | undefined;
+}): Caller<"migrate"> {
+  return callerOf("migrate", {
+    env: options.env,
+    rollback: true,
+    ...(options.worker === undefined ? {} : { worker: options.worker }),
+    ...(options.binding === undefined ? {} : { binding: options.binding }),
+  });
+}
+
 async function contextFor(
   options: MigrationFanOutOptions & { project?: string; destroyRetained?: number },
 ): Promise<RunContext> {
@@ -1143,8 +1268,10 @@ async function contextFor(
     env: options.env,
     ...(options.project !== undefined ? { project: options.project } : {}),
     ...(options.binding !== undefined ? { binding: options.binding } : {}),
+    caller: options.caller ?? migrateCallerOf(options),
     ...(options.destroyRetained !== undefined ? { destroyRetained: options.destroyRetained } : {}),
     ...(options.remoteD1 ? { remoteD1: options.remoteD1 } : {}),
+    ...(options.productionEnvironments ? { productionEnvironments: options.productionEnvironments } : {}),
   };
 }
 
@@ -1190,6 +1317,100 @@ export async function migrateProject(options: MigrateProjectOptions): Promise<Wo
     reverses: false,
     execute: (database, provider, target) => runMigrations(database, provider, target, { group }),
   });
+}
+
+/** Options for {@link planMigrateProject}: a run's, plus the databases the caller is about to create. */
+export interface PlanMigrateOptions extends Omit<MigrateProjectOptions, "confirmRollback"> {
+  /**
+   * Remote `database_id`s that do not exist yet, because the caller's own plan creates them — `pithy provision
+   * --dry-run`, which writes a placeholder id where the new database's would go. A database that does not
+   * exist has applied nothing, so every migration it carries is pending, and nothing is asked of it.
+   */
+  fresh?: ReadonlySet<string>;
+}
+
+/** One planned migration per name, credited to the Worker whose capability declared it. */
+function plannedFor(
+  group: DatabaseGroup,
+  env: string,
+  names: readonly string[],
+  direction: "up" | "down",
+): PlanMigration[] {
+  return names.map((name) => {
+    const worker = group.owners.get(name) ?? group.entries[0]?.worker ?? group.database;
+    const entry = group.entries.find((candidate) => candidate.worker === worker);
+    return {
+      env,
+      worker,
+      database: entry?.database ?? group.database,
+      binding: entry?.binding ?? group.binding,
+      name,
+      direction,
+    };
+  });
+}
+
+/**
+ * **What {@link migrateProject} would apply or roll back, without applying or rolling back anything (#697).**
+ *
+ * The same fan-out, the same groups and every check the run makes before it writes — the ledger refusal,
+ * the group pre-flight, the retained count — then the pending names forward, or the group's own names
+ * backwards, newest first. It stops where the run would start changing a database.
+ *
+ * **Two differences, both so that nothing is written.** It claims no database: a foreign owner is refused in
+ * the claim's own words, and an unowned database stays unowned. And locally it reads a copy of the store,
+ * since opening a Miniflare store can write to it (`./localStateCopy`). A rollback outside `dev` is planned without the
+ * confirmation phrase, because nothing it plans comes down.
+ */
+export async function planMigrateProject(options: PlanMigrateOptions): Promise<PlanMigration[]> {
+  const rollback = options.rollback ?? false;
+  const context = await contextFor(options);
+  const named = requireMigrationGroup(options.group);
+  const pass: PassShape = rollback
+    ? { spansLedger: true, reverses: true, group: { requested: named } }
+    : { spansLedger: true, reverses: false };
+  const scope = await runScope(context, pass);
+  const direction = rollback ? "down" : "up";
+  const fresh = (group: DatabaseGroup): boolean =>
+    group.databaseId !== undefined && (options.fresh?.has(group.databaseId) ?? false);
+
+  const names = new Map<DatabaseGroup, readonly string[]>();
+  for (const group of scope.groups.filter(fresh)) {
+    names.set(group, rollback ? [] : Object.keys(await group.provider.getMigrations()).sort());
+  }
+  const read: RunScope = {
+    scoped: scope.scoped.filter((group) => !fresh(group)),
+    kept: scope.kept.filter((group) => !fresh(group)),
+    groups: scope.groups.filter((group) => !fresh(group)),
+  };
+  if (read.groups.length > 0) {
+    startStep(`Checking ${[...new Set(read.groups.map((group) => group.binding))].join(", ")}`);
+    const readGroups = async (from: RunContext): Promise<void> => {
+      const driver = await driverFor(from, read.scoped);
+      try {
+        const steps = await preflight(context, pass, driver, read, (claimed) =>
+          assertClaimable(context, driver, claimed),
+        );
+        for (const group of read.groups) {
+          names.set(
+            group,
+            steps
+              ? (steps.get(group)?.migrations ?? [])
+              : (await readMigrationLedger(driver.database(group), group.provider)).pending,
+          );
+        }
+      } finally {
+        await driver.dispose();
+      }
+    };
+    // Locally, a copy of the store: opening a Miniflare store can write to it.
+    if (context.env === LOCAL_ENVIRONMENT) {
+      await inLocalStateCopy(context.persistRoot, (root) => readGroups({ ...context, persistRoot: root }));
+    } else {
+      await readGroups(context);
+    }
+  }
+  return scope.groups.flatMap((group) => plannedFor(group, context.env, names.get(group) ?? [], direction));
 }
 
 /**
@@ -1509,6 +1730,8 @@ export async function dropCapabilityTables(options: DropCapabilityOptions): Prom
     account: options.account,
     env: options.env,
     project: options.project,
+    // A drop reverses no named group, so no refusal it raises names a rollback; the context is its own run's.
+    caller: migrateCallerOf({ env: options.env }),
     ...(options.destroyRetained !== undefined ? { destroyRetained: options.destroyRetained } : {}),
     ...(options.remoteD1 ? { remoteD1: options.remoteD1 } : {}),
   };

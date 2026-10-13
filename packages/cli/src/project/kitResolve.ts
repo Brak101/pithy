@@ -1,10 +1,17 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
-import { existsSync, readdirSync, realpathSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, relative, sep } from "node:path";
 import { pathToFileURL } from "node:url";
+import {
+  type EntryProbe,
+  type InstalledProbe,
+  nodeModulesProbe,
+  packageEntryProbe,
+} from "@pithy-sh/core/src/error/unresolved";
+import { packageOf } from "@pithy-sh/core/src/naming/packageName";
 
 /**
  * **A `@pithy-sh/*` module, resolved from the project — never from wherever the CLI is installed.**
@@ -124,12 +131,6 @@ import { pathToFileURL } from "node:url";
  * it means removing those static imports, which is its own issue.
  */
 
-/** `@pithy-sh/payments` from `@pithy-sh/payments/src/capability` — the package, not the subpath. */
-function packageOf(specifier: string): string {
-  const parts = specifier.split("/");
-  return specifier.startsWith("@") ? parts.slice(0, 2).join("/") : (parts[0] ?? specifier);
-}
-
 /**
  * Where `pkg` lives on the `node_modules` chain `projectDir` walks, or `null`.
  *
@@ -151,6 +152,29 @@ export function packageDirFrom(projectDir: string, pkg: string): string | null {
     dir = parent;
   }
 }
+
+/**
+ * Whether `pkg` sits on the `node_modules` chain above `referrer`, the file whose import of it failed — the
+ * chain the runtime walked and found nothing on, asked again of the filesystem.
+ *
+ * Core's `nodeModulesProbe` over `node:fs`: the walk, and the `realpath` it starts from, are core's, so the
+ * CLI and the vite plugin cannot walk two different chains. Bun 1.4.2 writes one sentence for a deep import
+ * whether its package is absent or installed without that path (#709), so this is what tells an install
+ * that will help from one that will not.
+ */
+export const installedBeside: InstalledProbe = nodeModulesProbe({ exists: existsSync, realpath: realpathSync });
+
+/**
+ * An installed `pkg`'s `package.json` on the same chain, and what is on disk beside it. Bun 1.4.2 writes the
+ * absent-package sentence for one that declares no entry and for one whose declared entry is not on disk,
+ * and only the manifest tells *import a path* from *rebuild it* — for a bare name and, through `exports`, for
+ * a deep import too (#709).
+ */
+export const entryBeside: EntryProbe = packageEntryProbe({
+  exists: existsSync,
+  realpath: realpathSync,
+  read: (path) => readFileSync(path, "utf8"),
+});
 
 /**
  * The project's Worker directories — `apps/*`, and nothing else.

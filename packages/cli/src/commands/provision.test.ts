@@ -9,6 +9,8 @@ import { DeclaredEnvironments, FEATURE_ENVIRONMENT } from "@pithy-sh/core/src/na
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { requireManagedEnvironment } from "../project/environment";
 import type { ProvisionedDeclines, ProvisionedResource, ProvisionReport } from "../provision/environment";
+import { provisionNext } from "../terminal/nextSteps";
+import { expectConforms } from "../test-utils/payloadContract";
 import { provisionProgress, runProvision, writeReport } from "./provision";
 
 /**
@@ -128,7 +130,7 @@ describe("pithy provision reports what it left out", () => {
       return true;
     }) as typeof process.stdout.write;
     try {
-      writeReport(report, { json, seeded: false, pending: { names: [], remedy: null }, registry: {} });
+      writeReport(report, { json, seeded: false, pending: { names: [], remedy: null, sentence: null }, registry: {} });
     } finally {
       process.stdout.write = original;
     }
@@ -313,11 +315,13 @@ describe("pithy provision narrates the run it is doing", () => {
     '"configs":[{"worker":"board","path":"apps/board/wrangler.jsonc","ids":1}]',
     '"committed":true',
     '"pendingSecrets":[]',
-    '"pendingSecretsRemedy":null}',
+    '"pendingSecretsRemedy":null',
+    // #697: every run says whether it was a dry run, so a parser never has to infer it from the plan.
+    '"dryRun":false}',
   ].join(",")}\n`;
 
   test("--json is one line, unchanged, whether or not the human run streams", () => {
-    const pending = { names: [], remedy: null };
+    const pending = { names: [], remedy: null, sentence: null };
     const registry = {};
     const streamed = captured(() =>
       writeReport(full, { json: true, seeded: false, pending, registry, streamed: true }),
@@ -327,6 +331,67 @@ describe("pithy provision narrates the run it is doing", () => {
     // And the flag that moves the human lines moves nothing here — there is one line either way.
     expect(captured(() => writeReport(full, { json: true, seeded: false, pending, registry }))).toBe(JSON_LINE);
     expect(streamed.trimEnd().split("\n")).toHaveLength(1);
+  });
+
+  /**
+   * **`next` is the deploy a Worker it names still needs, and no key otherwise (#697).** The condition is
+   * `terminal/nextSteps.test.ts`'s and the account's answer `provision/undeployed.test.ts`'s; this holds the
+   * line to carrying what it is handed, last, and to the published payload.
+   */
+  test("--json carries next only when the run hands it one", async () => {
+    const pending = { names: [], remedy: null, sentence: null };
+    const next = provisionNext({ env: "staging", undeployed: ["board-staging"] });
+    const line = captured(() => writeReport(full, { json: true, seeded: false, pending, registry: {}, next }));
+    expect(line).toBe(
+      JSON_LINE.replace(
+        '"dryRun":false}',
+        '"dryRun":false,"next":[{"command":"pithy deploy --env staging","why":"board-staging is not deployed in staging."}]}',
+      ),
+    );
+    await expectConforms("provision", () =>
+      captured(() => writeReport(full, { json: true, seeded: false, pending, registry: {}, next })),
+    );
+    const none = provisionNext({ env: "staging", undeployed: [] });
+    expect(captured(() => writeReport(full, { json: true, seeded: false, pending, registry: {}, next: none }))).toBe(
+      JSON_LINE,
+    );
+  });
+
+  /** Held to the schema `pithy schema provision` publishes (#697): a declared run, and a feature's extras. */
+  test("--json conforms to its published payload", async () => {
+    const decision =
+      "`pithy secrets provision` runs against every environment, production included. That is a person's decision, not a fix.";
+    const pending = { names: ["link-key"], remedy: decision, sentence: decision };
+    await expectConforms("provision", () =>
+      captured(() => writeReport(full, { json: true, seeded: false, pending, registry: {} })),
+    );
+    const feature: ProvisionReport = {
+      ...full,
+      env: "feature",
+      committed: false,
+      declined: [
+        {
+          state: "read",
+          worker: "board",
+          declines: [{ state: "unrecognized", name: "CACHE", reason: "No cache here." }],
+        },
+        { state: "invalid", worker: "web", problem: "declinedBindings.CACHE is not a string." },
+      ],
+      featureSecrets: [{ name: "link-key", environments: ["feature"], created: ["feature"] }],
+      hosts: [{ capability: "email", worker: "acme-f1-x-email", outcome: "deployed", reason: "Deployed." }],
+      routesDropped: [{ worker: "board", routes: ["api.example.com/*"] }],
+      bindingsDropped: [{ worker: "board", bindings: ["STRANGER"] }],
+    };
+    await expectConforms("provision", () =>
+      captured(() =>
+        writeReport(feature, {
+          json: true,
+          seeded: true,
+          pending: { names: [], remedy: null, sentence: null },
+          registry: {},
+        }),
+      ),
+    );
   });
 
   /**
@@ -343,7 +408,7 @@ describe("pithy provision narrates the run it is doing", () => {
       ...full,
       manifestFaults: [{ package: "@pithy-sh/email", reason: "requiredBindings[1].scope: not a known scope" }],
     };
-    const options = { seeded: false, pending: { names: [], remedy: null }, registry: {} };
+    const options = { seeded: false, pending: { names: [], remedy: null, sentence: null }, registry: {} };
 
     /** Capture stderr, where a defect in somebody else's package belongs — never the operator's summary. */
     function capturedErr(act: () => void): string {
@@ -395,6 +460,16 @@ describe("pithy provision narrates the run it is doing", () => {
     expect(provisionProgress({ json: true })).toBeUndefined();
   });
 
+  test("--events without --json in the parse is a person's run, so the lines stay prose", () => {
+    // `--json --no-json --events` parses to json false: no record may reach the lines a person reads.
+    const progress = provisionProgress({ json: false, events: true });
+    const written = captured(() =>
+      progress?.({ phase: "start", name: "replay-staging-db", binding: "DB", kind: "d1" }),
+    );
+
+    expect(written).toBe("▸ replay-staging-db...\n");
+  });
+
   /**
    * **A step line per resource, before that resource's result.** Both halves are asserted: the step is
    * what says the run has reached this resource, and the result is the line the summary used to hold
@@ -431,7 +506,7 @@ describe("pithy provision narrates the run it is doing", () => {
    * and stays exactly where it was.
    */
   test("the summary does not repeat what already streamed, and loses nothing else", () => {
-    const pending = { names: [], remedy: null };
+    const pending = { names: [], remedy: null, sentence: null };
     const registry = {};
     const streamed = captured(() =>
       writeReport(full, { json: false, seeded: false, pending, registry, streamed: true }),

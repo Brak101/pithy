@@ -14,6 +14,7 @@ import { buildDevConfig, type DevConfig, devConfigPath, readDevConfig, writeDevC
 import { BASE_PORT, BLOCK_SIZE, type PortsRegistry } from "../feature/ports";
 import { pruneFeatureBlocks } from "../feature/prune";
 import type { WorkerTarget } from "../project/workers";
+import { asCommand, expectConforms } from "../test-utils/payloadContract";
 import { parseDevLogFileName } from "./devLogPath";
 import type { DevLogRecord } from "./devLogRecord";
 import type { DevEvent } from "./events";
@@ -513,16 +514,21 @@ describe("ensureDevConfig", () => {
 });
 
 describe("startDev — spawn commands and env", () => {
-  test("wrangler worker gets `wrangler dev --port … --inspector-port 0`; custom command runs verbatim", async () => {
+  test("wrangler worker gets `wrangler --cwd <dir> dev --port … --inspector-port 0`; custom command runs verbatim", async () => {
     const h = harness();
     await startDev(h.options);
     const api = h.spawned.find((s) => s.opts.cwd === "/proj/apps/api");
     const web = h.spawned.find((s) => s.opts.cwd === "/proj/apps/web");
     expect(api).toMatchObject({
+      // The seam sees the command as `startWorker` names it — `bun` everywhere. The platform spelling
+      // is the spawn default's resolution (#698), applied below the seam and tested in
+      // `platform/command.test.ts`, where the Windows literal lives.
       command: "bun",
       args: [
         "x",
         "wrangler",
+        "--cwd",
+        "/proj/apps/api",
         "dev",
         "--port",
         "8787",
@@ -950,7 +956,7 @@ describe("startDev — the l keypress", () => {
     await keys.press("l");
 
     expect(opened).toEqual([]);
-    expect(h.stdoutLines).toContain("No dev login is seeded. Run pithy seed, then press l again.");
+    expect(h.stdoutLines).toContain("No dev login is seeded. Run pithy seed --env dev, then press l again.");
   });
 
   test("a browser that will not open is a sentence, not a dead session", async () => {
@@ -1205,12 +1211,17 @@ describe("startDev — ready deadline", () => {
   test("--json gets a record, not the prose — the agent's half of the report", async () => {
     // A session that never emits its ready line, read by a script: the sentence a person gets is not an
     // answer, so the deadline writes one JSON line per report. The prose goes to stderr, where a person
-    // reads it in either mode.
-    const { h } = await halfReady({ json: true });
-    h.advance(READY_DEADLINE_MS);
+    // reads it in either mode. Run as `pithy dev` runs it, so the record carries the command's version.
+    const h = await asCommand("dev", async () => {
+      const { h } = await halfReady({ json: true });
+      h.advance(READY_DEADLINE_MS);
+      return h;
+    });
 
     const records = h.stdoutLines.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line) as unknown);
-    expect(records).toEqual([{ command: "dev", event: "still-waiting", waiting: ["web"] }]);
+    expect(records).toEqual([{ command: "dev", schemaVersion: 1, event: "still-waiting", waiting: ["web"] }]);
+    // Held to the schema `pithy schema dev` publishes (#697).
+    await expectConforms("dev", h.stdoutLines.filter((line) => line.startsWith("{")).join("\n"));
     // And no prose report on stdout to confuse a reader parsing line by line.
     expect(h.stdoutLines.some((line) => line.startsWith("Still waiting on:"))).toBe(false);
     expect(h.stderrLines).toContain("Still waiting on: web.");
@@ -1775,7 +1786,7 @@ describe("startDev — naming what starts", () => {
     const h = harness({ ensureDevConfig: ensure, loadDevConfig: async () => null });
 
     await expect(startDev({ ...h.options, openLog, apps: ["nope"] })).rejects.toMatchObject({
-      payload: { code: "core/not_found" },
+      payload: { code: "validation/invalid_input" },
     });
     expect(h.spawned).toHaveLength(0);
     expect(ensure).not.toHaveBeenCalled();
@@ -2124,7 +2135,7 @@ describe("startDev — capability hosts", () => {
     await handle.ready;
     expect(calls).toEqual([true]);
     expect(h.stdoutLines.join("\n")).toContain("using the simulator");
-    expect(h.stdoutLines.join("\n")).toContain("pithy init");
+    expect(h.stdoutLines.join("\n")).toContain("set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN");
   });
 
   test("its output is labeled and tee'd like every other worker's, into its own file", async () => {
@@ -2202,7 +2213,7 @@ describe("startDev — capability hosts", () => {
     await handle.ready;
     expect(h.stdoutLines.filter((line) => line.includes("using the simulator"))).toHaveLength(1);
     // And the action line comes with it, because a problem without its remedy is half a report.
-    expect(h.stdoutLines.join("\n")).toContain("pithy init");
+    expect(h.stdoutLines.join("\n")).toContain("set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN");
   });
 
   test("a host whose config could not be resolved is not spawned, and the session still runs", async () => {
@@ -4012,13 +4023,16 @@ describe("startDev — autostart answers under a checkout that is gone", () => {
   test("under --json the prose is on stderr and stdout carries one parseable event", async () => {
     const h = harness({ projectDir: dir, json: true, ensureDeps: deps() });
 
-    await startDev(h.options);
+    // As `pithy dev` runs it, so the event carries the command's version.
+    await asCommand("dev", () => startDev(h.options));
 
     expect(h.stderrLines).toContain("Autostart answers are recorded for a checkout at /gone/app, which is gone: web.");
     for (const line of h.stdoutLines) expect(() => JSON.parse(line) as unknown).not.toThrow();
     expect(h.stdoutLines).toContain(
-      '{"command":"dev","event":"autostart-stale","roots":[{"root":"/gone/app","branches":[{"branch":"main","workers":["web"]}]}]}',
+      '{"command":"dev","schemaVersion":1,"event":"autostart-stale","roots":[{"root":"/gone/app","branches":[{"branch":"main","workers":["web"]}]}]}',
     );
+    // Held to the schema `pithy schema dev` publishes (#697).
+    await expectConforms("dev", h.stdoutLines.join("\n"));
   });
 
   // Acceptance criterion 5, at the session level: a registry whose every root is on disk adds no line

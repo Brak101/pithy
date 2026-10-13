@@ -23,7 +23,7 @@ pithy docs status [--json]
 | `--print` | boolean | `false` | `connect` only. Print the snippet and write nothing |
 | `--json` | boolean | `false` | Machine-readable output |
 
-`--client` and `--all` are mutually exclusive. `--scope` is required whenever nothing can be asked — a run under `--json`, or with no terminal attached.
+`--client` and `--all` are mutually exclusive. `--scope` is required whenever nothing can be asked — a run under `--json`, `--no-input` or `PITHY_NONINTERACTIVE=1`, or with no terminal attached — and so is `--client` or `--all`. Each refusal is `input/required`, naming the flag and every value it takes (`docs/CLI.md` §1.2).
 
 `disconnect` takes the same target flags without `--print`. `status` takes `--json` and nothing else: it reads.
 
@@ -70,7 +70,7 @@ A **project** file is committed. It hands the docs to everyone who checks the re
 
 A **user** file is yours. It follows you into every project you open, and nobody else on the team gets it.
 
-Those are different decisions with different blast radii, so the command asks rather than picking. An interactive run prints both sentences and asks *Who is this for?*; a run that cannot ask — `--json`, or no terminal — is refused unless `--scope` says. The flag path holds the same line the prompt does.
+Those are different decisions with different blast radii, so the command asks rather than picking. An interactive run prints both sentences and asks *Who is this for?*; a run that cannot ask — `--json`, `--no-input`, `PITHY_NONINTERACTIVE=1`, or no terminal — is refused unless `--scope` says. The flag path holds the same line the prompt does.
 
 A client that declares one scope takes it whatever `--scope` said. Claude Desktop, Cline and Goose have no project configuration to write, so `--scope project` against them is a question with one answer, and refusing over it would make `--all --scope project` unusable on a machine that happens to run Goose.
 
@@ -92,7 +92,7 @@ One line, one object. `command` names the subcommand that wrote it, and the rest
 
 ```
 $ pithy docs connect --all --scope user --json
-{"command":"docs connect","written":[{"client":"codex","scope":"user","path":"/home/you/.codex/config.toml","state":"added","reason":null,"snippet":null}]}
+{"command":"docs connect","schemaVersion":1,"written":[{"client":"codex","scope":"user","path":"/home/you/.codex/config.toml","state":"added","reason":null,"snippet":null}]}
 ```
 
 `written` is `[]` when no client was detected. That is exit 0 and not an error — there was nothing to write.
@@ -101,28 +101,28 @@ $ pithy docs connect --all --scope user --json
 
 ```
 $ pithy docs connect --client cursor --scope user --json
-{"command":"docs connect","written":[{"client":"cursor","scope":"user","path":"/home/you/.cursor/mcp.json","state":"refused","reason":"The file is not valid JSON, so nothing was written.","snippet":"{\n  \"mcpServers\": { \"pithy\": { \"url\": \"https://pithy.sh/mcp\" } }\n}\n"}]}
+{"command":"docs connect","schemaVersion":1,"written":[{"client":"cursor","scope":"user","path":"/home/you/.cursor/mcp.json","state":"refused","reason":"The file is not valid JSON, so nothing was written.","snippet":"{\n  \"mcpServers\": { \"pithy\": { \"url\": \"https://pithy.sh/mcp\" } }\n}\n"}]}
 ```
 
 **Connect, `--print`** — nothing was written, so there is no `written` array at all.
 
 ```
 $ pithy docs connect --print --client cursor --json
-{"command":"docs connect","printed":{"client":"cursor","path":"/home/you/.cursor/mcp.json","snippet":"{\n  \"mcpServers\": { \"pithy\": { \"url\": \"https://pithy.sh/mcp\" } }\n}\n"}}
+{"command":"docs connect","schemaVersion":1,"printed":{"client":"cursor","path":"/home/you/.cursor/mcp.json","snippet":"{\n  \"mcpServers\": { \"pithy\": { \"url\": \"https://pithy.sh/mcp\" } }\n}\n"}}
 ```
 
 **Disconnect.**
 
 ```
 $ pithy docs disconnect --all --scope user --json
-{"command":"docs disconnect","disconnected":[{"client":"cursor","scope":"user","path":"/home/you/.cursor/mcp.json","state":"removed","reason":null}]}
+{"command":"docs disconnect","schemaVersion":1,"disconnected":[{"client":"cursor","scope":"user","path":"/home/you/.cursor/mcp.json","state":"removed","reason":null}]}
 ```
 
 **Status** — every client in the registry, detected or not, with one record per scope it declares.
 
 ```
 $ pithy docs status --json
-{"command":"docs status","clients":[{"client":"cursor","label":"Cursor","detected":true,"scopes":[{"scope":"project","path":"/home/you/app/.cursor/mcp.json","connected":false,"url":null,"current":false},{"scope":"user","path":"/home/you/.cursor/mcp.json","connected":true,"url":"https://pithy.sh/mcp","current":true}]}]}
+{"command":"docs status","schemaVersion":1,"clients":[{"client":"cursor","label":"Cursor","detected":true,"scopes":[{"scope":"project","path":"/home/you/app/.cursor/mcp.json","connected":false,"url":null,"current":false},{"scope":"user","path":"/home/you/.cursor/mcp.json","connected":true,"url":"https://pithy.sh/mcp","current":true}]}]}
 ```
 
 The top-level keys:
@@ -130,6 +130,7 @@ The top-level keys:
 | key | type | meaning |
 |---|---|---|
 | `command` | string | The subcommand that wrote the line: `docs connect`, `docs disconnect` or `docs status`. On every payload |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `printed` | object | `connect --print` only. What would have been written, and where. Nothing was |
 | `written` | object[] | `connect` only. One record per client and scope acted on; `[]` when nothing was detected |
 | `disconnected` | object[] | `disconnect` only. One record per client and scope acted on |
@@ -187,7 +188,7 @@ And `printed`:
 
 ## Errors
 
-**Both `--client` and `--all`.** Exit 1.
+**Both `--client` and `--all`.** Exit 2.
 
 ```
 $ pithy docs connect --client cursor --all
@@ -195,7 +196,7 @@ Pass either --client or --all, not both.
 Choose one.
 ```
 
-**A client the table does not know.** Exit 1. The action lists every id.
+**A client the table does not know.** Exit 2. The action lists every id.
 
 ```
 $ pithy docs connect --client emacs --scope user
@@ -204,17 +205,17 @@ Pass one of: claude-code, cursor, vscode, gemini, claude-desktop, cline, zed, co
 ```
 
 ```
-{"error":{"code":"core/not_found","status":404,"message":"No client called emacs.","action":"Pass one of: claude-code, cursor, vscode, gemini, claude-desktop, cline, zed, codex, goose, continue."}}
+{"error":{"code":"validation/invalid_input","status":400,"issues":[],"message":"No client called emacs.","action":"Pass one of: claude-code, cursor, vscode, gemini, claude-desktop, cline, zed, codex, goose, continue.","exit":2,"retryable":false}}
 ```
 
-**No scope, and nothing that can be asked.** Exit 1. The refusal is the point: a default here would decide on your behalf whether your team gets this too.
+**No scope, and nothing that can be asked.** Exit 2. The refusal is the point: a default here would decide on your behalf whether your team gets this too.
 
 ```
 $ pithy docs connect --all --json
-{"error":{"code":"validation/invalid_input","status":400,"issues":[],"message":"--scope is required when nothing can be asked.","action":"Pass --scope project to commit it for the team, or --scope user for yourself."}}
+{"error":{"code":"input/required","status":400,"flag":"--scope","choices":["project","user"],"message":"--scope is required when nothing can be asked.","action":"Pass --scope project to commit it for the team, or --scope user for yourself.","exit":2,"retryable":false}}
 ```
 
-**A scope that is not one of the two.** Exit 1.
+**A scope that is not one of the two.** Exit 2.
 
 ```
 $ pithy docs connect --all --scope global
@@ -222,11 +223,11 @@ $ pithy docs connect --all --scope global
 Pass --scope project to commit it for the team, or --scope user for yourself.
 ```
 
-**No target, unattended.** A bare `pithy docs connect` at a terminal acts on every detected client. Without one there is nothing to prompt with, so it names the flags instead. Exit 1.
+**No target, unattended.** A bare `pithy docs connect` at a terminal acts on every detected client. Without one there is nothing to prompt with, so it names the flags instead. Exit 2.
 
 ```
 $ pithy docs connect --json
-{"error":{"code":"validation/invalid_input","status":400,"issues":[],"message":"Name what to connect.","action":"Pass --client <id> for one, or --all for every client detected here."}}
+{"error":{"code":"input/required","status":400,"flag":"--client","choices":["claude-code","cursor","vscode","gemini","claude-desktop","cline","zed","codex","goose","continue"],"message":"Name what to connect.","action":"Pass --client <id> for one, or --all for every client detected here.","exit":2,"retryable":false}}
 ```
 
 **A file that will not parse** is not one of these. It is a `refused` row, per client, and the run carries on to the rest. Exit 1 only if every client asked for refused.

@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
+import { basename } from "node:path";
 import type { CloudflareClients } from "@pithy-sh/cloudflare/src/client/clients";
 import type { Capability } from "@pithy-sh/core/src/capability/capability";
 import type { SettingsAccountReader, SettingsEnvironment } from "@pithy-sh/core/src/capability/settings";
+import { pithyCommand } from "@pithy-sh/core/src/cli/command";
 import { InternalError } from "@pithy-sh/core/src/error/pithyError";
 import type { SecretProbe } from "@pithy-sh/secrets/src/cli/dispatch";
+import { addAction, addSecretsPlan } from "../capabilities/addCommand";
 import { buildSecretDispatcher } from "../capabilities/secretsDispatcher";
 import { cloudflareClients } from "../cloudflare/clients";
 import { type CloudflareAccountSelection, cloudflareEnv } from "../cloudflare/config";
@@ -62,6 +65,8 @@ export async function settingsEnvironments(projectDir: string, workerDir: string
 
 /** What it takes to reach the account, all of it injectable so a unit test never calls out. */
 export interface SettingsAccountOptions {
+  /** The project root — what a refusal reads to name the Workers `pithy add secrets` runs in (#711). */
+  projectDir: string;
   /** The account this project belongs to, from its own root `pithy.config.ts`. */
   account: CloudflareAccountSelection | null;
   /** The root config's `name` — the leading segment of the manager Workflow a secret question is asked of. */
@@ -147,7 +152,8 @@ export async function settingsAccountConnection(options: SettingsAccountOptions)
       if (!storeId) {
         throw new InternalError({
           message: "The Secrets Store id is not recorded, so no entry can be asked about.",
-          action: "Run pithy add secrets to record SECRETS_STORE_ID.",
+          // The command that records it, from the one builder every such refusal uses (#711).
+          action: addAction(addSecretsPlan(options.projectDir), (add) => `Run ${add} to record SECRETS_STORE_ID.`),
           detail: `store entry ${name} asked with no SECRETS_STORE_ID`,
         });
       }
@@ -166,7 +172,7 @@ export async function settingsAccountConnection(options: SettingsAccountOptions)
       if (environment === "dev") {
         throw new InternalError({
           message: "A dev secret cannot be asked of the account.",
-          action: "Ask about a deployed environment, or read the local value through pithy secrets edit.",
+          action: `Ask about a deployed environment, or read the local value through ${pithyCommand("secrets edit")}.`,
           detail: `secret ${name} in dev has no manager Worker to answer`,
         });
       }
@@ -223,9 +229,14 @@ export async function doctorSettingsCheck(options: DoctorSettingsOptions): Promi
   // Once per Worker. The runner asks per capability, doctor hands each Worker over once per environment, and
   // every answer composes each declared environment again — the same question, asked that many times.
   const environments = new Map<string, Promise<SettingsEnvironment[]>>();
+  // The Worker by its name, as every finding states it, and by its directory, which is what `--worker` takes (#711).
   return checkCapabilitySettings({
     project,
-    workers: options.workers.map((worker) => ({ name: worker.name, capabilities: worker.capabilities })),
+    workers: options.workers.map((worker) => ({
+      name: worker.name,
+      directory: basename(worker.dir),
+      capabilities: worker.capabilities,
+    })),
     environments: (worker) => {
       let answer = environments.get(worker);
       if (answer === undefined) {
@@ -236,6 +247,7 @@ export async function doctorSettingsCheck(options: DoctorSettingsOptions): Promi
     },
     connect: () =>
       settingsAccountConnection({
+        projectDir: options.projectDir,
         account: options.account,
         project,
         offline: options.offline,
