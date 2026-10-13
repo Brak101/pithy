@@ -107,9 +107,7 @@ export async function detectShell(options: DetectShellOptions = {}): Promise<She
       kind: "powershell",
       rcPath: join(home, "Documents", "PowerShell", "Microsoft.PowerShell_profile.ps1"),
       extraRcPaths:
-        platform === "win32"
-          ? [join(home, "Documents", "WindowsPowerShell", "Microsoft.PowerShell_profile.ps1")]
-          : [],
+        platform === "win32" ? [join(home, "Documents", "WindowsPowerShell", "Microsoft.PowerShell_profile.ps1")] : [],
       aliasSyntax: "function p. { pithy @args }",
     };
   }

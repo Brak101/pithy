@@ -261,9 +261,16 @@ const AliasPayload = z
         command: Command,
         action: z.literal("install").describe("An install ran."),
         installed: z.literal(true).describe("The alias is in place, whether this run put it there or found it."),
-        alreadyInstalled: z.boolean().describe("`true` when it was already there and nothing was written."),
+        alreadyInstalled: z.boolean().describe("`true` when the block was already in the set before this run."),
+        wrote: z
+          .array(z.string())
+          .describe("The startup files this run wrote the block into. `[]` is the sentence 'this run wrote nothing.'"),
         shell: Shell,
         rcPath: RcPath,
+        rcPaths: z
+          .array(z.string())
+          .optional()
+          .describe("The whole profile set, when it has more than one member (#701 item 6)."),
         alias: AliasLine,
       })
       .describe("Install, in a detected shell."),
@@ -272,16 +279,26 @@ const AliasPayload = z
         command: Command,
         action: z.literal("remove").describe("A removal ran."),
         removed: z.boolean().describe("`false` when there was no block to remove. Not an error."),
+        removedFrom: z
+          .array(z.string())
+          .optional()
+          .describe("The files the block came out of — only the ones it was in."),
         rcPath: RcPath,
+        rcPaths: z.array(z.string()).optional().describe("The whole profile set, when it has more than one member."),
       })
       .describe("Remove, in a detected shell."),
     z
       .object({
         command: Command,
         action: z.literal("status").describe("A status check ran."),
-        installed: z.boolean().describe("Whether the marker block is in the rc file."),
+        installed: z.boolean().describe("Whether the marker block is in any member of the set."),
+        installedIn: z
+          .array(z.string())
+          .optional()
+          .describe("The files that carry the block — named, not the whole set."),
         shell: Shell.nullable().describe("The detected shell family, or `null` when detection failed."),
         rcPath: RcPath.nullable().describe("The rc file, or `null` when detection failed."),
+        rcPaths: z.array(z.string()).optional().describe("The whole profile set, when it has more than one member."),
       })
       .describe("Status."),
     z
@@ -319,7 +336,7 @@ export default withContract(
   }),
   {
     output: "document",
-    schemaVersion: 1,
+    schemaVersion: 2,
     payload: AliasPayload,
     mutates: true,
     idempotent: true,
