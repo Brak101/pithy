@@ -282,7 +282,7 @@ describe("every command declares what it promises", () => {
   test("a line that is not the published shape is refused, in either direction", async () => {
     const status = {
       command: "alias",
-      schemaVersion: 2,
+      schemaVersion: 1,
       action: "status",
       installed: true,
       shell: "zsh",
@@ -292,7 +292,7 @@ describe("every command declares what it promises", () => {
     // Without its version, or at one the command does not declare, it is not the published shape either.
     const { schemaVersion: _version, ...unversioned } = status;
     await expect(expectConforms("alias", JSON.stringify(unversioned))).rejects.toThrow();
-    await expect(expectConforms("alias", JSON.stringify({ ...status, schemaVersion: 1 }))).rejects.toThrow();
+    await expect(expectConforms("alias", JSON.stringify({ ...status, schemaVersion: 2 }))).rejects.toThrow();
     await expect(expectConforms("alias", JSON.stringify({ ...status, extra: 1 }))).rejects.toThrow();
     const { installed: _, ...missing } = status;
     await expect(expectConforms("alias", JSON.stringify(missing))).rejects.toThrow();

@@ -99,7 +99,7 @@
       }
     },
     "alias": {
-      "schemaVersion": 2,
+      "schemaVersion": 1,
       "payload": {
         "$": "object",
         "$<action=\"install\",installed=true>.command": "\"alias\"",

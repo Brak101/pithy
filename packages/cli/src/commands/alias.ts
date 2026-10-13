@@ -336,7 +336,7 @@ export default withContract(
   }),
   {
     output: "document",
-    schemaVersion: 2,
+    schemaVersion: 1,
     payload: AliasPayload,
     mutates: true,
     idempotent: true,
