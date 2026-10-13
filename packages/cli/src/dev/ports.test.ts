@@ -87,10 +87,12 @@ describe("sweepStaleDevPorts", () => {
     await sweepStaleDevPorts([8787], {
       ...base,
       lsof: async () => [3001],
-      // A custom dev.command child (Vite) from a crashed session: ours by record, not by command name.
+      // A custom dev.command child (Vite) from a crashed session: ours by record, not by command name
+      // — so the plain seam carries it, one process, no tree (#705 review).
       commandOf: async () => "node /proj/node_modules/.bin/vite --host",
       knownPids: [3001],
-      kill: (pid) => killed.push(pid),
+      kill: (pid) => void killed.push(pid),
+      killStale: (pid) => void killed.push(pid),
     });
     expect(killed).toEqual([3001]);
   });
