@@ -124,7 +124,7 @@ Named with `--worker`, it is a usage error, exit 2: another `--worker` is the fi
 
 ```
 Cloudflare credentials are missing.
-Run pithy init to record CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN, or export them.
+Export CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN for this project's account, then run this again.
 ```
 
 **No `DB` id for this environment.** The document corpus lives in the app database, so provisioning refuses rather than standing up an index with nothing to fill it: `<worker>'s wrangler.jsonc has no DB database_id for <env>.`
@@ -170,8 +170,10 @@ Pick one of: docs, notes.
 
 ```
 The metadata indexes on `acme-staging-vector-docs` were accepted but are not live yet.
-Re-run `pithy vector provision` in a minute. Do not write vectors until it reports them ready.
+Re-run `pithy vector provision --worker api --env staging` in a minute. Do not write vectors until it reports them ready.
 ```
+
+The command is this run's own, with its Worker and environment. In a production environment it is not offered as a fix: the line names it and says the run is a person's decision.
 
 **The Workflow did not finish.** `reset` and `reprocess` wait on dispatched instances and raise a `cloudflare/*` error when one ends `errored` or `terminated`, or is still running at the poll cap.
 
