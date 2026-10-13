@@ -80,12 +80,17 @@ function isWebAddress(url: string): boolean {
  * address and become syntax. Node quotes an argument containing spaces; it does not escape `cmd`'s
  * metacharacters. `…/cli?a=1&calc` is command execution, from a URL the kit was handed over the wire.
  *
- * The no-shell candidates were checked rather than assumed, and each is documented to drop exactly the
- * URLs this feature exists for — ones carrying a query:
+ * The no-shell candidates were checked rather than assumed. Each was documented to drop exactly the URLs
+ * this feature exists for, ones carrying a query, and one measurement since says otherwise:
  *
- * - **`rundll32 url.dll,FileProtocolHandler`** strips the query string (reported from Windows 7 onward),
- *   and fails outright on a fragment.
- * - **`explorer.exe <url>`** cannot open a URL carrying arguments.
+ * - **`rundll32 url.dll,FileProtocolHandler`** was reported to strip the query string from Windows 7
+ *   onward, and to fail outright on a fragment. On Windows 11 build 26200 the query survived (#701, item
+ *   10): spawned as argv with the URL as `args[1]`, it exited 0 at once and the browser requested the URL
+ *   with its query intact. Not yet checked: a fragment, older builds, and what an immediate exit 0 leaves
+ *   for reporting a failure. It takes the URL as an argument and parses nothing, so it is where a Windows
+ *   opener would start.
+ * - **`explorer.exe <url>`** cannot open a URL carrying arguments. Measured on the same host: exit 1,
+ *   and no request reached the browser.
  *
  * What does work is PowerShell with an encoded command and an escaped argument — which is what the
  * `open` package does, and which is still an interpreter reading a string we were handed. **So Windows
