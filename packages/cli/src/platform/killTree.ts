@@ -4,6 +4,7 @@
 import { execFile } from "node:child_process";
 import { win32 } from "node:path";
 import { promisify } from "node:util";
+import { environmentValue } from "./command";
 
 /**
  * The default for a kill seam: signal a process, on Windows killing its whole child tree (#701 item 2).
@@ -47,14 +48,6 @@ export type KillProcess = (pid: number, signal: NodeJS.Signals) => void;
 export type RunKill = (args: string[]) => Promise<unknown>;
 
 const runProcess = promisify(execFile);
-
-/** Find `name` in `env` by name regardless of case — Windows spells it `SystemRoot`, a copied env is a plain object. */
-function environmentValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
-  const direct = env[name];
-  if (direct !== undefined) return direct;
-  const key = Object.keys(env).find((entry) => entry.toUpperCase() === name.toUpperCase());
-  return key === undefined ? undefined : env[key];
-}
 
 /**
  * The system copy of a Windows binary, by full path: `%SystemRoot%\System32\<name>.exe`, and the

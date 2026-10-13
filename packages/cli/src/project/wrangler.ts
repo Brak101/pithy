@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
-import { spawn } from "node:child_process";
 import { join, resolve } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { pithyCommand } from "@pithy-sh/core/src/cli/command";
@@ -15,6 +14,7 @@ import { FEATURE_ENVIRONMENT, LOCAL_ENVIRONMENT } from "@pithy-sh/core/src/namin
 import { parse } from "comment-json";
 import { cloudflareChildEnv, credentialedChildEnv } from "../cloudflare/childEnv";
 import type { CloudflareAccountSelection, CloudflareCredentials } from "../cloudflare/config";
+import { spawnCommand } from "../platform/command";
 import { assertCreatesNoResources } from "./effectiveConfig";
 import { writeJsonc } from "./jsonc";
 import { detectPackageManager, execArgs } from "./packageManager";
@@ -287,7 +287,7 @@ export async function runWrangler(
   // rejects the call rather than the child, so nothing is running when the refusal is raised.
   const childEnv = { ...wranglerChildEnv(options.account), ...(options.env ?? {}) };
   return new Promise((resolve, reject) => {
-    const child = spawn(command, commandArgs, {
+    const child = spawnCommand(command, commandArgs, {
       cwd: options.cwd,
       stdio: options.passthrough ? "inherit" : ["ignore", "pipe", "pipe"],
       env: childEnv,

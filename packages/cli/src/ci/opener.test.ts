@@ -132,6 +132,9 @@ const POLICY = {
   boundedExecutables: new Set<string>(),
   uncapturedModules: new Set<string>(),
   progressModule: resolve(CLI_SRC, "terminal", "progress.ts"),
+  // The shared command spawner (#698): a seam call is a spawn at its call site, so census rows name
+  // the callers, not just the mechanism inside the spawner.
+  commandSpawner: resolve(CLI_SRC, "platform", "command.ts"),
 };
 
 /** Every shipped module under `packages/cli/src` outside `ci/`, comments blanked. */

@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
-import { execFile } from "node:child_process";
-import { promisify, stripVTControlCharacters } from "node:util";
+import { stripVTControlCharacters } from "node:util";
 import { commandName, pithyCommand } from "@pithy-sh/core/src/cli/command";
 import { InternalError, messageOf, NotFoundError, PithyError } from "@pithy-sh/core/src/error/pithyError";
 import type { CliAuditEmit } from "../audit/cliAudit";
 import { type CloudflareAccountSelection, cloudflareEnv } from "../cloudflare/config";
 import { inShadow } from "../plan/shadow";
+import { execCommand } from "../platform/command";
 import { isSourceEnvironment, wranglerConfigPath } from "../provision/featureConfig";
 import { EXIT, exitCodeOf } from "../terminal/exitClass";
 import { settleStep, startStep } from "../terminal/progress";
@@ -346,8 +346,6 @@ function defaultRunDeploy(account: CloudflareAccountSelection | null): RunDeploy
   };
 }
 
-const runProcess = promisify(execFile);
-
 /**
  * The default UI build step: the worker's `ui.build` argv, through the project's package manager, in the
  * worker's own directory. Quiet on success like the deploy step — the output is captured and surfaced only
@@ -356,7 +354,7 @@ const runProcess = promisify(execFile);
  */
 const defaultRunBuild: RunBuild = async (target, command, args, buildEnv) => {
   try {
-    await runProcess(command, args, {
+    await execCommand(command, args, {
       cwd: target.dir,
       maxBuffer: 16 * 1024 * 1024,
       // Overlaid on the real environment rather than replacing it: a build needs PATH, and CI needs

@@ -218,7 +218,7 @@ describe("runEditor", () => {
     await runEditor(editor, "/tmp/replay/secrets.edit.jsonc", {
       platform: "linux",
       spawn: (command, args, options) => {
-        calls.push({ command, args, shell: options.shell });
+        calls.push({ command, args, shell: Boolean(options.shell) });
         return child(0);
       },
     });
@@ -246,31 +246,48 @@ describe("runEditor", () => {
     expect((error as PithyError).payload.message).toContain("nano");
   });
 
-  test("Windows runs through a shell, because a `.cmd` shim cannot be spawned without one", async () => {
+  test("Windows runs through cmd.exe, because a `.cmd` shim cannot be spawned without one", async () => {
     // Every GUI editor on Windows is a `.cmd` shim (`code.cmd`, `subl.cmd`), and Node refuses to
-    // spawn one directly. The whole command line is one string cmd.exe re-splits, so the file — which
-    // lives under `%APPDATA%\pithy\<project>\` and routinely contains a space — is quoted here.
-    const calls: { command: string; args: readonly string[]; shell: boolean }[] = [];
+    // spawn one directly. The spawn is the CLI's one shell shape (#698): cmd.exe /d /s /c, verbatim
+    // argv, the resolved shim path caret-escaped and the file — which lives under
+    // `%APPDATA%\pithy\<project>\` and routinely carries a space — quoted whole. The fileExists seam
+    // is what the resolution probes; the real filesystem is not part of this assertion.
+    const calls: { command: string; args: readonly string[]; verbatim: boolean }[] = [];
     await runEditor({ command: "code", args: ["--wait"], source: "EDITOR" }, "C:\\Users\\Jim Scott\\s.jsonc", {
       platform: "win32",
+      env: { PATH: "C:\\Program Files\\nodejs", PATHEXT: ".COM;.EXE;.BAT;.CMD" },
+      fileExists: (path) => path === "C:\\Program Files\\nodejs\\code.cmd",
       spawn: (command, args, options) => {
-        calls.push({ command, args, shell: options.shell });
+        calls.push({ command, args, verbatim: options.windowsVerbatimArguments });
         return child(0);
       },
     });
-    expect(calls).toEqual([{ command: "code", args: ["--wait", '"C:\\Users\\Jim Scott\\s.jsonc"'], shell: true }]);
+    expect(calls).toEqual([
+      {
+        command: "cmd.exe",
+        args: [
+          "/d",
+          "/s",
+          "/c",
+          '"C:\\Program^ Files\\nodejs\\code.cmd ^"--wait^" ^"C:\\Users\\Jim^ Scott\\s.jsonc^""',
+        ],
+        verbatim: true,
+      },
+    ]);
   });
 
-  test("a Windows editor path with a space is quoted too", async () => {
-    const calls: string[] = [];
+  test("a Windows editor named by path is spawned directly — an .exe needs no shell", async () => {
+    const calls: { command: string; args: readonly string[]; verbatim: boolean }[] = [];
     await runEditor({ command: "C:\\Program Files\\Vim\\gvim.exe", args: ["-f"], source: "EDITOR" }, "C:\\s.jsonc", {
       platform: "win32",
-      spawn: (command) => {
-        calls.push(command);
+      spawn: (command, args, options) => {
+        calls.push({ command, args, verbatim: options.windowsVerbatimArguments });
         return child(0);
       },
     });
-    expect(calls).toEqual(['"C:\\Program Files\\Vim\\gvim.exe"']);
+    expect(calls).toEqual([
+      { command: "C:\\Program Files\\Vim\\gvim.exe", args: ["-f", "C:\\s.jsonc"], verbatim: false },
+    ]);
   });
 
   test("POSIX never uses a shell — the file is an argument, not a word to re-split", async () => {
@@ -278,7 +295,7 @@ describe("runEditor", () => {
     await runEditor(editor, "/tmp/a b/secrets.jsonc", {
       platform: "linux",
       spawn: (_command, args, options) => {
-        calls.push({ args, shell: options.shell });
+        calls.push({ args, shell: Boolean(options.shell) });
         return child(0);
       },
     });
