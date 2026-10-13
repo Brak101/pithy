@@ -4,33 +4,25 @@
 import { randomUUID } from "node:crypto";
 import { unlinkSync } from "node:fs";
 import { access, copyFile, lstat, readdir, rm } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { ProfileOverride } from "@pithy-sh/cloudflare/src/tokens/profiles";
 import type { Capability } from "@pithy-sh/core/src/capability/capability";
 import { compositionEnvironment } from "@pithy-sh/core/src/env/ambient";
-import {
-  causeMessage,
-  failurePosition,
-  importingPackage,
-  isBuildFailureWrapper,
-  prop,
-  rootCause,
-  safeReason,
-  unresolvedKind,
-  unresolvedSpecifier,
-} from "@pithy-sh/core/src/error/cause";
+import { causeMessage, failurePosition, prop, rootCause, safeReason } from "@pithy-sh/core/src/error/cause";
 import {
   fromZodError,
   InternalError,
   NotFoundError,
   PreconditionFailedError,
 } from "@pithy-sh/core/src/error/pithyError";
+import { packageLoadFailure, unresolvedImport } from "@pithy-sh/core/src/error/unresolved";
 import { WorkerDomains } from "@pithy-sh/core/src/naming/domains";
 import { DEFAULT_ENVIRONMENTS, DeclaredEnvironments } from "@pithy-sh/core/src/naming/environment";
 import { assertValidProjectName, kebab } from "@pithy-sh/core/src/naming/resource";
 import { z } from "zod";
 import { CloudflareAccountName } from "../cloudflare/config";
+import { entryBeside, installedBeside } from "./kitResolve";
 import { registerTypeScriptResolution } from "./typescriptResolve";
 import { discoverWorkers } from "./workers";
 
@@ -552,14 +544,14 @@ function isProjectConfig(value: unknown): value is ProjectConfig {
 }
 
 /**
- * Why a `pithy.config.ts` would not import. Three causes an adopter fixes three different ways, plus the
- * honest fourth: the classifier does not recognize this one and will not invent a remedy for it.
+ * Why a `pithy.config.ts` would not import. Four causes fixed four different ways, plus the honest fifth:
+ * the classifier does not recognize this one and will not invent a remedy for it.
  */
-export type ConfigLoadFailureKind = "unresolved-import" | "parse-error" | "threw-on-load" | "unknown";
+export type ConfigLoadFailureKind = "unresolved-import" | "package-load" | "parse-error" | "threw-on-load" | "unknown";
 
 /** A classified config-load failure: what went wrong, and the one sentence that fits it. */
 export interface ConfigLoadFailure {
-  /** Which of the four causes this is. */
+  /** Which of the five causes this is. */
   kind: ConfigLoadFailureKind;
   /** The `action` line for the refusal — chosen from the failure, never asserted over it. */
   action: string;
@@ -577,30 +569,10 @@ function rawMessage(cause: unknown): string {
   return causeMessage(cause) ?? "";
 }
 
-function isUnresolvedImport(cause: unknown): boolean {
-  const code = prop(cause, "code");
-  if (
-    code === "ERR_MODULE_NOT_FOUND" ||
-    code === "MODULE_NOT_FOUND" ||
-    code === "ERR_PACKAGE_PATH_NOT_EXPORTED" ||
-    code === "ERR_UNSUPPORTED_DIR_IMPORT"
-  ) {
-    return true;
-  }
-  if (prop(cause, "name") === "ResolveMessage") return true;
-  return /Cannot find (?:package|module) |Failed to resolve (?:import|module)|Failed to load url /.test(
-    rawMessage(cause),
-  );
-}
-
 function isParseError(cause: unknown): boolean {
   const name = prop(cause, "name");
   if (name === "SyntaxError" || name === "BuildMessage") return true;
   if (prop(cause, "code") === "PARSE_ERROR") return true;
-  // Bun's build wrapper with its diagnostics already dropped — the shape every caller after the first
-  // sees, and the one `pithy doctor` renders. It proves a build produced diagnostics, so it is a parse
-  // error with no reason and no position rather than a config that threw. See core's `cause.ts`.
-  if (isBuildFailureWrapper(cause)) return true;
   return /Transform failed|\[PARSE_ERROR]|Parse (?:error|failure)|Unexpected (?:token|end of input)/.test(
     rawMessage(cause),
   );
@@ -618,7 +590,10 @@ function isParseError(cause: unknown): boolean {
  *
  * So each cause gets the sentence that fits it, and the fourth gets none:
  *
- * - **unresolved-import** — the specifier is named, and `bun install` is right *here*, where it was earned.
+ * - **unresolved-import** — core's `unresolvedImport` names the import and whose it is, and says to install
+ *   only where installing helps. This surface keeps no rule of its own about imports (#709).
+ * - **package-load** — core's `packageLoadFailure`: a file inside an installed package threw as it loaded —
+ *   a `"type"` its code contradicts, or code that does not parse. That package is named, never the config.
  * - **parse-error** — the parser's reason and position. It says installing will not help, because the
  *   adopter has read the opposite for as long as this refusal has existed.
  * - **threw-on-load** — the config's own error, which is neither of the above.
@@ -630,74 +605,36 @@ function isParseError(cause: unknown): boolean {
  * @param wrapped whatever the `try` caught, wrapper and all. {@link rootCause} opens it first — see #223:
  *   Bun wraps two or more build diagnostics in an `AggregateError`, and a stray brace cascades, so the
  *   wrapped shape is the *common* one. #207 fixed the bare case and this one classified worse than it.
+ * @param configFile the config that was imported. A parser's position is quoted only when it is in this
+ *   file or its fresh copy: Bun gives one in whatever file did not parse, which may be one the config imports.
  */
-/**
- * The remedy for an import that would not resolve — **one of three, because there are three causes.**
- *
- * Until #489 they wore one sentence: *Install the project's dependencies (bun install), or correct that
- * import.* For a missing dependency that is right. For the other two, `bun install` is **guaranteed** to
- * be a no-op, which is what makes the sentence unfollowable rather than merely unhelpful — and an agent
- * following it has no next move, because the message *was* the recovery path.
- *
- * #480 is the case that showed it: `pithy add email` reported `Nothing resolves
- * "@pithy-sh/core/src/capability/capability"` while core was installed and resolving throughout. The
- * specifier was honest; the package genuinely absent was the one being added, and the importer is what
- * would have pointed at it. {@link importingPackage} recovers that where the runtime supplies it.
- *
- * `relativeTo` exists because on node the "specifier" *is* an already-resolved absolute path, so this
- * message printed `/home/…` for every relative import — contradicting the rule the rest of this module
- * keeps, and the tests that assert an action never carries one.
- */
-function unresolvedAction(cause: unknown, relativeTo: string | undefined): string {
-  const specifier = unresolvedSpecifier(cause);
-  if (specifier === undefined) {
-    return "An import in the config does not resolve. Check its imports, then install the project's dependencies.";
-  }
-
-  const shown = readable(specifier, relativeTo);
-  const importer = importingPackage(cause);
-  const from = importer === undefined ? "" : ` It is imported by ${importer}.`;
-
-  switch (unresolvedKind(cause)) {
-    case "package":
-      return `Nothing provides "${shown}".${from} Install the project's dependencies (bun install), or correct that import.`;
-    case "package-subpath":
-      // The package is installed and does not export this path. Installing it again produces the same
-      // tree; the fix is a version that has it, or a corrected import.
-      return `"${shown}" is not something its package provides.${from} Check the version you have, or correct that import — installing dependencies will not help.`;
-    case "local-file":
-      return `Nothing at "${shown}". Create that file or correct the import — installing dependencies will not help.`;
-    default:
-      return `Nothing resolves "${shown}".${from} Correct that import, or install the project's dependencies.`;
-  }
-}
-
-/**
- * A specifier as an adopter would write it: relative to their config when it arrived as a resolved path.
- *
- * Node hands back `/home/jo/app/apps/board/src/x`; what they typed was `./src/x`. Printing the former
- * puts our frame in their message and a machine-specific path in a line meant to be acted on.
- */
-function readable(specifier: string, relativeTo: string | undefined): string {
-  if (relativeTo === undefined || !isAbsolute(specifier)) return specifier;
-  const within = relative(relativeTo, specifier);
-  return within.startsWith("..") ? specifier : `./${within.split(sep).join("/")}`;
-}
-
-export function classifyConfigLoadFailure(wrapped: unknown, relativeTo?: string): ConfigLoadFailure {
+export function classifyConfigLoadFailure(
+  wrapped: unknown,
+  relativeTo?: string,
+  configFile?: string,
+): ConfigLoadFailure {
   // Bun hands `import()` failures over inside an `AggregateError`. Classify what is inside it.
   const cause = rootCause(wrapped);
 
-  if (isUnresolvedImport(cause)) {
-    return { kind: "unresolved-import", action: unresolvedAction(cause, relativeTo) };
-  }
+  // Which import, whose, and what to do: core's, for all three surfaces that refuse a module (#709).
+  const unresolved = unresolvedImport(cause, {
+    installed: installedBeside,
+    entry: entryBeside,
+    relativeTo,
+    loader: "@pithy-sh/cli",
+  });
+  if (unresolved !== undefined) return { kind: "unresolved-import", action: unresolved.remedy };
+
+  // A package's own file that would not load is the package's, before it can read as the config's (#709).
+  const foreign = packageLoadFailure(cause, { loader: "@pithy-sh/cli" });
+  if (foreign !== undefined) return { kind: "package-load", action: foreign.remedy };
 
   if (isParseError(cause)) {
-    // Both of these can answer "nothing" — and one of the reasons they can is Bun's build wrapper, whose
-    // whole message is a count and a path. That suppression is core's, once, rather than written out here
-    // and in two other classifiers that each had to be found and patched (#223, #228).
+    // Both of these can answer "nothing": a diagnostic that carries a path, a stack frame or a newline is
+    // not quoted, and a position is never invented. That filter is core's, once rather than here and in two
+    // other classifiers that each had to be found and patched (#228).
     const reason = safeReason(cause);
-    const at = failurePosition(cause);
+    const at = failurePosition(cause, configFile === undefined ? undefined : (file) => isConfigFile(file, configFile));
     const where = at ? ` Line ${at.line}, column ${at.column}.` : "";
     return {
       kind: "parse-error",
@@ -731,10 +668,7 @@ export function classifyConfigLoadFailure(wrapped: unknown, relativeTo?: string)
  * reporting a clean run. `pithy add auth` left a Worker that booted and answered 500 on every auth route,
  * because the tables were not there (#273).
  *
- * **Only a different file busts it.** Measured on Bun 1.3: a `?t=…` query on the file URL does not, and
- * neither does the same file reached by a differently-spelled path. So this imports a copy, beside the
- * original — where the config's own relative imports and `import.meta.dirname` still resolve to the same
- * directory — and removes it. Dot-prefixed and uniquely named, so two concurrent runs cannot collide.
+ * **A different file is the bust that holds everywhere.** Re-measured on Bun 1.4.2 (#709): a `?t=…` query on the file URL now busts it, and the same file reached by a differently-spelled path still does not. A query is one runtime's behavior and has changed once already; a new file is new to every module cache. So this imports a copy, beside the original — where the config's own relative imports and `import.meta.dirname` still resolve to the same directory — and removes it. Dot-prefixed and uniquely named, so two concurrent runs cannot collide.
  *
  * ## It writes into the adopter's source tree, so it cleans up three ways
  *
@@ -770,6 +704,16 @@ async function importFreshCopy(path: string): Promise<{ default?: unknown }> {
     openCopies.delete(copy);
     await rm(copy, { force: true });
   }
+}
+
+/**
+ * Whether `file` is the config at `configFile`, or a fresh copy of it, which is imported in its place — so a
+ * position in either is the config's own, and a position in any other file is not (#709).
+ */
+function isConfigFile(file: string, configFile: string): boolean {
+  const at = resolve(file);
+  if (at === resolve(configFile)) return true;
+  return dirname(at) === dirname(resolve(configFile)) && basename(at).startsWith(RELOAD_PREFIX);
 }
 
 /** What a fresh copy is called. One prefix, so the sweep and the writer cannot drift apart. */
@@ -889,7 +833,7 @@ async function importConfig(path: string, missing: () => never, fresh = false): 
     // That boundary is unchanged. What changed is that the part of the cause an adopter can act on now
     // reaches them through `action`, in a form that carries no path, no source line, and no stack.
     // The config's own directory, so a resolved absolute path is shown the way it was written.
-    const { kind, action } = classifyConfigLoadFailure(cause, dirname(path));
+    const { kind, action } = classifyConfigLoadFailure(cause, dirname(path), path);
     throw new InternalError({
       message: `Could not load ${path}.`,
       action,
