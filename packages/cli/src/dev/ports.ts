@@ -283,9 +283,9 @@ export interface SweepDeps {
   /** Plain signal for a pid accepted only by the state-file list (default: `process.kill`). */
   killStale?: (pid: number, signal: NodeJS.Signals) => void;
   log?: (message: string) => void;
-  /** Command-line lookup, the scope filter (default: {@link psCommand}). */
+  /** Command-line lookup, the scope filter (default: {@link defaultCommandOf}, `ps` or CIM by platform). */
   commandOf?: ProcessCommand;
-  /** Parent lookup, for the ancestry guard (default: {@link psParent}). */
+  /** Parent lookup, for the ancestry guard (default: {@link defaultParentOf}, `ps` or CIM by platform). */
   parentOf?: ParentPid;
   /** Pids the previous session recorded in `.dev-state.json` — ours by construction, reaped whatever they run. */
   knownPids?: readonly number[];
