@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 import { existsSync, statSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { expectConforms, runCaptured } from "../test-utils/payloadContract";
 import { aliasStatus, handleHiddenFlags, installAlias, removeAlias } from "./alias";
@@ -16,6 +16,7 @@ let home: string;
 let rcPath: string;
 let savedHome: string | undefined;
 let savedShell: string | undefined;
+let savedUserProfile: string | undefined;
 
 /** Capture everything written to stdout during a test. */
 function captureStdout(): string[] {
@@ -32,13 +33,19 @@ beforeEach(async () => {
   rcPath = join(home, ".zshrc");
   savedHome = process.env.HOME;
   savedShell = process.env.SHELL;
+  savedUserProfile = process.env.USERPROFILE;
   process.env.HOME = home;
+  // The faked home has to be visible to `os.homedir()`, which reads HOME on POSIX and USERPROFILE
+  // on Windows (#701). Pinning both is the one way this harness does not assume the host's OS.
+  process.env.USERPROFILE = home;
   process.env.SHELL = "/bin/zsh";
 });
 afterEach(async () => {
   vi.restoreAllMocks();
   if (savedHome === undefined) delete process.env.HOME;
   else process.env.HOME = savedHome;
+  if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+  else process.env.USERPROFILE = savedUserProfile;
   if (savedShell === undefined) delete process.env.SHELL;
   else process.env.SHELL = savedShell;
   await rm(home, { recursive: true, force: true });
@@ -105,6 +112,7 @@ describe("installAlias", () => {
       action: "install",
       installed: true,
       alreadyInstalled: false,
+      wrote: [rcPath],
       shell: "zsh",
       rcPath,
       alias: ZSH_ALIAS,
@@ -157,6 +165,131 @@ describe("aliasStatus", () => {
     const out = captureStdout();
     await aliasStatus();
     expect(out.join("")).toBe("Unable to detect shell.\n");
+  });
+});
+
+/**
+ * #701 item 6, proven on every CI host through the shell seam (`SHELL=pwsh` selects the PowerShell
+ * branch on any platform, and the `platform` seam names the edition set). Windows ships PowerShell
+ * 5.1, which auto-loads `Documents\WindowsPowerShell\…`; `pwsh` 7 loads `Documents\PowerShell\…`.
+ * The alias must land in both, count as installed from either, come out of both — and name the
+ * files it actually touched when it repairs, reports, or removes.
+ */
+describe("the PowerShell alias set", () => {
+  const PW7 = "Microsoft.PowerShell_profile.ps1";
+  /** The Windows platform seam: the two-profile set is a win32 fact, proven from any CI host. */
+  const WIN = { platform: "win32" as const };
+  let pw7Path: string;
+  let pw51Path: string;
+
+  beforeEach(async () => {
+    process.env.SHELL = "pwsh";
+    pw7Path = join(home, "Documents", "PowerShell", PW7);
+    pw51Path = join(home, "Documents", "WindowsPowerShell", PW7);
+  });
+
+  /** Plant a profile file, creating its family's profile directory the way a real install did. */
+  async function plant(path: string, contents: string): Promise<void> {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, contents);
+  }
+
+  test("install writes the marked block to BOTH family profiles", async () => {
+    await installAlias(WIN);
+    const ALIAS = "function p. { pithy @args }";
+    for (const path of [pw7Path, pw51Path]) {
+      expect(await readFile(path, "utf8")).toContain(`${OPEN}\n${ALIAS}\n# <<< pithy alias <<<`);
+    }
+  });
+
+  test("off Windows, pwsh gets the 7 profile alone — no 5.1 file for an edition that is not here", async () => {
+    // The platform seam, not the host: this proves the non-win32 shape from any CI box, and on a
+    // Windows host `process.platform` would genuinely include the 5.1 profile.
+    await installAlias({ platform: "linux" });
+    expect(await readFile(pw7Path, "utf8")).toContain(OPEN);
+    await expect(readFile(pw51Path, "utf8")).rejects.toThrow();
+  });
+
+  test("idempotence is set-wide: a block in one profile counts as installed and is not duplicated", async () => {
+    // The state #701's host was in: a previous pithy wrote only the 7 profile. Re-running the fixed
+    // CLI reads the set, sees a block, and reports installed — and writing nothing means no file
+    // grew a second block. `Already pithy.` is the sentence for a run that wrote nothing, which a
+    // fully-topped set is.
+    await installAlias(WIN);
+    const out = captureStdout();
+    await installAlias(WIN);
+    expect(out.join("")).toBe("Already pithy.\n");
+    for (const path of [pw7Path, pw51Path]) {
+      const text = await readFile(path, "utf8");
+      expect(text.split(OPEN).length - 1).toBe(1);
+    }
+  });
+
+  test("an old install in the 7 profile alone is repaired — and the repair names the file it wrote", async () => {
+    // The #701 host's exact state: the previous CLI wrote only Documents\PowerShell. Re-running
+    // alias must fill the 5.1 profile — the family that ships with Windows and never got the block
+    // — and say so: a command that edits a file the shell runs at startup names the file it
+    // changed. `Already pithy.` would hide a write.
+    await plant(pw7Path, `${OPEN}\nfunction p. { pithy @args }\n# <<< pithy alias <<<\n`);
+    const out = captureStdout();
+    await installAlias(WIN);
+    expect(out.join("")).toBe(
+      `Added \`function p. { pithy @args }\` to ${pw51Path}\nOpen a new terminal, or run: source ${pw7Path}\n`,
+    );
+    expect(await readFile(pw51Path, "utf8")).toContain("function p. { pithy @args }");
+  });
+
+  test("the repair's --json payload separates the fact from the write: alreadyInstalled plus wrote", async () => {
+    await plant(pw7Path, `${OPEN}\nfunction p. { pithy @args }\n# <<< pithy alias <<<\n`);
+    const out = captureStdout();
+    await installAlias({ ...WIN, json: true });
+    const payload = JSON.parse(out.join(""));
+    expect(payload.alreadyInstalled).toBe(true);
+    expect(payload.wrote).toEqual([pw51Path]);
+  });
+
+  test("status reports installed from the 5.1 profile alone, and names only the file that carries it", async () => {
+    await plant(pw51Path, `# pre-existing\n${OPEN}\nfunction p. { pithy @args }\n# <<< pithy alias <<<\n`);
+    const out = captureStdout();
+    await aliasStatus(WIN);
+    // The block lives only in the 5.1 file, so the 5.1 file is the whole of the report. Naming the
+    // set when only one member carries the block makes a claim about the other the reader can check
+    // and find false.
+    expect(out.join("")).toBe(`Installed in ${pw51Path}\n`);
+  });
+
+  test("remove names the files it actually removed from — not the whole set", async () => {
+    // A set topped up on one member only: remove takes the block out of the 7 profile and says the
+    // 7 profile, never the 5.1 path it did not touch.
+    await plant(pw7Path, `${OPEN}\nfunction p. { pithy @args }\n# <<< pithy alias <<<\n`);
+    const out = captureStdout();
+    await removeAlias(WIN);
+    expect(out.join("")).toBe(
+      `Removed \`function p. { pithy @args }\` from ${pw7Path}\nOpen a new terminal, or run: source ${pw7Path}\n`,
+    );
+  });
+
+  test("remove takes the block out of both profiles and leaves the rest of each byte-intact", async () => {
+    await plant(pw7Path, "Set-StrictMode -Version Latest\n");
+    await plant(pw51Path, "# 5.1 baseline\n");
+    await installAlias(WIN);
+    await removeAlias(WIN);
+    expect(await readFile(pw7Path, "utf8")).toBe("Set-StrictMode -Version Latest\n");
+    expect(await readFile(pw51Path, "utf8")).toBe("# 5.1 baseline\n");
+  });
+
+  test("the --json install payload carries the full rcPaths set, POSIX payloads carry none", async () => {
+    const out = captureStdout();
+    await installAlias({ ...WIN, json: true });
+    const payload = JSON.parse(out.join(""));
+    expect(payload.rcPath).toBe(pw7Path);
+    expect(payload.rcPaths).toEqual([pw7Path, pw51Path]);
+    expect(payload.wrote).toEqual([pw7Path, pw51Path]);
+
+    const posix = captureStdout();
+    process.env.SHELL = "/bin/zsh";
+    await installAlias({ json: true });
+    expect(JSON.parse(posix.join("")).rcPaths).toBeUndefined();
   });
 });
 

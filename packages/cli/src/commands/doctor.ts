@@ -138,7 +138,7 @@ import { detectInstaller, type Installer, upgradeCommandFor } from "../notifier/
 import { readState, setNotifierFlag, stateDir, stateFilePath, writeState } from "../notifier/state";
 import { classifyBump } from "../notifier/version";
 import { readRcFile } from "../platform/rc";
-import { detectShell, type ShellInfo } from "../platform/shell";
+import { aliasRcPaths, detectShell, type ShellInfo } from "../platform/shell";
 import { resolveWorkersFor } from "../project/composeFor";
 import { loadProject, loadProjectEnvironments, type ProjectConfig, projectCloudflareAccount } from "../project/config";
 import { checkOrigins, describeOriginDrift, type OriginsCheck, originDriftFix } from "../project/domains";
@@ -217,12 +217,13 @@ function messageOf(error: unknown): string {
 async function aliasStatus(shell: ShellInfo | null, readRc: (path: string) => Promise<string>): Promise<AliasStatus> {
   if (!shell) return { state: "not-installed", rcPath: null, reason: null };
   try {
-    const contents = await readRc(shell.rcPath);
-    return {
-      state: contents.includes(ALIAS_MARKER) ? "installed" : "not-installed",
-      rcPath: shell.rcPath,
-      reason: null,
-    };
+    // One logical location, several files: PowerShell's alias lives in each family's profile, and a
+    // block in any of them is an installed alias (#701 item 6). A file that will not open is the
+    // `unknown` answer below — an rc file that exists and cannot be read must not read as absent.
+    for (const path of aliasRcPaths(shell)) {
+      if ((await readRc(path)).includes(ALIAS_MARKER)) return { state: "installed", rcPath: path, reason: null };
+    }
+    return { state: "not-installed", rcPath: shell.rcPath, reason: null };
   } catch (error) {
     return { state: "unknown", rcPath: shell.rcPath, reason: messageOf(error) };
   }
