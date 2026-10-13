@@ -148,6 +148,18 @@ describe("what is not a captured child needing a step", () => {
     expect(silentCommands(walk({ "pm.ts": pm, "commands/add.ts": COMMAND }))).toEqual(["commands/add.ts#run"]);
   });
 
+  test("a bounded literal inside a wider expression is not a bounded call site", () => {
+    // `tool ?? "git"` runs `tool` when it is set and git only when it is not — the census exists to
+    // hold exactly this call, so the exemption is a lone literal, never a literal that lives inside
+    // an expression. Same rule, same shape: `useNpm ? "npm" : "git"` must be held too.
+    const coalesce =
+      'import { execFile } from "node:child_process";\nexport function install(tool: string | undefined) {\n  execFile(tool ?? "git", ["status"]);\n}\n';
+    expect(silentCommands(walk({ "pm.ts": coalesce, "commands/add.ts": COMMAND }))).toEqual(["commands/add.ts#run"]);
+    const ternary =
+      'import { execFile } from "node:child_process";\nexport function install(useNpm: boolean) {\n  execFile(useNpm ? "npm" : "git", ["status"]);\n}\n';
+    expect(silentCommands(walk({ "pm.ts": ternary, "commands/add.ts": COMMAND }))).toEqual(["commands/add.ts#run"]);
+  });
+
   test("a spawn in a module that hands its streams on — but not an execFile there", () => {
     const spawned =
       'import { spawn, execFile } from "node:child_process";\nexport function install() {\n  spawn("vim", []);\n}\n';

@@ -88,6 +88,16 @@ const BROWSER_COMMANDS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Named exceptions to the reservation above: `<module> → executables>` whose spawn in that module is
+ * not an opener, with its reason. `dev/ports.ts` runs `powershell.exe` to query the CIM process table
+ * — a table read by the same right that reserves the name for the opener; it opens nothing. Every
+ * other module stays held: the name is reserved, the exception is the one line, spelled.
+ */
+const NOT_OPENER: Readonly<Record<string, ReadonlySet<string>>> = {
+  "dev/ports.ts": new Set(["powershell.exe"]),
+};
+
+/**
  * **Every child process this CLI starts, and why.**
  *
  * The four-name list above was the whole of the old rule, and its comment claimed a second opener could
@@ -104,6 +114,8 @@ const BROWSER_COMMANDS: ReadonlySet<string> = new Set([
  */
 const SPAWNS: Readonly<Record<string, string>> = {
   'dev/ports.ts "lsof"': "Finds what already holds a dev port, to name the process rather than the number.",
+  'dev/ports.ts "netstat"': "The Windows port table: `netstat -ano` names the pids LISTENING on a dev port (#701 item 3).",
+  'dev/ports.ts "powershell.exe"': "Asks the Windows process table (CIM) a pid's name and parent, so the sweep tells workerd from a stranger.",
   'dev/ports.ts "ps"': "Names the process holding a port, when lsof is not installed.",
   "dev/orchestrator.ts command": "Runs each worker's dev server — the command is the resolved package manager.",
   'feature/ports.ts "git"': "Reads the branch a feature's port block belongs to.",
@@ -113,6 +125,8 @@ const SPAWNS: Readonly<Record<string, string>> = {
   "platform/browser.ts command": "The one browser opener. The command is this platform's, from `openCommand`.",
   "platform/editor.ts command":
     "The one editor launcher. The command is `$VISUAL`, `$EDITOR`, or the platform default.",
+  'platform/killTree.ts systemExecutable("taskkill"':
+    "Ends the worker tree a dev session spawned. A kill, not an opener; the helper names the system copy, the literal names the binary.",
   "project/deploy.ts command": "Runs wrangler to deploy, through the project's own package manager.",
   "project/packageManager.ts command": "Runs the adopter's package manager — the command is which one they use.",
   'project/templateFiles.ts "git"': "Reads a template's tracked files, so a scaffold copies what git knows.",
@@ -180,7 +194,7 @@ describe("one opener, one key reader, one sentence", () => {
       if (file === BROWSER) continue;
       for (const call of calls) {
         const executable = literalExecutable(call.executable);
-        if (executable !== null && BROWSER_COMMANDS.has(executable)) {
+        if (executable !== null && BROWSER_COMMANDS.has(executable) && !NOT_OPENER[relative(CLI_SRC, file)]?.has(executable)) {
           offenders.push(`${shown(file)} ${call.primitive}(${call.executable})`);
         }
       }

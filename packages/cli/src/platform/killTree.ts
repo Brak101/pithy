@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 import { execFile } from "node:child_process";
+import { win32 } from "node:path";
 import { promisify } from "node:util";
+import { environmentValue } from "./command";
 
 /**
  * The default for a kill seam: signal a process, on Windows killing its whole child tree (#701 item 2).
@@ -14,10 +16,29 @@ import { promisify } from "node:util";
  * `kill(-pid)` — the POSIX group signal the orchestrator sends under `setsid` — has no Windows
  * equivalent, and `detached: true` there detaches the console, it does not create a killable group.
  *
- * `taskkill /PID <pid> /T` walks the child tree by pid and takes the pid as an argument, so nothing is
- * built through a shell string; `/F` joins it for the force path, mirroring SIGTERM-then-SIGKILL: the
- * polite close first, the kill in the grace window's timeout. A pid already gone exits non-zero and is
- * swallowed — "already exited" is not a failure to signal, same as `ESRCH` on POSIX.
+ * **The tree kill reaches the children this session started and holds a handle to — nowhere else.**
+ * Node keeps a child's process handle open until it exits, so a pid it spawned cannot have been
+ * recycled; a pid read from a crashed session's state file can belong to anything, and Windows reuses
+ * pids fast. That is the orchestrator's split: `signalChild` tree-kills, `stopPreviousSession`
+ * signals plainly. A stale pid earns one process killed, not a stranger's whole tree.
+ *
+ * `taskkill /PID <pid> /T /F` walks the child tree by pid and takes the pid as an argument, so nothing
+ * is built through a shell string. **`/F` is on every signal, and the measurement is why** (a Windows
+ * host, a `.cmd` launcher over a console `node`):
+ *
+ * ```text
+ * > taskkill /PID <launcher> /T
+ * ERROR: The process with PID 78324 (child process of PID 72124) could not be terminated.
+ * Reason: This process can only be terminated forcefully (with /F option).
+ * ```
+ *
+ * Exit 128, launcher and grandchild alive: without `/F` the walk asks, a console process with no
+ * window of its own refuses, and the refusal exits non-zero into the swallow below — a graceful step
+ * that is a silent no-op, so every teardown would burn its grace window and the reap would kill
+ * nothing. Node's own Windows `SIGTERM`/`SIGINT` are `TerminateProcess` anyway — unconditional — so
+ * the ask/kill asymmetry POSIX has, Windows does not, and there is nothing to preserve by asking.
+ * A pid already gone exits non-zero and is swallowed — "already exited" is not a failure to signal,
+ * same as `ESRCH` on POSIX.
  *
  * Off Windows this is `process.kill`, verbatim, negative pids (process groups) included.
  */
@@ -29,8 +50,18 @@ export type RunKill = (args: string[]) => Promise<unknown>;
 const runProcess = promisify(execFile);
 
 /**
+ * The system copy of a Windows binary, by full path: `%SystemRoot%\System32\<name>.exe`, and the
+ * bare name when `SystemRoot` is absent — which it is on no real Windows. The census reads this
+ * helper's literal argument as the spelled name of the executable (`ci/childProcesses.ts`).
+ */
+export function systemExecutable(name: string): string {
+  const root = environmentValue(process.env, "SystemRoot");
+  return root ? win32.join(root, "System32", `${name}.exe`) : name;
+}
+
+/**
  * Build the kill for `platform`. `run` is the seam that starts `taskkill`, so a test can prove the tree
- * kill — with `/T`, the pid as its own argument, no shell — is the one used on `win32`.
+ * kill — with `/T /F`, the pid as its own argument, no shell — is the one used on `win32`.
  */
 export function defaultKillFor(
   platform: NodeJS.Platform = process.platform,
@@ -39,13 +70,14 @@ export function defaultKillFor(
   if (platform !== "win32") {
     return (pid, signal) => void process.kill(pid, signal);
   }
-  // The literal `"taskkill"` sits at the spawn call site, where `ci/childProcesses.ts` reads it: the
-  // kill is bounded the same way `ps` and `lsof` are, and a bounded executable is spelled there.
-  const run: RunKill = deps.run ?? ((args) => runProcess("taskkill", args));
-  return (pid, signal) => {
-    const args = signal === "SIGKILL" ? ["/PID", String(pid), "/T", "/F"] : ["/PID", String(pid), "/T"];
+  // The kill binary is named by full path: CreateProcess looks up a bare name in the *working
+  // directory* before PATH, and the working directory is the project's — a `taskkill.exe` planted
+  // there would own every teardown. The census (ci/childProcesses.ts) reads
+  // `systemExecutable("taskkill")` as a spelled call site: the helper's argument is the literal.
+  const run: RunKill = deps.run ?? ((args) => runProcess(systemExecutable("taskkill"), args));
+  return (pid) => {
     // Fire-and-forget, like `process.kill` is: the caller watches the child's own exit, and a taskkill
     // that fails has failed on a process that is already going.
-    void run(args).catch(() => {});
+    void run(["/PID", String(pid), "/T", "/F"]).catch(() => {});
   };
 }

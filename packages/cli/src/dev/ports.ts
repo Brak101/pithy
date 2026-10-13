@@ -5,7 +5,6 @@ import { execFile } from "node:child_process";
 import net from "node:net";
 import { promisify } from "node:util";
 import { ConflictError } from "@pithy-sh/core/src/error/pithyError";
-import { defaultKillFor } from "../platform/killTree";
 
 const run = promisify(execFile);
 
@@ -290,6 +289,8 @@ export interface SweepDeps {
 export async function sweepStaleDevPorts(ports: number[], deps: SweepDeps = {}): Promise<number[]> {
   const lsof = deps.lsof ?? defaultPortHolders();
   const alive = deps.isAlive ?? isAlive;
+  // The sweep's kill is the tree kill: on Windows the port holder is a `.cmd`/`node`/`workerd` chain,
+  // and the sweep exists precisely to end chains (#701 item 3, riding #704's killTree).
   const kill = deps.kill ?? defaultKillFor();
   const commandOf = deps.commandOf ?? defaultCommandOf();
   const parentOf = deps.parentOf ?? defaultParentOf();

@@ -112,8 +112,11 @@ export interface ChildProcessReport {
 /** How the walk decides which calls start a child that must be narrated. */
 export interface ChildProcessPolicy {
   /**
-   * Executables whose run is a bounded local query — reading git's metadata or the process table. Judged by
-   * the literal executable at the call site, never by its argv.
+   * Executables whose run is bounded local work — reading git's metadata, the process table, a short
+   * kill. Judged by the basename literals spelled at the call site, never by its argv: the quoted name
+   * (`"git"`), and the basename of a system path built there (`win32.join(root, "System32",
+   * "taskkill.exe")` names the same kill as `"taskkill"`, fetched from System32 so the working
+   * directory — the project's — is never searched for it).
    */
   readonly boundedExecutables: ReadonlySet<string>;
   /**
@@ -137,6 +140,26 @@ export interface ChildProcessPolicy {
 
 const SPECIFIER = String.raw`["'\x60](?:node:)?child_process["'\x60]`;
 const IDENT = String.raw`[A-Za-z_$][\w$]*`;
+
+/**
+ * The bounded name this executable expression spells, if any. Two forms, both judged by a literal at
+ * the call site: a **lone string literal** (`"git"`, `"ps"`), and the one named system-path shape
+ * the CLI uses — `systemExecutable("taskkill")`, judged by its literal argument. The census's argv[0]
+ * extraction stops at the outer call's edge, so the trailing `)` of the helper is not in the text it
+ * reports, and the shape accepts it with and without. Nothing looser: a literal *inside* a wider
+ * expression is the census's catch, not its exemption — `tool ?? "git"` runs the tool when it is
+ * set, and only reaches git when it is not.
+ */
+export function boundedExecutableName(executable: string): string | undefined {
+  const lone = /^["']([^"'`$]*)["']$/.exec(executable)?.[1];
+  if (lone !== undefined) return lone;
+  return /^systemExecutable\(\s*["']([^"'`$]*)["']\)?\s*$/.exec(executable)?.[1];
+}
+
+export function isBoundedExecutable(executable: string, bounded: ReadonlySet<string>): boolean {
+  const name = boundedExecutableName(executable);
+  return name !== undefined && bounded.has(name);
+}
 
 /** An identifier occurrence, not a property access, not inside a longer name, not inside a quote. */
 function occurrences(code: string, name: string): number[] {
@@ -702,8 +725,7 @@ export function childProcessReport(
 
     const own = (at: number): Declaration | undefined => list.find((decl) => at >= decl.start && at < decl.end);
     for (const call of moduleCalls) {
-      const bounded = /^["']([^"']*)["']$/.exec(call.executable)?.[1];
-      if (bounded !== undefined && policy.boundedExecutables.has(bounded)) continue;
+      if (isBoundedExecutable(call.executable, policy.boundedExecutables)) continue;
       // The streams-on exemption covers `spawn`, and the seam calls spelled from inside a module the
       // policy lists: `spawnCommand` is `spawn` with resolution in front of it, and a caller that
       // streams the child's output — the editor, the browser opener — stays as silent-by-design

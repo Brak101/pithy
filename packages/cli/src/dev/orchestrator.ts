@@ -36,7 +36,7 @@ import { heldReservations } from "../feature/prune";
 import { currentBranch, defaultGit } from "../feature/worktree";
 import { openUrl as openUrlDefault } from "../platform/browser";
 import { spawnCommand } from "../platform/command";
-import { defaultKillFor } from "../platform/killTree";
+import { defaultKillFor, type KillProcess } from "../platform/killTree";
 import { composeFor } from "../project/composeFor";
 import { allCapabilities } from "../project/config";
 import { detectPackageManager, execArgs } from "../project/packageManager";
@@ -187,7 +187,19 @@ export interface StartDevOptions {
   /** Reap our own orphans on the pinned ports. `knownPids` are the previous session's recorded children. */
   sweep?: (ports: number[], knownPids: readonly number[]) => Promise<number[]>;
   spawn?: SpawnDev;
-  kill?: (pid: number, signal: NodeJS.Signals) => void;
+  /**
+   * Signal a child of **this** session. The Windows default is the tree kill (`killTree.ts`): this
+   * module spawned the child, Node holds its process handle open until it exits, so the pid is not
+   * recycled and walking its tree reaches exactly the shim → node → wrangler → workerd chain this
+   * session started.
+   */
+  kill?: KillProcess;
+  /**
+   * Signal a pid read from a crashed session's state file. Plain `process.kill`, and deliberately not
+   * the tree kill: Windows recycles pids, so a stale entry can belong to anything by now — the adopter's
+   * editor, their terminal. An unrelated pid earns one signal, not the loss of its whole process tree.
+   */
+  killStale?: (pid: number, signal: NodeJS.Signals) => void;
   isAlive?: (pid: number) => boolean;
   sleep?: Sleep;
   /** Seam: the ready-deadline timer. Real `setTimeout` in production, a hand-driven clock in tests. */
@@ -588,8 +600,8 @@ export async function startDev(options: StartDevOptions): Promise<DevHandle> {
   const bind = options.tryBind ?? tryBindDefault;
   const spawn = options.spawn ?? spawnDefault;
   const kill = options.kill ?? defaultKillFor();
-  // Stale pids from a crashed session's state file get a plain signal (the killStale seam, #704):
-  // a recycled pid's tree is somebody else's.
+  // Stale pids from a crashed session's state file get a plain signal: the tree kill reaches a whole
+  // process tree, and a recycled pid's tree is somebody else's (the `killStale` seam's doc says it).
   const killStale = options.killStale ?? ((pid: number, signal: NodeJS.Signals) => void process.kill(pid, signal));
   const isAlive = options.isAlive ?? isAliveDefault;
   const sleep = options.sleep ?? realSleep;
@@ -949,7 +961,7 @@ export async function startDev(options: StartDevOptions): Promise<DevHandle> {
   //    sweep is scoped to our own orphans — the previous session's pids and workerd/wrangler-shaped
   //    commands — so anything genuinely external falls through to step 5 and is reported, never killed.
   const statePath = devStatePath(projectDir);
-  const previous = await stopPreviousSession({ statePath, readState, isAlive, kill, sleep, emitLine });
+  const previous = await stopPreviousSession({ statePath, readState, isAlive, kill: killStale, sleep, emitLine });
   const sweep =
     options.sweep ??
     ((ports: number[], knownPids: readonly number[]) =>
