@@ -99,10 +99,17 @@ export async function detectShell(options: DetectShellOptions = {}): Promise<She
   // same reason a `.zshrc` sitting in the home directory costs nothing to a zsh user. The primary is
   // the 7 path (the `pwsh` spelling a test and the docs both name); the 5.1 path rides in extras.
   if (platform === "win32" || base.endsWith("pwsh") || base.endsWith("powershell")) {
+    // The 5.1 profile is a Windows file: 5.1 ships with Windows, and `pwsh` on macOS or Linux is a
+    // POSIX pwsh with no 5.1 sibling to top up. Writing `Documents\WindowsPowerShell\…` on a Linux
+    // home for `SHELL=pwsh` would create a profile directory for an edition that does not exist
+    // there — extras carry the 5.1 path on win32 only.
     return {
       kind: "powershell",
       rcPath: join(home, "Documents", "PowerShell", "Microsoft.PowerShell_profile.ps1"),
-      extraRcPaths: [join(home, "Documents", "WindowsPowerShell", "Microsoft.PowerShell_profile.ps1")],
+      extraRcPaths:
+        platform === "win32"
+          ? [join(home, "Documents", "WindowsPowerShell", "Microsoft.PowerShell_profile.ps1")]
+          : [],
       aliasSyntax: "function p. { pithy @args }",
     };
   }
