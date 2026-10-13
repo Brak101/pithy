@@ -112,6 +112,7 @@ describe("installAlias", () => {
       action: "install",
       installed: true,
       alreadyInstalled: false,
+      wrote: [rcPath],
       shell: "zsh",
       rcPath,
       alias: ZSH_ALIAS,
