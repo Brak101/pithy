@@ -34,9 +34,9 @@ Two characters, ending in the brand mark: `p.` — `p. init`, `p. add auth`, `p.
 | zsh | `~/.zshrc` | `alias p.='pithy'` |
 | fish | `~/.config/fish/config.fish` | `alias p. pithy` |
 | nushell | `~/.config/nushell/config.nu` | `alias p. = pithy` |
-| PowerShell | `~/Documents/PowerShell/Microsoft.PowerShell_profile.ps1` | `function p. { pithy @args }` |
+| PowerShell | `~/Documents/PowerShell/Microsoft.PowerShell_profile.ps1`, and on Windows also `~/Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1` | `function p. { pithy @args }` |
 
-PowerShell gets a function rather than an alias because `Set-Alias` rejects a `.` in a name. macOS bash prefers `.bash_profile` — the platform convention — and falls back to `.bashrc` only when it is absent.
+PowerShell gets a function rather than an alias because `Set-Alias` rejects a `.` in a name. On Windows its rc file is a set of two: PowerShell 7 (`pwsh`) loads the first profile and Windows PowerShell 5.1, which ships with Windows, loads the second, and no file loads in both. So the block goes into both, and a family that is not installed holds an inert block until it is. pwsh on macOS or Linux has one profile. macOS bash prefers `.bash_profile` — the platform convention — and falls back to `.bashrc` only when it is absent.
 
 **Write a delimited block**, never a bare line.
 
@@ -48,11 +48,11 @@ alias p.='pithy'
 
 Universal `#` comment syntax, and the markers are what `--remove` finds and deletes. Nothing outside them is touched.
 
-**Idempotent.** A second install detects the existing block — or a hand-added `alias p.=` in any form — and writes nothing.
+**Idempotent.** A second install detects the existing block — or a hand-added `alias p.=` in any form — and writes nothing. Where the rc file is a set, the install tops it up: a profile without the block gets one, which is how an install from before the second profile is repaired, and the human line names every file written.
 
 **An unrecognized shell is never guessed at.** `pithy alias` prints the POSIX form and how to add it by hand, then exits 0. It writes to no rc file it does not recognize.
 
-`--status` reads only. It answers on the marker block alone, so a hand-added `alias p.=` reads as *not installed* — the command reports what `--remove` could act on, not what the shell happens to define.
+`--status` reads only, and names the files that carry the block. It answers on the marker block alone, so a hand-added `alias p.=` reads as *not installed* — the command reports what `--remove` could act on, not what the shell happens to define.
 
 ### Two hidden flags
 
@@ -112,15 +112,19 @@ This path used to carry no `action` at all — so the one case where the command
 | `command` | `"alias"` | The command that produced the line. On every payload |
 | `schemaVersion` | integer | The version of this payload's shape. Bumped only by a change that breaks a parser — a key removed, a key retyped, a value added to a fixed set; an added key does not bump it. `pithy schema` publishes the current one. |
 | `action` | `"install" \| "remove" \| "status"` | Which path ran. On every payload, the unknown-shell one included |
-| `installed` | boolean | Install: always `true` — the alias is in place, whether this run put it there or found it. Status: whether the marker block is in the rc file |
-| `alreadyInstalled` | boolean | Install only. `true` when the block, or a hand-added `alias p.=`, was already there and nothing was written |
+| `installed` | boolean | Install: always `true` — the alias is in place, whether this run put it there or found it. Status: whether the marker block is in any of the rc files |
+| `alreadyInstalled` | boolean | Install only. `true` when the block, or a hand-added `alias p.=`, was already in one of the rc files before this run |
+| `wrote` | string[] | Install only, always present. The files this run wrote the block into. `[]` means nothing was written |
 | `removed` | boolean | Remove only. `false` when there was no block to remove — not an error, and the exit is 0 |
+| `removedFrom` | string[] | Remove only, present when `removed` is `true`. The files the block came out of |
+| `installedIn` | string[] | Status only, present when `installed` is `true`. The files that carry the block |
 | `shell` | string or `null` | The detected shell family: `bash`, `zsh`, `fish`, `nushell`, `powershell`. `null` when detection failed |
-| `rcPath` | string or `null` | Absolute path to the rc file the alias line belongs in. `null` on `status` with an undetected shell |
+| `rcPath` | string or `null` | Absolute path to the rc file the alias line belongs in — the first, when there are several. `null` on `status` with an undetected shell |
+| `rcPaths` | string[] | Present only when the rc file is a set of more than one — PowerShell on Windows. Every member, `rcPath` first |
 | `alias` | string | The alias line itself. The shell-specific syntax on the install path; the plain POSIX form on the unknown-shell path |
 | `manual` | `true` | Present only on the unknown-shell path, and only from an install or a remove. Says the shell was not detected, nothing was written, and `alias` is for you to add by hand |
 
-`installed` and `alreadyInstalled` answer different questions on the install path, and both are worth reading: `installed` is the state afterwards, `alreadyInstalled` is whether this run changed anything.
+`installed`, `alreadyInstalled` and `wrote` answer different questions on the install path: `installed` is the state afterwards, `alreadyInstalled` is whether the alias was there before, and `wrote` is what this run changed. On Windows a run can find the alias in one profile and write it into the other, so `alreadyInstalled` is `true` and `wrote` is not empty.
 
 ## Errors
 
