@@ -114,7 +114,9 @@ export async function installAlias(opts: AliasOptions = {}): Promise<void> {
       emitJson("install", {
         installed: true,
         alreadyInstalled: true,
-        ...(wrote.length > 0 ? { wrote } : {}),
+        // `wrote` is always in the payload — the empty array is the sentence "this run wrote
+        // nothing", which is the fact the repair path and the no-op path share.
+        wrote,
         shell: shell.kind,
         rcPath: shell.rcPath,
         ...(paths.length > 1 ? { rcPaths: paths } : {}),
