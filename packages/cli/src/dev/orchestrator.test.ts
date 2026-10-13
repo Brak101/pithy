@@ -520,6 +520,9 @@ describe("startDev — spawn commands and env", () => {
     const api = h.spawned.find((s) => s.opts.cwd === "/proj/apps/api");
     const web = h.spawned.find((s) => s.opts.cwd === "/proj/apps/web");
     expect(api).toMatchObject({
+      // The seam sees the command as `startWorker` names it — `bun` everywhere. The platform spelling
+      // is the spawn default's resolution (#698), applied below the seam and tested in
+      // `platform/command.test.ts`, where the Windows literal lives.
       command: "bun",
       args: [
         "x",

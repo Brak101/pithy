@@ -1,17 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
-import { execFile } from "node:child_process";
 import { access, readFile, realpath } from "node:fs/promises";
 import { join, relative } from "node:path";
-import { promisify, stripVTControlCharacters } from "node:util";
+import { stripVTControlCharacters } from "node:util";
 import { PACKAGE_EXEC } from "@pithy-sh/core/src/cli/command";
 import { InternalError } from "@pithy-sh/core/src/error/pithyError";
+import { execCommand } from "../platform/command";
 import { startStep } from "../terminal/progress";
 import { writeFileAtomic } from "./atomic";
 import { readOptionalFile } from "./readOptionalFile";
-
-const run = promisify(execFile);
 
 /** The package managers a Pithy adopter might use. Adoption is never gated behind Bun. */
 export type PackageManager = "npm" | "pnpm" | "yarn" | "bun";
@@ -152,7 +150,7 @@ export type InstallRunner = (command: string, args: string[], cwd: string) => Pr
  */
 export const runPackageManager: InstallRunner = async (command, args, cwd) => {
   startStep(`Running ${[command, ...args].join(" ")}`);
-  await run(command, args, { cwd });
+  await execCommand(command, args, { cwd });
 };
 
 const spawnInstall: InstallRunner = async (command, args, cwd) => {

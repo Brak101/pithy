@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
-import { spawn as spawnChild } from "node:child_process";
 import { commandAlternatives, commandName, pithyCommand } from "@pithy-sh/core/src/cli/command";
 import { isContinuousIntegration } from "@pithy-sh/core/src/env/ci";
 import { messageOf, ValidationError } from "@pithy-sh/core/src/error/pithyError";
@@ -36,6 +35,7 @@ import {
 import { heldReservations } from "../feature/prune";
 import { currentBranch, defaultGit } from "../feature/worktree";
 import { openUrl as openUrlDefault } from "../platform/browser";
+import { spawnCommand } from "../platform/command";
 import { composeFor } from "../project/composeFor";
 import { allCapabilities } from "../project/config";
 import { detectPackageManager, execArgs } from "../project/packageManager";
@@ -362,7 +362,7 @@ const realSleep: Sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms
 
 /** The real spawn: a group-leader child (POSIX `setsid` via `detached`) with piped stdout/stderr. */
 const spawnDefault: SpawnDev = (command, args, options) =>
-  spawnChild(command, args, {
+  spawnCommand(command, args, {
     cwd: options.cwd,
     env: options.env,
     detached: options.detached,
@@ -586,10 +586,10 @@ export async function startDev(options: StartDevOptions): Promise<DevHandle> {
   const loadDevConfig = options.loadDevConfig ?? ((dir: string) => readDevConfig(devConfigPath(dir)));
   const bind = options.tryBind ?? tryBindDefault;
   const spawn = options.spawn ?? spawnDefault;
-  const kill = options.kill ?? ((pid, signal) => process.kill(pid, signal));
   const isAlive = options.isAlive ?? isAliveDefault;
   const sleep = options.sleep ?? realSleep;
   const hasSetsid = options.hasSetsid ?? process.platform !== "win32";
+  const kill = options.kill ?? ((pid, signal) => process.kill(pid, signal));
   const stdout = options.stdout ?? ((text: string) => void process.stdout.write(text));
   const stderr = options.stderr ?? ((text: string) => void process.stderr.write(text));
   const readDevLogins = options.readDevLogins ?? readDevLoginsDefault;

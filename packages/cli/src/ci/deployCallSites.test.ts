@@ -154,7 +154,7 @@ const CREATES_NOTHING_GATE = "assertCreatesNoResources";
 const SEAM_FUNCTION = "runWrangler";
 
 /** The child process call inside the seam. The gate has to come before it, or it gates nothing. */
-const CHILD_SPAWN = /\bspawn\s*\(/;
+const CHILD_SPAWN = /\b(?:spawn|spawnCommand)\s*\(/;
 
 /** The name an argv literal turns provisioning off by. A literal string is not it: see the test below. */
 const NO_PROVISION = "NO_PROVISION_ARG";
