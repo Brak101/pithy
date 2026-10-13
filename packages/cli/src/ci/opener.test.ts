@@ -186,7 +186,7 @@ function literalExecutable(executable: string): string | null {
  * argument alike — and matched by **basename**, so the System32 helper spelling cannot slip past a
  * reservation that names the binary. A module's exception is keyed by the spelling as written.
  */
-function browserOffenders(calls: Map<string, readonly CallSite[]>): string[] {
+function browserOffenders(calls: ReadonlyMap<string, readonly CallSite[]>): string[] {
   const offenders: string[] = [];
   for (const [file, sites] of calls) {
     if (file === BROWSER) continue;
