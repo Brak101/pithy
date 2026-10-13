@@ -5,6 +5,7 @@ import { basename, relative, resolve } from "node:path";
 import { blankComments } from "@pithy-sh/core/src/text/comments";
 import { describe, expect, test } from "vitest";
 import {
+  boundedExecutableName,
   type ChildProcessPolicy,
   type ChildProcessReport,
   childProcessReport,
@@ -50,7 +51,8 @@ import { isTestFile, readSource, sourcePaths } from "./sourceFiles";
  *    at runtime.
  *
  * **Not every child needs a step, and there are two exceptions.** A child whose executable is written as the
- * literal `"git"`, `"lsof"` or `"ps"` is a bounded local query — git's metadata, the process table — judged at
+ * literal `"git"`, `"lsof"`, `"ps"` or `"taskkill"` is bounded local work — git's metadata, the process
+ * table, a short kill — judged at
  * the call site, so the same `execFile` with `"npm"` beside it is held. And a streams-on spawn in one of
  * three named modules — the editor that owns the terminal, the browser opener that detaches, and the dev
  * orchestrator that pipes each worker's streams to the terminal and the session log — is not captured.
@@ -130,7 +132,7 @@ const WRAP = /\bwithErrorReporting\s*\(/;
 
 /** What needs no step. Each entry is argued in the docblock above. */
 const POLICY: ChildProcessPolicy = {
-  boundedExecutables: new Set(["git", "lsof", "ps"]),
+  boundedExecutables: new Set(["git", "lsof", "ps", "taskkill"]),
   uncapturedModules: new Set(
     ["platform/browser.ts", "platform/editor.ts", "dev/orchestrator.ts"].map((path) => resolve(CLI_SRC, path)),
   ),
@@ -200,6 +202,7 @@ describe("a long command narrates itself", () => {
       "packages/cli/src/plan/shadow.ts",
       "packages/cli/src/platform/browser.ts",
       "packages/cli/src/platform/editor.ts",
+      "packages/cli/src/platform/killTree.ts",
       "packages/cli/src/project/deploy.ts",
       "packages/cli/src/project/packageManager.ts",
       "packages/cli/src/project/templateFiles.ts",
@@ -215,7 +218,9 @@ describe("a long command narrates itself", () => {
         shown(file),
       ).toBe(true);
     }
-    const executables = [...report.calls.values()].flat().map((call) => call.executable.replace(/^["']|["']$/g, ""));
+    const executables = [...report.calls.values()]
+      .flat()
+      .map((call) => boundedExecutableName(call.executable) ?? call.executable.replace(/^["']|["']$/g, ""));
     for (const executable of POLICY.boundedExecutables) expect(executables, executable).toContain(executable);
   });
 

@@ -202,8 +202,9 @@ function findOnPath(name: string, env: NodeJS.ProcessEnv, fileExists: (path: str
  * `process.env` on Windows matches any case — the variable arrives as `Path`, not `PATH` — and every
  * module-level read through this file's seams is a *copy* of it: `{ ...process.env, … }` is an
  * ordinary object, `env.PATH` on one is `undefined`, and the resolution silently finds nothing.
+ * Exported for `killTree.ts`, which reads `SystemRoot` the same way (#704 review).
  */
-function environmentValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
+export function environmentValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
   const direct = env[name];
   if (direct !== undefined) return direct;
   const key = Object.keys(env).find((entry) => entry.toUpperCase() === name.toUpperCase());
