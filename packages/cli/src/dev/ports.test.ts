@@ -95,6 +95,40 @@ describe("sweepStaleDevPorts", () => {
     expect(killed).toEqual([3001]);
   });
 
+  test("a known pid the command filter does not match gets the plain kill, not the tree kill (#705 review)", async () => {
+    const tree: number[] = [];
+    const plain: number[] = [];
+    const reaped = await sweepStaleDevPorts([8787], {
+      ...base,
+      lsof: async () => [3001],
+      // A recycled pid: the state file names it, the command line says stranger. One process dies,
+      // not a stranger's tree — the #704 killStale rule, at the sweep's seam.
+      commandOf: async () => "C:\\Program Files\\SomeApp\\someapp.exe",
+      knownPids: [3001],
+      kill: (pid) => void tree.push(pid),
+      killStale: (pid) => void plain.push(pid),
+    });
+    expect(reaped).toEqual([3001]);
+    expect(plain).toEqual([3001]);
+    expect(tree).toEqual([]);
+  });
+
+  test("a holder the command filter matches earns the tree kill, recorded pids or not", async () => {
+    const tree: number[] = [];
+    const plain: number[] = [];
+    await sweepStaleDevPorts([8787], {
+      ...base,
+      lsof: async () => [3001, 3002],
+      commandOf: async (pid) =>
+        pid === 3001 ? "C:\\…\\workerd.exe --control-fd" : "node /proj/node_modules/.bin/vite",
+      knownPids: [3002],
+      kill: (pid) => void tree.push(pid),
+      killStale: (pid) => void plain.push(pid),
+    });
+    expect(tree).toEqual([3001]);
+    expect(plain).toEqual([3002]);
+  });
+
   test("never signals this process or one of its ancestors", async () => {
     const killed: number[] = [];
     const parents = new Map<number, number>([

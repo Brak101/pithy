@@ -113,10 +113,11 @@ export interface ChildProcessReport {
 export interface ChildProcessPolicy {
   /**
    * Executables whose run is bounded local work — reading git's metadata, the process table, a short
-   * kill. Judged by the basename literals spelled at the call site, never by its argv: the quoted name
-   * (`"git"`), and the basename of a system path built there (`win32.join(root, "System32",
-   * "taskkill.exe")` names the same kill as `"taskkill"`, fetched from System32 so the working
-   * directory — the project's — is never searched for it).
+   * kill. Judged by the literal spelled at the call site, never by its argv, in the two shapes
+   * {@link boundedExecutableName} accepts: a lone string literal (`"git"`), and
+   * `systemExecutable("taskkill")`, judged by its literal argument, which names the System32 copy so the
+   * working directory (the project's) is never searched for it. A literal inside a wider expression is
+   * held.
    */
   readonly boundedExecutables: ReadonlySet<string>;
   /**

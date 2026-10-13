@@ -280,6 +280,8 @@ export interface SweepDeps {
   lsof?: LsofPort;
   isAlive?: (pid: number) => boolean;
   kill?: (pid: number, signal: NodeJS.Signals) => void;
+  /** Plain signal for a pid accepted only by the state-file list (default: `process.kill`). */
+  killStale?: (pid: number, signal: NodeJS.Signals) => void;
   log?: (message: string) => void;
   /** Command-line lookup, the scope filter (default: {@link psCommand}). */
   commandOf?: ProcessCommand;
@@ -305,8 +307,11 @@ export async function sweepStaleDevPorts(ports: number[], deps: SweepDeps = {}):
   const lsof = deps.lsof ?? defaultPortHolders();
   const alive = deps.isAlive ?? isAlive;
   // The sweep's kill is the tree kill: on Windows the port holder is a `.cmd`/`node`/`workerd` chain,
-  // and the sweep exists precisely to end chains (#701 item 3, riding #704's killTree).
+  // and the sweep exists precisely to end chains (#701 item 3, riding #704's killTree). It is earned
+  // only by the command filter: a pid accepted just because the state file recorded it may have been
+  // recycled, and a recycled pid earns one process killed, not a stranger's whole tree (#704's rule).
   const kill = deps.kill ?? defaultKillFor();
+  const killStale = deps.killStale ?? ((pid: number, signal: NodeJS.Signals) => void process.kill(pid, signal));
   const commandOf = deps.commandOf ?? defaultCommandOf();
   const parentOf = deps.parentOf ?? defaultParentOf();
   const selfPid = deps.selfPid ?? process.pid;
@@ -318,16 +323,20 @@ export async function sweepStaleDevPorts(ports: number[], deps: SweepDeps = {}):
   for (const port of ports) {
     for (const pid of await lsof(port)) {
       if (pid === selfPid || !alive(pid)) continue;
+      const commandMatch = isReapableDevCommand(await commandOf(pid));
       const ours = known.has(pid);
-      if (!ours && !isReapableDevCommand(await commandOf(pid))) {
+      if (!ours && !commandMatch) {
         deps.log?.(`port ${port} is held by pid ${pid}, which is not a stale worker — leaving it`);
         continue;
       }
       protectedPids ??= await ancestorPids(selfPid, parentOf);
       if (protectedPids.has(pid)) continue;
       deps.log?.(`reaping stale process on port ${port} (pid ${pid})`);
+      // Tree kill only a holder the command filter matched as a worker; a known pid the filter did
+      // not match is killed as a stale pid — one process, no tree (#705 review).
+      const apply = commandMatch ? kill : killStale;
       try {
-        kill(pid, "SIGKILL");
+        apply(pid, "SIGKILL");
         reaped.push(pid);
       } catch {
         // Already gone between the lsof and the kill — nothing to reap.
