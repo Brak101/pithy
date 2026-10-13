@@ -202,7 +202,9 @@ describe("the PowerShell alias set", () => {
   });
 
   test("off Windows, pwsh gets the 7 profile alone — no 5.1 file for an edition that is not here", async () => {
-    await installAlias();
+    // The platform seam, not the host: this proves the non-win32 shape from any CI box, and on a
+    // Windows host `process.platform` would genuinely include the 5.1 profile.
+    await installAlias({ platform: "linux" });
     expect(await readFile(pw7Path, "utf8")).toContain(OPEN);
     await expect(readFile(pw51Path, "utf8")).rejects.toThrow();
   });
