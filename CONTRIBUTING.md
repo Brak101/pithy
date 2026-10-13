@@ -36,7 +36,7 @@ Each form sets the issue type, `Bug` or `Feature`, and applies `needs-triage`; e
 
 Welcome. A pull request merges into `main` when three things hold, and GitHub enforces all of them:
 
-- **The `CI` check is green**, on a branch that is up to date with `main`. If `main` moves, update your branch and CI runs again.
+- **The `CI` check is green**, on a branch that is up to date with `main`. You don't need to keep it up to date. When we merge, we bring your branch up to date with `main` ourselves, and CI runs again. That needs **Allow edits by maintainers** left on, which GitHub sets by default. A fork owned by an organization can't allow it, so there we ask you to merge `main` yourself. Otherwise we ask you to act only when `main` conflicts with your change, and we name the files.
 - **One maintainer has approved the change.** A push that changes it dismisses an earlier approval, so the approval is of the diff that merges.
 - **Every review conversation is resolved.**
 
