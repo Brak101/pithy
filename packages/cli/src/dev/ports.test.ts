@@ -3,7 +3,7 @@
 
 import { ConflictError } from "@pithy-sh/core/src/error/pithyError";
 import { describe, expect, test, vi } from "vitest";
-import { isReapableDevCommand, sweepStaleDevPorts, verifyPinnedPort, waitForExit } from "./ports";
+import { isReapableDevCommand, parseCimPids, sweepStaleDevPorts, verifyPinnedPort, waitForExit } from "./ports";
 
 describe("verifyPinnedPort", () => {
   test("returns when the port is free on both families", async () => {
@@ -87,12 +87,48 @@ describe("sweepStaleDevPorts", () => {
     await sweepStaleDevPorts([8787], {
       ...base,
       lsof: async () => [3001],
-      // A custom dev.command child (Vite) from a crashed session: ours by record, not by command name.
+      // A custom dev.command child (Vite) from a crashed session: ours by record, not by command name
+      // — so the plain seam carries it, one process, no tree (#705 review).
       commandOf: async () => "node /proj/node_modules/.bin/vite --host",
       knownPids: [3001],
-      kill: (pid) => killed.push(pid),
+      kill: (pid) => void killed.push(pid),
+      killStale: (pid) => void killed.push(pid),
     });
     expect(killed).toEqual([3001]);
+  });
+
+  test("a known pid the command filter does not match gets the plain kill, not the tree kill (#705 review)", async () => {
+    const tree: number[] = [];
+    const plain: number[] = [];
+    const reaped = await sweepStaleDevPorts([8787], {
+      ...base,
+      lsof: async () => [3001],
+      // A recycled pid: the state file names it, the command line says stranger. One process dies,
+      // not a stranger's tree — the #704 killStale rule, at the sweep's seam.
+      commandOf: async () => "C:\\Program Files\\SomeApp\\someapp.exe",
+      knownPids: [3001],
+      kill: (pid) => void tree.push(pid),
+      killStale: (pid) => void plain.push(pid),
+    });
+    expect(reaped).toEqual([3001]);
+    expect(plain).toEqual([3001]);
+    expect(tree).toEqual([]);
+  });
+
+  test("a holder the command filter matches earns the tree kill, recorded pids or not", async () => {
+    const tree: number[] = [];
+    const plain: number[] = [];
+    await sweepStaleDevPorts([8787], {
+      ...base,
+      lsof: async () => [3001, 3002],
+      commandOf: async (pid) =>
+        pid === 3001 ? "C:\\…\\workerd.exe --control-fd" : "node /proj/node_modules/.bin/vite",
+      knownPids: [3002],
+      kill: (pid) => void tree.push(pid),
+      killStale: (pid) => void plain.push(pid),
+    });
+    expect(tree).toEqual([3001]);
+    expect(plain).toEqual([3002]);
   });
 
   test("never signals this process or one of its ancestors", async () => {
@@ -129,6 +165,28 @@ describe("sweepStaleDevPorts", () => {
   });
 });
 
+describe("parseCimPids", () => {
+  test("a listener on both families is one pid, named once", () => {
+    // `Get-NetTCPConnection -State Listen -LocalPort 8787` answers one row per listening address: a
+    // server bound to 127.0.0.1 and ::1 is the same pid on two rows.
+    expect(parseCimPids("27200\r\n27200\r\n")).toEqual([27200]);
+  });
+
+  test("distinct listeners on one port are all named", () => {
+    expect(parseCimPids("27200\r\n31108\r\n")).toEqual([27200, 31108]);
+  });
+
+  test("no listener, empty output, and the pid 0 of a kernel row answer the sweep with nothing to reap", () => {
+    expect(parseCimPids("")).toEqual([]);
+    expect(parseCimPids("\r\n\r\n")).toEqual([]);
+    expect(parseCimPids("0\r\n")).toEqual([]);
+  });
+
+  test("a line that is not a number is not a pid", () => {
+    expect(parseCimPids("OwningProcess\r\n7716\r\n")).toEqual([7716]);
+  });
+});
+
 describe("isReapableDevCommand", () => {
   test.each<[string | null, boolean]>([
     ["/usr/local/bin/workerd serve --socket-addr=127.0.0.1:8787", true],
@@ -139,6 +197,17 @@ describe("isReapableDevCommand", () => {
     ["docker-proxy -proto tcp -host-port 8791", false],
     ["nvim wrangler.jsonc", false],
     [null, false],
+    // #701 item 3: the CIM command lines the Windows sweep feeds this. Backslash paths, an `.exe`
+    // suffix, and a quoted program path (a Windows home with a space is the common case).
+    ["C:\\Users\\x\\node_modules\\@cloudflare\\workerd\\bin\\workerd.exe serve", true],
+    ['"C:\\Program Files\\nodejs\\node.exe" C:\\proj\\node_modules\\wrangler\\bin\\wrangler.js dev', true],
+    ["C:\\Users\\x\\AppData\\Roaming\\npm\\node_modules\\bun\\bin\\bun.exe x wrangler dev", true],
+    // CIM reports a path as it was launched and Windows filenames are not case-preserved: WORKERD.EXE
+    // is the same binary, and the filter must not fail safe past it.
+    ["C:\\TOOLS\\WORKERD.EXE serve", true],
+    ['"C:\\Program Files\\nodejs\\NODE.EXE" C:\\proj\\node_modules\\wrangler\\bin\\wrangler.js dev', true],
+    ['"C:\\Program Files\\Git\\usr\\bin\\git.exe" status', false],
+    ["C:\\Windows\\System32\\netstat.exe -ano", false],
   ])("%s → %s", (command, expected) => {
     expect(isReapableDevCommand(command)).toBe(expected);
   });

@@ -4,7 +4,13 @@
 import { basename, relative, resolve } from "node:path";
 import { blankComments } from "@pithy-sh/core/src/text/comments";
 import { describe, expect, test } from "vitest";
-import { childProcessReport, relativeImports, type SourceModule } from "./childProcesses";
+import {
+  boundedExecutableName,
+  type CallSite,
+  childProcessReport,
+  relativeImports,
+  type SourceModule,
+} from "./childProcesses";
 import { isTestFile, readSource, sourcePaths } from "./sourceFiles";
 
 /**
@@ -88,6 +94,19 @@ const BROWSER_COMMANDS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Named exceptions to the reservation above: `<module> → executable spellings>` whose spawn in that
+ * module is not an opener, with its reason. `dev/ports.ts` runs PowerShell to query the CIM process
+ * table and the listening-socket table — a table read by the same right that reserves the name for
+ * the opener; it opens nothing. The key is the spelling the census reports — the bare literal, and
+ * the `systemExecutable` argument, whose basename the check reads — and the list carries only the
+ * spelling the shipped tree calls: `dev/ports.ts` names the System32 helper, and nothing else.
+ * Every other module stays held: the name is reserved, the exception is the one line, spelled.
+ */
+const NOT_OPENER: Readonly<Record<string, ReadonlySet<string>>> = {
+  "dev/ports.ts": new Set(["WindowsPowerShell/v1.0/powershell"]),
+};
+
+/**
  * **Every child process this CLI starts, and why.**
  *
  * The four-name list above was the whole of the old rule, and its comment claimed a second opener could
@@ -105,6 +124,8 @@ const BROWSER_COMMANDS: ReadonlySet<string> = new Set([
 const SPAWNS: Readonly<Record<string, string>> = {
   'dev/ports.ts "lsof"': "Finds what already holds a dev port, to name the process rather than the number.",
   'dev/ports.ts "ps"': "Names the process holding a port, when lsof is not installed.",
+  'dev/ports.ts systemExecutable("WindowsPowerShell/v1.0/powershell"':
+    "Asks CIM, on Windows, which pid listens on a dev port and what command line and parent that pid has — a query, not an opener; the helper names the system copy, the literal names the binary.",
   "dev/orchestrator.ts command": "Runs each worker's dev server — the command is the resolved package manager.",
   'feature/ports.ts "git"': "Reads the branch a feature's port block belongs to.",
   'feature/worktree.ts "git"': "Creates and removes the worktree a feature branch lives in.",
@@ -159,6 +180,27 @@ function literalExecutable(executable: string): string | null {
   return /^["']([^"']*)["']$/.exec(executable)?.[1] ?? null;
 }
 
+/**
+ * Judge a set of call sites against the browser reservation. Names are read the way the census reads
+ * bounded executables — {@link boundedExecutableName}, the lone literal and the `systemExecutable`
+ * argument alike — and matched by **basename**, so the System32 helper spelling cannot slip past a
+ * reservation that names the binary. A module's exception is keyed by the spelling as written.
+ */
+function browserOffenders(calls: ReadonlyMap<string, readonly CallSite[]>): string[] {
+  const offenders: string[] = [];
+  for (const [file, sites] of calls) {
+    if (file === BROWSER) continue;
+    for (const call of sites) {
+      const spelling = boundedExecutableName(call.executable);
+      if (spelling === undefined) continue;
+      if (BROWSER_COMMANDS.has(basename(spelling)) && !NOT_OPENER[relative(CLI_SRC, file)]?.has(spelling)) {
+        offenders.push(`${shown(file)} ${call.primitive}(${call.executable})`);
+      }
+    }
+  }
+  return offenders;
+}
+
 describe("one opener, one key reader, one sentence", () => {
   const all = modules();
   const report = childProcessReport(all, POLICY);
@@ -177,17 +219,24 @@ describe("one opener, one key reader, one sentence", () => {
   });
 
   test("nothing else spawns a browser, however it spells the command", () => {
-    const offenders: string[] = [];
-    for (const [file, calls] of report.calls) {
-      if (file === BROWSER) continue;
-      for (const call of calls) {
-        const executable = literalExecutable(call.executable);
-        if (executable !== null && BROWSER_COMMANDS.has(executable)) {
-          offenders.push(`${shown(file)} ${call.primitive}(${call.executable})`);
-        }
-      }
-    }
-    expect(offenders).toEqual([]);
+    expect(browserOffenders(report.calls)).toEqual([]);
+  });
+
+  test("the reservation reads the helper spelling, and the exception is the one line it names", () => {
+    // The name list cannot state this with literals alone: `systemExecutable("WindowsPowerShell/v1.0/powershell")`
+    // runs PowerShell, and the check must see through the helper to the binary. Planted, not shipped:
+    // a stranger module using the spelling is an offender; `dev/ports.ts`, the named exception, is not.
+    const site: CallSite = {
+      primitive: "execFile",
+      executable: `systemExecutable("WindowsPowerShell/v1.0/powershell")`,
+      offset: 0,
+    };
+    const stranger = resolve(CLI_SRC, "commands", "planted.ts");
+    const ports = resolve(CLI_SRC, "dev", "ports.ts");
+    expect(browserOffenders(new Map([[stranger, [site]]]))).toEqual([
+      `${shown(stranger)} execFile(systemExecutable("WindowsPowerShell/v1.0/powershell"))`,
+    ]);
+    expect(browserOffenders(new Map([[ports, [site]]]))).toEqual([]);
   });
 
   /**
