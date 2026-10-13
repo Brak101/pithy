@@ -129,17 +129,23 @@ const SPECIFIER = String.raw`["'\x60](?:node:)?child_process["'\x60]`;
 const IDENT = String.raw`[A-Za-z_$][\w$]*`;
 
 /**
- * Is this executable expression a bounded executable? Two spellings, both judged by a literal at
+ * The bounded name this executable expression spells, if any. Two forms, both judged by a literal at
  * the call site: a **lone string literal** (`"git"`, `"ps"`), and the one named system-path shape
- * the CLI uses — `systemExecutable("taskkill")`, judged by its literal argument. Nothing looser:
- * a literal *inside* a wider expression is the census's catch, not its exemption —
- * `tool ?? "git"` runs the tool when it is set, and only reaches git when it is not.
+ * the CLI uses — `systemExecutable("taskkill")`, judged by its literal argument. The census's argv[0]
+ * extraction stops at the outer call's edge, so the trailing `)` of the helper is not in the text it
+ * reports, and the shape accepts it with and without. Nothing looser: a literal *inside* a wider
+ * expression is the census's catch, not its exemption — `tool ?? "git"` runs the tool when it is
+ * set, and only reaches git when it is not.
  */
-export function isBoundedExecutable(executable: string, bounded: ReadonlySet<string>): boolean {
+export function boundedExecutableName(executable: string): string | undefined {
   const lone = /^["']([^"'`$]*)["']$/.exec(executable)?.[1];
-  if (lone !== undefined && bounded.has(lone)) return true;
-  const system = /^systemExecutable\(\s*["']([^"'`$]*)["']\s*\)$/.exec(executable)?.[1];
-  return system !== undefined && bounded.has(system);
+  if (lone !== undefined) return lone;
+  return /^systemExecutable\(\s*["']([^"'`$]*)["']\)?\s*$/.exec(executable)?.[1];
+}
+
+export function isBoundedExecutable(executable: string, bounded: ReadonlySet<string>): boolean {
+  const name = boundedExecutableName(executable);
+  return name !== undefined && bounded.has(name);
 }
 
 /** An identifier occurrence, not a property access, not inside a longer name, not inside a quote. */

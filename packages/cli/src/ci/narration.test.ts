@@ -5,6 +5,7 @@ import { basename, relative, resolve } from "node:path";
 import { blankComments } from "@pithy-sh/core/src/text/comments";
 import { describe, expect, test } from "vitest";
 import {
+  boundedExecutableName,
   type ChildProcessPolicy,
   type ChildProcessReport,
   childProcessReport,
@@ -205,7 +206,9 @@ describe("a long command narrates itself", () => {
         shown(file),
       ).toBe(true);
     }
-    const executables = [...report.calls.values()].flat().map((call) => call.executable.replace(/^["']|["']$/g, ""));
+    const executables = [...report.calls.values()]
+      .flat()
+      .map((call) => boundedExecutableName(call.executable) ?? call.executable.replace(/^["']|["']$/g, ""));
     for (const executable of POLICY.boundedExecutables) expect(executables, executable).toContain(executable);
   });
 
