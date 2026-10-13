@@ -4,6 +4,7 @@
 import { access, readFile, realpath } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { stripVTControlCharacters } from "node:util";
+import { PACKAGE_EXEC } from "@pithy-sh/core/src/cli/command";
 import { InternalError } from "@pithy-sh/core/src/error/pithyError";
 import { execCommand } from "../platform/command";
 import { startStep } from "../terminal/progress";
@@ -61,16 +62,9 @@ export function uninstallArgs(pm: PackageManager, pkg: string): string[] {
  * ready to hand to `child_process.spawn`.
  */
 export function execArgs(pm: PackageManager, bin: string, args: string[]): { command: string; args: string[] } {
-  switch (pm) {
-    case "bun":
-      return { command: "bun", args: ["x", bin, ...args] };
-    case "pnpm":
-      return { command: "pnpm", args: ["exec", bin, ...args] };
-    case "yarn":
-      return { command: "yarn", args: [bin, ...args] };
-    default:
-      return { command: "npx", args: [bin, ...args] };
-  }
+  // One table with the lines that name a command run this way (`viaPackageManager`), so the two cannot disagree.
+  const [command, ...prefix] = PACKAGE_EXEC[pm];
+  return { command, args: [...prefix, bin, ...args] };
 }
 
 /** The scope every package this kit ships lives under. */

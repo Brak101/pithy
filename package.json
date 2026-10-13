@@ -3,9 +3,9 @@
   "private": true,
   "license": "MIT",
   "type": "module",
-  "packageManager": "bun@1.3.14",
+  "packageManager": "bun@1.4.2",
   "engines": {
-    "bun": ">=1.1.0"
+    "bun": ">=1.4.0"
   },
   "workspaces": [
     "packages/*",
@@ -25,6 +25,7 @@
     "stamp-versions": "bun scripts/stampVersions.ts",
     "docs-catalog": "bun packages/cli/src/docs/writeCatalog.ts",
     "payload-shapes": "bun packages/cli/src/contract/writePayloadShapes.ts",
+    "command-catalog": "bun packages/cli/src/contract/writeCommandCatalog.ts",
     "dist-types": "bun packages/cli/src/ci/checkDistTypes.ts",
     "worktree": "bun scripts/worktree.ts",
     "reset": "turbo run reset && rm -rf node_modules && bun install",
@@ -38,18 +39,6 @@
     "verify-published": "bun scripts/verifyPublished.ts",
     "clean-room": "bun scripts/cleanRoom.ts"
   },
-  "//": [
-    "@cloudflare/workers-types is pinned below 5.20260807.2, which added `declare const Buffer: any`.",
-    "A block-scoped const cannot merge with @types/node's `var Buffer`, so the node:buffer global",
-    "augmentation is dropped and `randomBytes(8).toString('hex')` stops type-checking. It breaks any",
-    "tsconfig listing both @cloudflare/workers-types and node in `types` — packages/cli does.",
-    "5.20260804.1 is the last clean release, and is what this pins — verified by unpacking both tarballs.",
-    "Still unfixed as of 5.20260817.1. See #402 and docs/STACK.md §17.",
-    "REMOVE THIS PIN when a workers-types release declares Buffer as a `var`, or drops it: bump the",
-    "override to that version, run `bun run typecheck`, and if packages/cli is clean, delete this",
-    "block and the override with it. The declared ranges stay `^5.20260729.1` — adopters are not",
-    "affected, and a real scaffold was checked against 5.20260816.1 to confirm it."
-  ],
   "reactOverrideComment": [
     "react and react-dom MUST resolve to the exact same version, or React refuses to run at all:",
     "`Incompatible React versions: the \"react\" and \"react-dom\" packages must have the exact same version`.",
@@ -65,7 +54,6 @@
     "where the scaffolded front end's gates run."
   ],
   "overrides": {
-    "@cloudflare/workers-types": "5.20260804.1",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },

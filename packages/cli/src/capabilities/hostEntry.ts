@@ -3,6 +3,7 @@
 
 import type { Capability } from "@pithy-sh/core/src/capability/capability";
 import { ValidationError } from "@pithy-sh/core/src/error/pithyError";
+import { packageOf } from "@pithy-sh/core/src/naming/packageName";
 import { packageInstalledFrom } from "../project/kitResolve";
 import { kitSource } from "../project/kitSource";
 import { capabilityLoadErrorNow } from "./loadFailure";
@@ -51,16 +52,6 @@ export interface HostPeerSeam {
   readonly provide: string;
   /** The peers this composition hands the host. Empty means the host deploys from its own entry. */
   needed(capability: Capability, siblings: readonly Capability[]): readonly HostPeer[];
-}
-
-/** The generated entry's file name for one environment, beside the config that names it. */
-export function hostEntryFile(env: string): string {
-  return `.pithy-host.${env}.ts`;
-}
-
-/** The package a kit specifier names: `@pithy-sh/ledger` from `@pithy-sh/ledger/src/peer`. */
-function packageOf(specifier: string): string {
-  return specifier.split("/").slice(0, 2).join("/");
 }
 
 /**

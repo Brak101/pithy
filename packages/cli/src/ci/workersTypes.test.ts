@@ -80,6 +80,9 @@ const WORKERS_TYPES = "@cloudflare/workers-types";
  */
 const RANGE = "^5.20260729.1";
 
+/** A resolved copy in `bun.lock`: `"@cloudflare/workers-types": ["@cloudflare/workers-types@<version>", …`. */
+const LOCKED_WORKERS_TYPES = /"@cloudflare\/workers-types": \["@cloudflare\/workers-types@([^"]+)"/g;
+
 /** The dependency sections a manifest can declare a package in. `overrides` is not one — it is a pin. */
 const SECTIONS = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] as const;
 
@@ -540,14 +543,19 @@ describe("the Workers types are declared the way they are used", () => {
       "these state a different range. Two versions of an ambient global type in one adopter's program are duplicate-identifier errors, so all of them dedupe to one copy or none of them do",
     ).toEqual([]);
 
-    // And the root pin, which is what the whole workspace actually resolves to. It is a concrete version
-    // rather than a range, and it has to sit inside the range every package publishes — otherwise this
-    // tree type-checks against a copy no adopter would ever install. See the `"//"` block beside it.
-    const root = MANIFESTS.find((manifest) => manifest.directory === ".");
-    const pin = (root?.json.overrides as Record<string, unknown> | undefined)?.[WORKERS_TYPES];
+    // And what the whole workspace actually resolves to, read from the lockfile rather than from an
+    // override, because an override is an intention and the lockfile is the install. One copy, inside the
+    // range every package publishes — otherwise this tree type-checks against a copy no adopter would ever
+    // install. A root override held it below `5.20260807.2`'s `declare const Buffer` until upstream made it a
+    // `var` in `5.20261009.1` (#402, docs/STACK.md §17); a pin, if one returns, is read through this too.
+    const resolved = [...(readSource(resolve(REPO_ROOT, "bun.lock")) ?? "").matchAll(LOCKED_WORKERS_TYPES)].map(
+      (match) => match[1] as string,
+    );
+    expect(resolved.length, "bun.lock names no @cloudflare/workers-types; the reader found nothing").toBeGreaterThan(0);
+    expect(new Set(resolved).size, `bun.lock resolves more than one copy: ${resolved.join(", ")}`).toBe(1);
     expect(
-      typeof pin === "string" && satisfiesCaret(pin, RANGE),
-      `the root override ${String(pin)} is outside ${RANGE}`,
+      resolved.every((version) => satisfiesCaret(version, RANGE)),
+      `bun.lock resolves ${resolved.join(", ")}, outside ${RANGE}`,
     ).toBe(true);
   });
 
