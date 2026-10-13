@@ -19,7 +19,7 @@ pithy seed [--worker <name>] [--env <name>] [--dry-run] [--redo] [--yes] \
 | `--worker <name>` | every Worker | Seed one Worker instead of every Worker under `apps/` |
 | `--env <name>` | `dev` | The environment to seed. `dev` runs locally against Miniflare; anything else runs against the live D1/KV/R2/Images/Stream for that env |
 | `--json` | `false` | Machine-readable output — the full write plan or run report as one JSON line. Implies non-interactive: `pithy seed` never prompts when `--json` is set |
-| `--dry-run` | `false` | Compute and print the write plan without touching any backend. Reads media sidecars to report `upload`/`skip`/`reupload` accurately; mints nothing |
+| `--dry-run` | `false` | Show the plan and write nothing. Computes the write plan without touching any backend. Reads media sidecars to report `upload`/`skip`/`reupload` accurately; mints nothing |
 | `--redo` | `false` | **DESTRUCTIVE.** Drop every table and recreate the schema before seeding — all data is lost. See Resetting data, below |
 | `--confirm-reset` | — | Unlock a non-`dev` `--redo`: the exact phrase `yes, i really want to reset <env>` |
 | `--destroy-retained` | — | **DESTRUCTIVE.** Let `--redo` drop rows in retained tables. Must equal the row count the refusal printed |
@@ -45,11 +45,12 @@ A prepared set is handed the origin its Worker answers on (`context.origin`, `do
 
 `--host` overrides all three: `--host preview.example.com`. A bare host takes the environment's scheme — `http` in `dev`, `https` everywhere else — and a full `http://` or `https://` origin is taken as written. One rule decides what a host is, and it refuses rather than repairs, before anything is written:
 
-- every label a DNS label, so an encoded host like `%2e%2e` is refused;
+- every label a DNS label, so an encoded host like `%2e%2e` is refused, and the whole name at most 253 characters;
+- no internationalized name: a label beginning `xn--` is refused, so `xn--a.test` is refused on every runtime, while `myxn--a.test` is the ordinary name it looks like;
 - nothing after the host — a path, a query, a fragment, a trailing `/` — and no credentials;
 - off `dev`, no port and no `http`: a deployed Worker answers over https on the default port;
 - `localhost`, `127.0.0.1` and `*.localhost` in `dev` only;
-- as a URL parser reads it: a host `new URL` refuses — `xn--a.test` — is refused, and a spelling it rewrites is refused rather than taken, so `127.1`, `0177.0.0.1`, `0x7f.0.0.1` and `0` are the loopback they parse to. Off `dev`, loopback in any spelling, `0.0.0.0` and IPv6 `[::1]` are refused, and so is every IP address: a deployed Worker answers on a name.
+- as a URL parser reads it: a host `new URL` cannot parse is refused, and a spelling it rewrites is refused rather than taken, so `127.1`, `0177.0.0.1`, `0x7f.0.0.1` and `0` are the loopback they parse to. Off `dev`, loopback in any spelling, `0.0.0.0` and IPv6 `[::1]` are refused, and so is every IP address: a deployed Worker answers on a name.
 
 **`pithy seed` mints nothing, so it offers a prepared set an empty channel.** `context.mintedThisRun` answers `undefined` for every name here, in every environment. That is not a failure: the only commands that mint and seed in one process are `pithy provision --feature` and `pithy provision --env <environment> --seed`, and a set that has to seal something under a freshly minted secret runs through one of those. See [`SEED.md`](../SEED.md#what-this-run-just-minted-contextmintedthisrun).
 
@@ -75,7 +76,7 @@ Every other flag in Pithy follows the same rule everywhere: `--json` means non-i
 
 - `dev` never asks for anything.
 - `staging` (and any other non-`dev`, non-production environment) needs `--yes`.
-- `prod` needs `--yes` **and** the exact phrase `yes, i really want to seed production`, matched case-insensitively after trimming. Interactively, `pithy seed` prompts for it with `@clack/prompts`. Non-interactively (`--json`, CI, no TTY), there is no prompt — pass it directly:
+- `prod` needs `--yes` **and** the exact phrase `yes, i really want to seed production`, matched case-insensitively after trimming. Interactively, `pithy seed` prompts for it with `@clack/prompts`. Non-interactively (`--json`, `--no-input`, `PITHY_NONINTERACTIVE=1`, CI, no TTY), there is no prompt — pass it directly. Omitting it there is refused `core/person_required`, exit 5, and the action names `--confirm-production` — the phrase is a person's to give, so an agent stops and asks:
 
   ```
   pithy seed --env prod --yes --confirm-production "yes, i really want to seed production"
@@ -120,7 +121,6 @@ $ pithy seed --env staging --redo --dry-run
 Would reset app (DB): 1 migration.
 api  0200_leaderboard_demo_board: 12 rows.
 Dry run. Nothing written.
-Done.
 ```
 
 **`--redo` carries its own, stricter gate — it is not the seed gate.** `--yes` means "yes, this is not dev"; it was designed to authorize *writing* seed rows, which is additive and harmless. A reset drops every table first. Letting one flag authorize both would mean a script — or a hand — that knew only to pass `--yes` could destroy an environment's entire dataset. So:
@@ -141,7 +141,6 @@ Would reset secrets (SECRETS): 1 migration. Retained: pithy_secrets_rotations, p
 Kept emailSuppressions (EMAIL_SUPPRESSIONS): prod binds it too.
 Nothing to seed for staging.
 Dry run. Nothing written.
-Done.
 ```
 
 A non-`dev` reset is **audited**: a `seed/schema_reset` event is recorded at `critical` severity naming the environment and the databases involved. The outcome is always truthful: recorded as `success` once the reset actually completes, or as `failure` — and the command still fails — if it dies partway. A `dev` reset records nothing — auditing covers actions that reach a **remote** system (from a developer's machine, from CI, or in production); a `dev` run only touches the local Miniflare store and changes nothing shared. Auditing is also a no-op when the project does not compose `@pithy-sh/audit`.
@@ -152,12 +151,13 @@ A non-`dev` reset is **audited**: a `seed/schema_reset` event is recorded at `cr
 
 ```
 $ pithy seed --env dev --dry-run --json
-{"command":"seed","env":"dev","dryRun":true,"workers":[{"worker":"api","sets":[{"name":"0200_leaderboard_demo_board","d1":[{"database":"app","table":"boardEntries","rows":12}],"kv":[],"r2":[],"media":[]}],"skippedByEnv":[],"shared":[]}],"devSecrets":null}
+{"command":"seed","schemaVersion":1,"env":"dev","dryRun":true,"workers":[{"worker":"api","sets":[{"name":"0200_leaderboard_demo_board","d1":[{"database":"app","table":"boardEntries","rows":12}],"kv":[],"r2":[],"media":[]}],"skippedByEnv":[],"shared":[]}],"devSecrets":null,"plan":{"files":[],"resources":[],"migrations":[],"secrets":[],"data":[{"worker":"api","store":"d1","target":"app.boardEntries","count":12,"action":"write"}],"notes":["A real run also seeds the project's dev secrets into each Worker's .dev.vars and the local SECRETS store."]}}
 ```
 
 | key | type | meaning |
 |---|---|---|
 | `command` | string | `"seed"`. |
+| `schemaVersion` | integer | The version of this payload's shape. Bumped only when a key is removed or retyped; `pithy schema` publishes the current one. |
 | `env` | string | The environment seeded. |
 | `dryRun` | boolean | Whether the plan was computed and nothing written. |
 | `workers` | object[] | The per-Worker outcome, in fan-out order. |
@@ -168,19 +168,20 @@ $ pithy seed --env dev --dry-run --json
 | `reset` | object[] | Present only with `--redo`: one entry per physical database whose schema was, or would be, reset. |
 | `reset[].retained` | string[] | The retained tables that database carries. A reset refuses while one holds rows. Empty when there are none. |
 | `reset[].boundBy` | string[], optional | The other environments binding that database. Present only when the reset keeps it. |
+| `plan` | object | Present only under `--dry-run`: the same writes in the shape every `--dry-run` shares (`docs/CLI.md` §1.2). Each table, store, object and asset is one `data` entry — `write`, or a media set's `upload`, `skip` or `reupload` — each database a `--redo` would reset is a `reset`, and one another environment binds is a note, since nothing is written to it. In `dev`, a note says the dev secrets a real run would also seed. |
 | `devSecrets` | object \| null | What the dev-secrets pass wrote and which Workers' `.dev.vars` it refused. `null` on a dry run and outside `dev`, where nothing is written. |
 
 ## Errors
 
-Every refusal here is a gate rather than a fault, and each one names the flag that opens it.
+Every refusal here is a gate rather than a fault, and each one names the flag that opens it. Each exits by its kind (`docs/CLI.md` §3.8): 2 for a flag to pass or fix, 5 for a phrase only a person may give. Ctrl-C at either confirmation prompt exits 130.
 
 | Condition | Effect |
 |---|---|
-| `--env production` | Refused at the flag. The environment is `prod` (§1.2). |
-| A non-`dev` environment without `--yes` | Refused before anything opens. |
-| `prod` without the confirmation phrase, non-interactively | Refused before anything opens — see the production exception above. |
-| A non-`dev` `--redo` without `--confirm-reset "yes, i really want to reset <env>"` | Refused. The phrase names its environment, so one authorizing `staging` cannot be pasted into a command targeting another. |
-| A `--redo` over a retained table that holds rows, without `--destroy-retained <n>` equal to them | Refused before any database moves. The refusal names each table and the count to pass. |
+| `--env production` | Refused at the flag, exit 2. The environment is `prod` (§1.2). |
+| A non-`dev` environment without `--yes` | Refused before anything opens, exit 2. |
+| `prod` without the confirmation phrase, non-interactively | Refused `core/person_required`, exit 5, naming `--confirm-production` in the action, before anything opens — see the production exception above. |
+| A non-`dev` `--redo` without `--confirm-reset "yes, i really want to reset <env>"` | Refused `core/person_required`, exit 5, naming `--confirm-reset` in the action, when nobody could be asked or the phrase is wrong. The phrase names its environment, so one authorizing `staging` cannot be pasted into a command targeting another. |
+| A `--redo` over a retained table that holds rows, without `--destroy-retained <n>` equal to them | Refused before any database moves, exit 2. The refusal names each table and the count to pass. |
 | A Worker that was supposed to get a generated `.dev.vars` and did not | The fixtures still run — they are the rest of the run and they are worth doing — and the exit code is 1. The refusal names the file and offers `.dev.vars.local`. |
 
 ## Examples
@@ -217,5 +218,4 @@ Done.
 $ pithy seed --env staging --dry-run
 api  0200_leaderboard_demo_board: 12 rows.
 Dry run. Nothing written.
-Done.
 ```

@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { CLOUDFLARE_ENV_KEYS } from "@pithy-sh/cloudflare/src/env/devVars";
 import { blankComments } from "@pithy-sh/core/src/text/comments";
 import { beforeAll, describe, expect, test } from "vitest";
+import { NONINTERACTIVE_ENV } from "../terminal/inputMode";
 import { readSource, sourcePaths } from "./sourceFiles";
 
 /**
@@ -159,9 +160,13 @@ const WORKERD_ENV_EVIDENCE = "packages/core/src/worker/envIsolation.workers.test
 /** The prose that cites it. A move has to move these too, or the reader is sent nowhere. */
 const EVIDENCE_CITATIONS = ["CONTRIBUTING.md"];
 
-/** The configs vitest is actually invoked with. A `vitest.workers.config.ts` is reached as a project. */
+/**
+ * The configs vitest is actually invoked with. A `vitest.workers.config.ts` is reached as a project.
+ * `vitest.windows.config.ts` is the CLI's Windows set (#702): invoked by its own script, on its own runner,
+ * and held to the same isolation as the default config it was split from.
+ */
 function isEntryConfig(name: string): boolean {
-  return name === "vitest.config.ts" || name === "vitest.integration.config.ts";
+  return name === "vitest.config.ts" || name === "vitest.integration.config.ts" || name === "vitest.windows.config.ts";
 }
 
 /** Only what a vitest config states that this file has an opinion about. */
@@ -708,6 +713,25 @@ describe("no unit suite can resolve a Cloudflare credential", () => {
       .filter((project) => CLOUDFLARE_ENV_KEYS.some((key) => project.env[key] === ""))
       .map((project) => project.label);
     expect(blanked).toEqual([]);
+  });
+});
+
+/**
+ * #697. **No unit suite inherits a shell's `PITHY_NONINTERACTIVE`.** An agent exports it once, and an
+ * in-process suite that attaches a fake terminal to reach a prompt would otherwise reach a refusal.
+ * The real constant, imported, so a rename in `terminal/inputMode.ts` cannot leave the pin behind.
+ */
+describe("no unit suite inherits a shell's prompt switch", () => {
+  test("every unit project pins PITHY_NONINTERACTIVE blank", () => {
+    const unpinned = projects
+      .filter((project) => !project.workers && !project.integration)
+      .filter((project) => project.env[NONINTERACTIVE_ENV] !== "")
+      .map((project) => project.label);
+    expect(unpinned).toEqual([]);
+  });
+
+  test("and the walk found unit projects to check", () => {
+    expect(projects.filter((project) => !project.workers && !project.integration).length).toBeGreaterThan(0);
   });
 });
 

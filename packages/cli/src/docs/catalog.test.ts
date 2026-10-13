@@ -9,8 +9,12 @@ import type { CommandDef } from "citty";
 import { describe, expect, test } from "vitest";
 import { CATALOG } from "../capabilities/catalog";
 import { HIDDEN_ROOT_FLAGS } from "../commands/alias";
+import { describeCli, walkTree } from "../contract/describe";
+import { flagsOf } from "../declaredFlags";
+import { main } from "../main";
 import { ROOT_FLAGS } from "../rootFlags";
-import { buildDocsCatalog, CATALOG_PATH, renderDocsCatalog, walkCommands } from "./catalog";
+import { EXIT_CLASSES, exitClassOf } from "../terminal/exitClass";
+import { buildDocsCatalog, CATALOG_PATH, renderDocsCatalog } from "./catalog";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..");
 
@@ -33,7 +37,18 @@ describe("the arg names flagsOf reads", () => {
   });
 });
 
-describe("walkCommands", () => {
+/**
+ * Every command under `root`, each with every spelling of its flags: `pithy schema`'s walk, which
+ * `buildDocsCatalog` projects to `{ path, flags }`.
+ */
+async function walkCommands(root: CommandDef): Promise<{ path: string; flags: string[] }[]> {
+  return (await describeCli(root)).commands.map((command) => ({
+    path: command.path,
+    flags: command.flags.flatMap((flag) => [flag.name, ...flag.aliases.map((alias) => alias.flag)]),
+  }));
+}
+
+describe("the catalog's walk of a command tree", () => {
   /** citty accepts a definition, a promise of one, or a thunk. A walk that reads only the first is blind. */
   const tree: CommandDef = {
     meta: { name: "pithy" },
@@ -119,11 +134,35 @@ describe("buildDocsCatalog", () => {
 
   test("names every error code the kit defines, with the status it pins", async () => {
     const built = await buildDocsCatalog();
-    expect(built.errorCodes).toEqual(
+    expect(built.errorCodes.map(({ code, status }) => ({ code, status }))).toEqual(
       KitErrorPayload.options
         .map((member) => ({ code: member.shape.code.value, status: member.shape.status.value }))
         .sort((a, b) => a.code.localeCompare(b.code)),
     );
+  });
+
+  /**
+   * **And what a caller should do about each one (#697)** — the exit class the CLI ends with, its number,
+   * whether a retry can help, and the remedy that class names. Beside `code` and `status`, never in place
+   * of them: the site's checker reads those two by name.
+   */
+  test("gives every error code its exit class, exit code, retryability and remedy, from the one table", async () => {
+    const built = await buildDocsCatalog();
+    for (const entry of built.errorCodes) {
+      const exitClass = exitClassOf({ code: entry.code });
+      expect(entry).toEqual({
+        code: entry.code,
+        status: entry.status,
+        exitClass,
+        exit: EXIT_CLASSES[exitClass].exit,
+        retryable: EXIT_CLASSES[exitClass].retryable,
+        remedy: EXIT_CLASSES[exitClass].agentShould,
+      });
+    }
+    expect(built.errorCodes.find((entry) => entry.code === "core/upstream_timeout")).toMatchObject({
+      exit: 4,
+      retryable: true,
+    });
   });
 
   /**
@@ -135,6 +174,7 @@ describe("buildDocsCatalog", () => {
   test("names every flag parsed outside a command's args, hidden ones included", async () => {
     expect((await buildDocsCatalog()).globalFlags).toEqual([
       "--help",
+      "--no-input",
       "--no-pretty",
       "--pithier",
       "--pithiest",
@@ -171,7 +211,11 @@ describe("buildDocsCatalog", () => {
     }
     // Anti-vacuous: a regex that stopped matching would make the assertion below pass over nothing.
     expect(found.size).toBeGreaterThan(3);
-    expect([...found].filter((flag) => !global.has(flag)).sort()).toEqual([]);
+    // `alias.ts` is also `pithy alias`, and its contract names that command's own declared flags (#697).
+    // Those are citty's, in `alias`'s `args`, and the catalog lists them under `alias` rather than here.
+    const aliasArgs = (await import("../commands/alias")).default.args;
+    const declared = new Set(flagsOf(typeof aliasArgs === "function" ? await aliasArgs() : await aliasArgs));
+    expect([...found].filter((flag) => !global.has(flag) && !declared.has(flag)).sort()).toEqual([]);
   });
 
   /**
@@ -185,6 +229,37 @@ describe("buildDocsCatalog", () => {
   });
 });
 
+/**
+ * **The catalog and `pithy schema` are one answer (#697).** The catalog is the committed copy another
+ * repository reads; `pithy schema` is the installed binary's own account. Both come from `describeCli`,
+ * and these hold the projection to it — and to the parser, which is the third party to the agreement:
+ * a flag the catalog lists and `bin.ts` refuses would send the site's checker and an agent different ways.
+ */
+describe("the catalog is a projection of pithy schema", () => {
+  test("every command, every spelling of every flag, every global flag and every error code", async () => {
+    const [catalog, cli] = await Promise.all([buildDocsCatalog(), describeCli(main)]);
+    expect(catalog.commands).toEqual(
+      cli.commands.map((command) => ({
+        path: command.path,
+        flags: command.flags.flatMap((flag) => [flag.name, ...flag.aliases.map((alias) => alias.flag)]),
+      })),
+    );
+    expect(catalog.globalFlags).toEqual(cli.globalFlags.flatMap((flag) => [flag.name, ...flag.aliases]).sort());
+    expect(catalog.errorCodes).toEqual(cli.errorCodes);
+  });
+
+  test("lists exactly the spellings the parser accepts, command by command", async () => {
+    const catalog = await buildDocsCatalog();
+    const nodes = await walkTree(main);
+    expect(nodes.length).toBeGreaterThan(80);
+    for (const node of nodes) {
+      const args = typeof node.cmd.args === "function" ? await node.cmd.args() : await node.cmd.args;
+      const listed = catalog.commands.find((command) => command.path === node.path.join(" "))?.flags;
+      expect({ path: node.path.join(" "), flags: listed }).toEqual({ path: node.path.join(" "), flags: flagsOf(args) });
+    }
+  });
+});
+
 describe("renderDocsCatalog", () => {
   test("writes strict JSON, because the reader is another repository's JSON.parse", () => {
     const rendered = renderDocsCatalog({
@@ -192,7 +267,16 @@ describe("renderDocsCatalog", () => {
       capabilities: [{ name: "auth", package: "@pithy-sh/auth" }],
       commands: [{ path: "add", flags: ["--json"] }],
       globalFlags: ["--help"],
-      errorCodes: [{ code: "core/not_found", status: 404 }],
+      errorCodes: [
+        {
+          code: "core/not_found",
+          status: 404,
+          exitClass: "precondition",
+          exit: 3,
+          retryable: false,
+          remedy: "Run the `fix` command",
+        },
+      ],
     });
     expect(() => JSON.parse(rendered) as unknown).not.toThrow();
     expect(rendered.endsWith("\n")).toBe(true);

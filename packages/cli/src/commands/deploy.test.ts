@@ -4,10 +4,13 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { PithyError } from "@pithy-sh/core/src/error/pithyError";
+import { PithyError } from "@pithy-sh/core/src/error/pithyError";
 import { describe, expect, test, vi } from "vitest";
 import type { MigrationFanOutOptions } from "../migrations/run";
-import deploy, { assertDeployFlags, deploySelection } from "./deploy";
+import type { WorkerDeploy } from "../project/deploy";
+import { EXIT, exitCodeOf } from "../terminal/exitClass";
+import { expectConforms, expectEventsConform } from "../test-utils/payloadContract";
+import deploy, { assertDeployFlags, deploySelection, requireDeployEnvironment } from "./deploy";
 
 /**
  * **`pithy deploy`'s pending-migration count resolved credentials for nobody in particular (#226).**
@@ -21,10 +24,13 @@ import deploy, { assertDeployFlags, deploySelection } from "./deploy";
  */
 
 /** The options every ledger read was handed. */
-const counted = vi.hoisted(() => ({ calls: [] as unknown[] }));
+const counted = vi.hoisted(() => ({ calls: [] as unknown[], ledger: { pending: 0, undeclared: [] } as unknown }));
 
 /** What each half of the deploy was asked to do this run — the two named steps, observed. */
 const ran = vi.hoisted(() => ({ apps: 0, kit: [] as unknown[] }));
+
+/** What the stubbed app half reports. Empty unless a case says otherwise. */
+const shipped = vi.hoisted(() => ({ rows: [] as unknown[] }));
 
 /**
  * Whether the stubbed app half narrates the way the real one does (#578).
@@ -51,7 +57,7 @@ vi.mock("../migrations/run", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../migrations/run")>()),
   readProjectLedger: async (options: unknown) => {
     counted.calls.push(options);
-    return { pending: 0, undeclared: [] };
+    return counted.ledger;
   },
 }));
 
@@ -64,9 +70,12 @@ vi.mock("../project/deploy", async (importOriginal) => ({
     if (narrating.on) {
       const { settleStep, startStep } = await import("../terminal/progress");
       startStep("acme-api");
-      settleStep("acme-api: deployed. https://api.acme.example v1");
+      // With the row behind the line, as `project/deploy.ts` settles it (#697).
+      settleStep("acme-api: deployed. https://api.acme.example v1", {
+        worker: { name: "acme-api", ok: true, url: "https://api.acme.example", versionId: "v1" },
+      });
     }
-    return [];
+    return shipped.rows;
   },
 }));
 
@@ -228,6 +237,60 @@ describe("deploySelection", () => {
 
   test("both named is both, spelled out", () => {
     expect(deploySelection({ apps: true, kit: true })).toEqual({ apps: true, kit: true });
+  });
+});
+
+/**
+ * **An environment the project never declared is a usage error, exit 2, before anything is built (#697).**
+ * It reached `wrangler deploy --env qa`, which failed every Worker on a missing stanza, and the run exited 1
+ * as N per-Worker failures. `dev` and `feature` are not declared and are still targets: the first is the
+ * top-level stanza, the second a branch's generated one.
+ */
+describe("requireDeployEnvironment", () => {
+  const declared = async () => ["staging", "prod"];
+  /** Whether the project was read: `dev`, `feature` and a bare deploy must not need it. */
+  const unread = async (): Promise<string[]> => {
+    throw new Error("the project was read");
+  };
+
+  test("a declared environment, dev, feature and no --env at all pass", async () => {
+    expect(await requireDeployEnvironment("staging", declared)).toBe("staging");
+    expect(await requireDeployEnvironment("dev", unread)).toBe("dev");
+    expect(await requireDeployEnvironment("feature", unread)).toBe("feature");
+    expect(await requireDeployEnvironment(undefined, unread)).toBeUndefined();
+  });
+
+  test("one the project never declared is refused, naming what it has", async () => {
+    const thrown = await requireDeployEnvironment("qa", declared).catch((error: unknown) => error);
+    expect(thrown).toBeInstanceOf(PithyError);
+    const payload = (thrown as PithyError).payload;
+    expect(payload.code).toBe("validation/invalid_input");
+    expect(exitCodeOf(payload)).toBe(EXIT.usage);
+    expect(payload.message).toBe('--env must be one of staging, prod. Got "qa".');
+  });
+
+  test("the command refuses it before either half runs", async () => {
+    ran.apps = 0;
+    ran.kit.length = 0;
+    const stderr: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      stderr.push(String(chunk));
+      return true;
+    });
+    const exit = vi.spyOn(process, "exit").mockImplementation((code) => {
+      throw new Error(`exit ${code}`);
+    });
+    try {
+      await expect(
+        deploy.run?.({ args: { env: "qa", json: true, apps: false, kit: false, force: false }, rawArgs: [] } as never),
+      ).rejects.toThrow(`exit ${EXIT.usage}`);
+    } finally {
+      vi.restoreAllMocks();
+    }
+    expect(exit).toHaveBeenCalledWith(EXIT.usage);
+    expect(stderr.join("")).toContain('"code":"validation/invalid_input"');
+    expect(ran.apps).toBe(0);
+    expect(ran.kit).toEqual([]);
   });
 });
 
@@ -425,6 +488,88 @@ describe("the two halves", () => {
     expect(JSON.parse(await invoke({ env: "dev" })).kitProblems).toBeNull();
   });
 
+  /**
+   * **`next` names `pithy migrate` when the schema is behind the code that shipped, and is absent otherwise (#697).**
+   * The count is the condition, read from the ledger the deploy already reads; the rest of the matrix is
+   * `terminal/nextSteps.test.ts`'s.
+   */
+  test("next names migrate for an environment the deploy left behind its code, and is absent otherwise", async () => {
+    counted.ledger = { state: "read", pending: 2, undeclared: [] };
+    try {
+      const behind = JSON.parse(await invoke({ env: "staging", apps: true }));
+      expect(behind.next).toEqual([
+        {
+          command: "pithy migrate --env staging",
+          why: "2 migrations are not applied to staging. Deploy does not migrate.",
+        },
+      ]);
+      await expectConforms("deploy", await invoke({ env: "staging", apps: true }));
+      expect(Object.hasOwn(JSON.parse(await invoke({ apps: true })), "next")).toBe(false);
+      counted.ledger = { state: "read", pending: 0, undeclared: [] };
+      expect(Object.hasOwn(JSON.parse(await invoke({ env: "staging", apps: true })), "next")).toBe(false);
+    } finally {
+      counted.ledger = { pending: 0, undeclared: [] };
+    }
+  });
+
+  /** Held to the schema `pithy schema deploy` publishes (#697): both halves, each half alone, and none. */
+  test("the --json line conforms to its published payload", async () => {
+    shipped.rows = [
+      { name: "acme-api", ok: true, versionId: "v1", url: "https://api.acme.example", verification: "verified" },
+      { name: "acme-web", ok: false, built: false, error: "The UI build failed." },
+    ] satisfies WorkerDeploy[];
+    try {
+      await expectConforms("deploy", await invoke({ env: "staging" }));
+      await expectConforms("deploy", await invoke({ env: "staging", apps: true }));
+      await expectConforms("deploy", await invoke({ env: "staging", kit: true }));
+      await expectConforms("deploy", await invoke({}));
+    } finally {
+      shipped.rows = [];
+    }
+  });
+
+  /**
+   * **A refusal recorded as a row exits by its class, and the rows before it stay in the report (#697 review).** An
+   * earlier Worker's build failure and a later Worker's refused credentials are both on the line; the run exits 3,
+   * because the credentials are the caller's next step, and an ordinary failure alone still exits 1.
+   */
+  test("--json carries every failed row, and a refused Worker's row sets the exit", async () => {
+    shipped.rows = [
+      { name: "acme-api", ok: false, built: false, error: "vite build failed." },
+      { name: "acme-web", ok: false, error: "wrangler deploy failed.", exit: EXIT.precondition },
+    ] satisfies WorkerDeploy[];
+    try {
+      const refused = await invokeRun({ env: "staging", apps: true });
+      expect(JSON.parse(refused.out).workers.map((row: WorkerDeploy) => [row.name, row.ok, row.exit])).toEqual([
+        ["acme-api", false, undefined],
+        ["acme-web", false, EXIT.precondition],
+      ]);
+      await expectConforms("deploy", refused.out);
+      expect(refused.exitCode).toBe(EXIT.precondition);
+
+      shipped.rows = [{ name: "acme-api", ok: false, built: false, error: "vite build failed." }];
+      expect((await invokeRun({ env: "staging", apps: true })).exitCode).toBe(EXIT.failed);
+      expect((await invokeRun({ env: "staging", apps: true, json: false })).exitCode).toBe(EXIT.failed);
+    } finally {
+      shipped.rows = [];
+    }
+  });
+
+  /**
+   * wrangler colors its `✘ [ERROR]`, and the captured stderr is the reason a row carries (#697). The color is
+   * taken out where wrangler's output is captured (`project/deploy.test.ts` drives the real `runWrangler`), and
+   * the `--json` encoder writes the row's text as it is — so what the row holds is what a reader gets.
+   */
+  test("a Worker's error under --json is the row's own text, byte for byte", async () => {
+    shipped.rows = [{ name: "acme-web", ok: false, error: "✘ [ERROR] Build failed" }] satisfies WorkerDeploy[];
+    try {
+      const out = await invoke({ env: "staging", apps: true });
+      expect(JSON.parse(out).workers[0].error).toBe("✘ [ERROR] Build failed");
+    } finally {
+      shipped.rows = [];
+    }
+  });
+
   test("a bare deploy ships apps/ and says out loud why the kit half did not run", async () => {
     ran.apps = 0;
     ran.kit.length = 0;
@@ -515,6 +660,31 @@ describe("what the command says while it works", () => {
     expect(JSON.parse(out).command).toBe("deploy");
     expect(out).not.toContain("▸");
   });
+
+  /**
+   * **`--json --events` is the one exception to one line (#697)**: a record per step as the run reaches it,
+   * then the document `--json` alone would have written, as the last line. Every line parses on its own, and
+   * none of them is prose.
+   */
+  test("--json --events streams a record per step, closed by the document --json writes", async () => {
+    const document = await narratedRun({ env: "staging", json: true });
+    const out = await narratedRun({ env: "staging", json: true, events: true });
+
+    const records = await expectEventsConform("deploy", out);
+    expect(records.slice(0, -1)).toEqual([
+      { command: "deploy", schemaVersion: 1, event: "start", what: "acme-api" },
+      {
+        command: "deploy",
+        schemaVersion: 1,
+        event: "settled",
+        line: "acme-api: deployed. https://api.acme.example v1",
+        worker: { name: "acme-api", ok: true, url: "https://api.acme.example", versionId: "v1" },
+      },
+    ]);
+    expect(out.trimEnd().split("\n").at(-1)).toBe(document.trimEnd());
+    expect(out).not.toContain("▸");
+    expect(out).not.toContain("\u001b");
+  });
 });
 
 /**
@@ -572,7 +742,7 @@ describe("a deploy of apps/ refuses a stanza whose bindings have no id", () => {
     "%s refuses before anything is built, naming the binding and the environments that have resources",
     async (_name, args) => {
       const { err, exitCode } = await refusal(args);
-      expect(exitCode).toBe(1);
+      expect(exitCode).toBe(EXIT.usage);
       expect(ran.apps).toBe(0);
       expect(err).toContain("board.DB (d1)");
       expect(err).toContain("--env staging or --env prod");
@@ -589,7 +759,7 @@ describe("a deploy of apps/ refuses a stanza whose bindings have no id", () => {
   ])("%s with no selector refuses too, before the kit half says anything", async (_name, args) => {
     const kit = ran.kit.length;
     const { err, exitCode } = await refusal({ json: false, apps: false, ...args });
-    expect(exitCode).toBe(1);
+    expect(exitCode).toBe(EXIT.usage);
     expect(ran.apps).toBe(0);
     expect(ran.kit.length).toBe(kit);
     expect(err).toContain("board.DB (d1)");

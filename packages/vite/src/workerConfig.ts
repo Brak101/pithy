@@ -1,19 +1,19 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { access } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import type { Capability } from "@pithy-sh/core/src/capability/capability";
-import {
-  causeMessage,
-  failurePosition,
-  importingPackage,
-  isBuildFailureWrapper,
-  prop,
-  rootCause,
-  safeReason,
-  unresolvedSpecifier,
-} from "@pithy-sh/core/src/error/cause";
+import { commandName } from "@pithy-sh/core/src/cli/command";
+import { causeMessage, failurePosition, prop, rootCause, safeReason } from "@pithy-sh/core/src/error/cause";
 import { InternalError, NotFoundError } from "@pithy-sh/core/src/error/pithyError";
+import {
+  nodeModulesProbe,
+  packageEntryProbe,
+  packageLoadFailure,
+  unresolvedImport,
+} from "@pithy-sh/core/src/error/unresolved";
 import { runnerImport } from "vite";
 
 /** The default export of a Worker's `pithy.config.ts`, before it is trusted. */
@@ -40,19 +40,23 @@ export interface LoadedWorkerConfig {
  *
  * What the copies *cannot* be allowed to disagree about is anything that is not a sentence. Two kinds of
  * that were found, one issue apart, and both live in `@pithy-sh/core` — the one package this plugin
- * already depends on. What a runtime does to an error on its way out is the first: `rootCause`, `prop`
- * and `isBuildFailureWrapper`, facts no copy can derive and every copy got wrong (#223). Whether one of
- * its strings is safe to show is the second: `safeReason`, `failurePosition`, `unresolvedSpecifier` and
- * `causeMessage`, because a path or a stack frame is a property of the string and not of the surface
- * quoting it — three near-verbatim copies of that filter meant the hole #223 found in it had to be closed
- * three times (#228).
+ * already depends on. What a runtime does to an error on its way out is the first: `rootCause` and
+ * `prop`, facts no copy can derive and every copy got wrong (#223). Whether one of
+ * its strings is safe to show is the second: `safeReason`, `failurePosition` and `causeMessage`, because a
+ * path or a stack frame is a property of the string and not of the surface quoting it — three
+ * near-verbatim copies of that filter meant the hole #223 found in it had to be closed three times (#228).
+ * An import that did not resolve is the third: which kind, whose, and what to do are `unresolvedImport`'s,
+ * because three surfaces deciding it kept giving three different remedies (#709). A file inside an
+ * installed package that throws as it loads is the fourth, `packageLoadFailure`'s, for the same reason.
  *
- * What stays restated here is the policy: which causes this loader recognizes, and what it says about
- * each. Those are genuinely per-surface, and this plugin still cannot import the CLI's.
+ * What stays restated here is the rest of the policy: a parse error and the config's own throw. This
+ * plugin still cannot import the CLI's.
  */
 export type WorkerConfigFailureKind =
-  /** An import in the config does not resolve. `bun install`, or a corrected specifier. */
+  /** An import in the config does not resolve. Which cause it was decides whether installing helps. */
   | "unresolved-import"
+  /** A file inside an installed package would not load: its `"type"` contradicts its code, or it does not parse. */
+  | "package-load"
   /** The file does not parse. Installing will not help, and the adopter has read the opposite for years. */
   | "parse-error"
   /** The config loaded far enough to throw its own error. Neither of the above. */
@@ -81,73 +85,66 @@ function rawMessage(cause: unknown): string {
   return causeMessage(cause) ?? "";
 }
 
-function isUnresolvedImport(cause: unknown): boolean {
-  const code = prop(cause, "code");
-  if (
-    code === "ERR_MODULE_NOT_FOUND" ||
-    code === "MODULE_NOT_FOUND" ||
-    code === "ERR_PACKAGE_PATH_NOT_EXPORTED" ||
-    code === "ERR_UNSUPPORTED_DIR_IMPORT"
-  ) {
-    return true;
-  }
-  if (prop(cause, "name") === "ResolveMessage") return true;
-  return /Cannot find (?:package|module) |Failed to resolve (?:import|module)|Failed to load url /.test(
-    rawMessage(cause),
-  );
-}
-
 function isParseError(cause: unknown): boolean {
   const name = prop(cause, "name");
   if (name === "SyntaxError" || name === "BuildMessage") return true;
   if (prop(cause, "code") === "PARSE_ERROR") return true;
-  // Bun's build wrapper with its diagnostics already dropped — the shape every caller after the first
-  // sees, since a failed module is cached and re-thrown emptied out. It proves a build produced
-  // diagnostics, so it is a parse error with no reason to quote. See core's `cause.ts` (#223).
-  if (isBuildFailureWrapper(cause)) return true;
   return /Transform failed|\[PARSE_ERROR]|Parse (?:error|failure)|Unexpected (?:token|end of input)/.test(
     rawMessage(cause),
   );
 }
 
 /**
+ * Whether a package is installed where the importing file would look — core's walk over `node:fs`, the
+ * same one the CLI passes, so a deep import of an absent package is told to install and one of an
+ * installed package without that path is not (#709). This plugin runs on Node, never in a Worker.
+ */
+const installed = nodeModulesProbe({ exists: existsSync, realpath: realpathSync });
+
+/**
+ * What an installed package's bare name resolves to, from its own `package.json`: core's read, the same the
+ * CLI passes. Vite's runner says *Failed to resolve entry* for a package that declares no entry and for one
+ * whose declared entry is not on disk, and names no importer for either (#709).
+ */
+const entry = packageEntryProbe({
+  exists: existsSync,
+  realpath: realpathSync,
+  read: (path) => readFileSync(path, "utf8"),
+});
+
+/**
  * Choose the refusal's `action` **from** the failure rather than asserting one over it (#217).
  *
- * An unresolved import names its **importer** alongside its specifier when the runtime gave one (#480,
- * #489). A specifier alone is honest and can still send the reader to the wrong package, because the
- * import that failed is often not the config's own: `pithy add email` refused with *nothing resolves
- * `@pithy-sh/core/src/capability/capability`* while core resolved from the Worker throughout, because
- * the failing import was `@pithy-sh/email`'s. The importer is the half that pointed at `email`, and
- * `importingPackage` is where core records that both runtimes hand it over. **It asserts nothing about
- * which package is absent** — nothing here can know that — only where the import is written.
+ * An unresolved import is core's {@link unresolvedImport}: the same sentence the CLI gives for the same
+ * cause, naming the package the import is written in when it is not the config (#480, #489), and an
+ * install only where an install can help (#709). `relativeTo` is the config's directory, so an adopter's
+ * own missing file is shown as the import they wrote and never as an absolute path. A parser's position is
+ * quoted only when it is in `configFile`, never when it is in a file the config imports.
  */
-export function classifyWorkerConfigFailure(wrapped: unknown): WorkerConfigFailure {
+export function classifyWorkerConfigFailure(
+  wrapped: unknown,
+  relativeTo?: string,
+  configFile?: string,
+): WorkerConfigFailure {
   // Bun hands `import()` failures over inside an `AggregateError`. Classify what is inside it.
   const cause = rootCause(wrapped);
-  if (isUnresolvedImport(cause)) {
-    const specifier = unresolvedSpecifier(cause);
-    // A package name or nothing — core never hands a path back, so there is none to keep out of here.
-    const importer = importingPackage(cause);
-    if (specifier === undefined) {
-      return {
-        kind: "unresolved-import",
-        action:
-          "An import in the config does not resolve. Install the project's dependencies (bun install), then check its imports.",
-      };
-    }
-    return {
-      kind: "unresolved-import",
-      action: importer
-        ? `Nothing resolves "${specifier}". ${importer} is what imports it, not the config. Install the project's dependencies (bun install).`
-        : `Nothing resolves "${specifier}". Install the project's dependencies (bun install), or correct that import.`,
-    };
-  }
+  // Which import, whose, and what to do: core's, for all three surfaces that refuse a module (#709).
+  const unresolved = unresolvedImport(cause, { installed, entry, relativeTo, loader: "@pithy-sh/vite" });
+  if (unresolved !== undefined) return { kind: "unresolved-import", action: unresolved.remedy };
+
+  // A package's own file that would not load is the package's, before it can read as the config's (#709).
+  const foreign = packageLoadFailure(cause, { loader: "@pithy-sh/vite" });
+  if (foreign !== undefined) return { kind: "package-load", action: foreign.remedy };
 
   if (isParseError(cause)) {
-    // Both of these can answer "nothing", and Bun's build wrapper — a count and a path, and never a
-    // reason or a position — is one of the reasons they do. That suppression is core's, once (#223, #228).
+    // Both of these can answer "nothing": a diagnostic that carries a path, a stack frame or a newline is
+    // not quoted, and a position is never invented. That filter is core's, once (#228).
     const reason = safeReason(cause);
-    const at = failurePosition(cause);
+    // A position in a file the config imports is not the config's, and is never quoted as if it were (#709).
+    const at = failurePosition(
+      cause,
+      configFile === undefined ? undefined : (file) => resolve(file) === resolve(configFile),
+    );
     const where = at ? ` Line ${at.line}, column ${at.column}.` : "";
     return {
       kind: "parse-error",
@@ -188,7 +185,9 @@ export async function loadWorkerConfig(configFile: string): Promise<LoadedWorker
   } catch {
     throw new NotFoundError({
       message: `No pithy.config.ts at ${configFile}.`,
-      action: "Run pithy ui add from the project root, or point the plugin at it with pithy({ configFile }).",
+      // No command here (#711): `pithy ui add` acts on one Worker and takes a framework, and a plugin that has
+      // lost its config cannot say which of either. Pointing the plugin is the remedy that always applies.
+      action: `Point the plugin at the Worker's pithy.config.ts with pithy({ configFile }). A front end scaffolded by ${commandName("ui add")} is pointed at it already.`,
     });
   }
 
@@ -202,7 +201,7 @@ export async function loadWorkerConfig(configFile: string): Promise<LoadedWorker
     // The config is there and would not load. Which of the four ways it failed decides what to tell the
     // adopter — see {@link classifyWorkerConfigFailure}. The raw cause still goes to `detail` and stops
     // there: the CLI renderer prints `message` and `action` only, and the HTTP codec strips `detail`.
-    const { kind, action } = classifyWorkerConfigFailure(cause);
+    const { kind, action } = classifyWorkerConfigFailure(cause, dirname(configFile), configFile);
     throw new InternalError({
       message: `Could not load ${configFile}.`,
       action,

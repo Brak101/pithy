@@ -3,9 +3,10 @@
 
 import type { Capability } from "@pithy-sh/core/src/capability/capability";
 import { ValidationError } from "@pithy-sh/core/src/error/pithyError";
+import { packageOf } from "@pithy-sh/core/src/naming/packageName";
 import { packageInstalledFrom } from "../project/kitResolve";
 import { kitSource } from "../project/kitSource";
-import { capabilityLoadError } from "./loadFailure";
+import { capabilityLoadErrorNow } from "./loadFailure";
 
 /**
  * **A host Worker's composition, written as the entry it is deployed from** (#645).
@@ -53,16 +54,6 @@ export interface HostPeerSeam {
   needed(capability: Capability, siblings: readonly Capability[]): readonly HostPeer[];
 }
 
-/** The generated entry's file name for one environment, beside the config that names it. */
-export function hostEntryFile(env: string): string {
-  return `.pithy-host.${env}.ts`;
-}
-
-/** The package a kit specifier names: `@pithy-sh/ledger` from `@pithy-sh/ledger/src/peer`. */
-function packageOf(specifier: string): string {
-  return specifier.split("/").slice(0, 2).join("/");
-}
-
 /**
  * Whether the project's install carries a kit module. False for a package that is absent, and for one released
  * before the module existed — which is the question this file asks of a host and of each peer.
@@ -82,7 +73,7 @@ function source(projectDir: string, specifier: string): string {
     return kitSource(projectDir, specifier);
   } catch (error) {
     const pkg = packageOf(specifier);
-    throw capabilityLoadError(pkg.replace("@pithy-sh/", ""), pkg, error, projectDir);
+    throw capabilityLoadErrorNow(pkg.replace("@pithy-sh/", ""), pkg, error, projectDir);
   }
 }
 

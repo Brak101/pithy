@@ -9,16 +9,23 @@ import { promisify } from "node:util";
 import { InternalError, PithyError } from "@pithy-sh/core/src/error/pithyError";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import type { CliAuditEvent } from "../audit/cliAudit";
+import { EXIT, exitCodeOf } from "../terminal/exitClass";
+import { formatJsonLine } from "../terminal/output";
 import { narrate, type ProgressEvent } from "../terminal/progress";
+import { snapshotTree } from "../test-utils/treeSnapshot";
 import {
+  deployFailureExit,
   deployOutput,
   deployProject,
   deploySeverity,
   deployVerificationFailed,
   pendingWarning,
   summarizeDeploy,
+  summarizePlannedDeploy,
   uiBuildEnvironment,
 } from "./deploy";
+import { NO_PROVISION_ARG } from "./effectiveConfig";
+import { runWrangler, WranglerCredentialsError } from "./wrangler";
 
 /** Representative `wrangler deploy` output — the lines deploy scrapes for the version id and url. */
 function wranglerOutput(name: string, version: string): string {
@@ -212,11 +219,23 @@ describe("deployProject", () => {
       },
     );
 
+    // Each settle carries the row its line was written from, for an `--events` reader (#697).
+    const row = (name: string) => ({
+      worker: { name, ok: true, url: `https://${name}.acme.workers.dev`, versionId: `ver-${name}` },
+    });
     expect(events).toEqual([
       { phase: "start", what: "pithy-api" },
-      { phase: "settled", line: "pithy-api: deployed. https://pithy-api.acme.workers.dev ver-pithy-api" },
+      {
+        phase: "settled",
+        line: "pithy-api: deployed. https://pithy-api.acme.workers.dev ver-pithy-api",
+        data: row("pithy-api"),
+      },
       { phase: "start", what: "pithy-web" },
-      { phase: "settled", line: "pithy-web: deployed. https://pithy-web.acme.workers.dev ver-pithy-web" },
+      {
+        phase: "settled",
+        line: "pithy-web: deployed. https://pithy-web.acme.workers.dev ver-pithy-web",
+        data: row("pithy-web"),
+      },
     ]);
   });
 
@@ -242,10 +261,8 @@ describe("deployProject", () => {
     );
 
     const settled = events.filter((event) => event.phase === "settled");
-    expect(settled[0]).toEqual({
-      phase: "settled",
-      line: summarizeDeploy({ name: "pithy-api", ok: false, error: "wrangler exited 1." }),
-    });
+    const failure = { name: "pithy-api", ok: false, error: "wrangler exited 1." };
+    expect(settled[0]).toEqual({ phase: "settled", line: summarizeDeploy(failure), data: { worker: failure } });
     expect(events.indexOf(settled[0] as ProgressEvent)).toBe(1);
   });
 
@@ -298,6 +315,87 @@ describe("deployProject", () => {
     expect(results[1]).toMatchObject({ name: "pithy-web", ok: true, versionId: "v2" });
   });
 
+  /**
+   * **Credentials Cloudflare refused stop the run, exit 3, while nothing has shipped (#697).** They are the
+   * same for every Worker, so the first refusal is every Worker's: a row per Worker would report one
+   * precondition as N failures and exit 1. Once a Worker has shipped, the credentials were good for it, so a
+   * later refusal is that Worker's row — and the report of what is already live is not thrown away.
+   */
+  test("credentials refused before anything shipped end the run as the precondition they are", async () => {
+    await writeWorker("api", "pithy-api");
+    await writeWorker("web", "pithy-web");
+    const attempted: string[] = [];
+    const refusal = new WranglerCredentialsError({ message: "wrangler deploy failed.", action: "Fix the token." });
+
+    const failure = await deployProject({
+      account: null,
+      projectDir: dir,
+      env: "staging",
+      runDeploy: async (target) => {
+        attempted.push(target.name);
+        throw refusal;
+      },
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBe(refusal);
+    expect(exitCodeOf((failure as PithyError).payload)).toBe(3);
+    expect(attempted).toEqual(["pithy-api"]);
+  });
+
+  test("credentials refused after a Worker shipped are that Worker's row", async () => {
+    await writeWorker("api", "pithy-api");
+    await writeWorker("web", "pithy-web");
+
+    const results = await deployProject({
+      account: null,
+      projectDir: dir,
+      env: "staging",
+      runDeploy: async (target) => {
+        if (target.name === "pithy-web") throw new WranglerCredentialsError({ message: "wrangler deploy failed." });
+        return wranglerOutput(target.name, "v3");
+      },
+    });
+
+    expect(results.map((row) => [row.name, row.ok])).toEqual([
+      ["pithy-api", true],
+      ["pithy-web", false],
+    ]);
+  });
+
+  /**
+   * **A refusal after an earlier Worker's own failure keeps that failure's row (#697 review).** Thrown, the run
+   * would exit 3 with nothing on stdout, and `--json` would never report that `pithy-api`'s build had failed. The
+   * run stops only when no Worker has a row yet; after that, the refusal is its Worker's row, carrying the exit its
+   * class names, and the report exits with that class.
+   */
+  test("credentials refused after an earlier Worker failed keep both rows, and the run exits 3", async () => {
+    await writeWorker("api", "pithy-api");
+    await writeUi("api");
+    await writeWorker("web", "pithy-web");
+    const attempted: string[] = [];
+
+    const results = await deployProject({
+      account: null,
+      projectDir: dir,
+      env: "staging",
+      runBuild: async () => {
+        throw new Error("vite build failed.");
+      },
+      runDeploy: async (target) => {
+        attempted.push(target.name);
+        throw new WranglerCredentialsError({ message: "wrangler deploy failed.", action: "Fix the token." });
+      },
+    });
+
+    expect(attempted).toEqual(["pithy-web"]);
+    expect(results).toEqual([
+      expect.objectContaining({ name: "pithy-api", ok: false, built: false }),
+      expect.objectContaining({ name: "pithy-web", ok: false, exit: EXIT.precondition }),
+    ]);
+    expect(results[0]).not.toHaveProperty("exit");
+    expect(deployFailureExit(results)).toBe(EXIT.precondition);
+  });
+
   test("surfaces wrangler's captured stderr (PithyError detail), not just the generic message", async () => {
     await writeWorker("app", "pithy-app");
 
@@ -314,6 +412,29 @@ describe("deployProject", () => {
     expect(results[0]?.ok).toBe(false);
     // The CI-relevant reason (the captured stderr), not the generic public message.
     expect(results[0]?.error).toBe("exit 1\nAuthentication error [10000]");
+  });
+
+  /**
+   * **A row's `error` is wrangler's words without wrangler's color (#697)** — stripped where the output is
+   * captured, since the `--json` encoder writes every value as it is. The real `runWrangler`, against a stand-in
+   * that fails in red.
+   */
+  test("a failed row's error, from wrangler's captured output, carries no escape sequence", async () => {
+    await writeWorker("app", "pithy-app");
+    const script = join(dir, "wrangler-stand-in.cjs");
+    await writeFile(script, "process.stderr.write('\\u001b[31mAuthentication error\\u001b[0m'); process.exit(1)\n");
+
+    const results = await deployProject({
+      account: null,
+      projectDir: dir,
+      runDeploy: async () => {
+        await runWrangler([script, NO_PROVISION_ARG], { account: null, bin: process.execPath });
+        return "";
+      },
+    });
+
+    expect(results[0]?.error).toBe("exit 1\nAuthentication error");
+    expect(formatJsonLine({ command: "deploy", workers: results })).not.toContain("\\u001b");
   });
 
   test("a worker whose output has no version id or url still succeeds with those fields absent", async () => {
@@ -538,6 +659,192 @@ describe("deployProject", () => {
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ outcome: "failure", severity: "info" });
     expect(events[0]?.metadata?.error).toMatch(/upload failed/);
+  });
+
+  /**
+   * **`pithy deploy --dry-run` (#697): the build, then `wrangler deploy --dry-run`, and no upload.** wrangler
+   * bundles and validates and stops, so a bundle that does not build fails here, on the Worker's row, rather
+   * than at the real deploy. Nothing that only follows an upload happens: no probe of a version that was never
+   * shipped, and no audit of a deploy that never ran.
+   */
+  describe("under --dry-run", () => {
+    test("wrangler runs with --dry-run on the real argv, and nothing is probed or audited", async () => {
+      await writeWorker("api", "pithy-api");
+      const calls: string[][] = [];
+      const audited: CliAuditEvent[] = [];
+
+      const results = await deployProject({
+        account: null,
+        projectDir: dir,
+        env: "prod",
+        dryRun: true,
+        runDeploy: async (_target, args) => {
+          calls.push(args);
+          return "--dry-run: exiting now.";
+        },
+        verifyDeploy: async () => {
+          throw new Error("A dry run probed an address.");
+        },
+        audit: async (event) => void audited.push(event),
+      });
+
+      expect(calls).toEqual([["deploy", "--env", "prod", "--experimental-provision=false", "--dry-run"]]);
+      expect(results).toEqual([{ name: "pithy-api", ok: true }]);
+      expect(audited).toEqual([]);
+    });
+
+    test("the UI build still runs first, because wrangler bundles what it built", async () => {
+      await writeWorker("web", "pithy-web");
+      await writeUi("web");
+      const order: string[] = [];
+
+      const results = await deployProject({
+        account: null,
+        projectDir: dir,
+        env: "prod",
+        dryRun: true,
+        runBuild: async (target) => void order.push(`build:${target.name}`),
+        runDeploy: async (target, args) => {
+          order.push(`${args.at(-1)}:${target.name}`);
+          return "";
+        },
+      });
+
+      expect(order).toEqual(["build:pithy-web", "--dry-run:pithy-web"]);
+      expect(results).toEqual([{ name: "pithy-web", ok: true, built: true }]);
+    });
+
+    test("a bundle that does not build fails its row with wrangler's error, and the next Worker is still checked", async () => {
+      await writeWorker("api", "pithy-api");
+      await writeWorker("web", "pithy-web");
+      const checked: string[] = [];
+
+      const results = await deployProject({
+        account: null,
+        projectDir: dir,
+        env: "staging",
+        dryRun: true,
+        runDeploy: async (target) => {
+          checked.push(target.name);
+          if (target.name === "pithy-api") {
+            throw new InternalError({
+              message: "wrangler deploy failed.",
+              detail: 'X [ERROR] Could not resolve "./missing"',
+            });
+          }
+          return "";
+        },
+      });
+
+      expect(checked).toEqual(["pithy-api", "pithy-web"]);
+      expect(results).toEqual([
+        { name: "pithy-api", ok: false, error: 'X [ERROR] Could not resolve "./missing"' },
+        { name: "pithy-web", ok: true },
+      ]);
+    });
+
+    test("a failed UI build fails its row, and wrangler never runs for it", async () => {
+      await writeWorker("web", "pithy-web");
+      await writeUi("web");
+      const checked: string[] = [];
+
+      const results = await deployProject({
+        account: null,
+        projectDir: dir,
+        env: "prod",
+        dryRun: true,
+        runBuild: async () => {
+          throw new InternalError({ message: "npx vite build failed.", detail: "Could not resolve ./client" });
+        },
+        runDeploy: async (target) => {
+          checked.push(target.name);
+          return "";
+        },
+      });
+
+      expect(checked).toEqual([]);
+      expect(results[0]).toMatchObject({ name: "pithy-web", ok: false, built: false });
+      expect(results[0]?.error).toMatch(/Could not resolve/);
+    });
+
+    /**
+     * **`--dry-run` writes nothing in the project, the build's output included (#697).** A front end's build writes
+     * `dist/`, runs whatever hooks its package declares, and leaves a `.wrangler/deploy/config.json` redirect;
+     * wrangler bundles under `.wrangler/tmp`. In the project, every one of those is a write a plan said it would not
+     * make. So the Workers are built and bundled in a private copy, and the project is byte-identical afterwards —
+     * ignored files and all, which is stronger than the tracked and untracked files the promise is about.
+     */
+    test("the build and wrangler's bundle land in a copy, and the project is byte-identical afterwards", async () => {
+      await writeWorker("web", "pithy-web");
+      await writeUi("web");
+      await mkdir(join(dir, "apps", "web", "src"), { recursive: true });
+      await writeFile(join(dir, "apps", "web", "src", "main.ts"), "export {};\n");
+      await writeFile(join(dir, ".gitignore"), "dist/\n.wrangler/\n");
+      const before = await snapshotTree(dir);
+      const at: string[] = [];
+
+      const results = await deployProject({
+        account: null,
+        projectDir: dir,
+        env: "prod",
+        dryRun: true,
+        runBuild: async (target) => {
+          at.push(target.dir);
+          // What a real build and its hooks write: output, a redirect, and a generated source file.
+          await mkdir(join(target.dir, "dist"), { recursive: true });
+          await writeFile(join(target.dir, "dist", "index.js"), "built");
+          await mkdir(join(target.dir, ".wrangler", "deploy"), { recursive: true });
+          await writeFile(join(target.dir, ".wrangler", "deploy", "config.json"), "{}");
+          await writeFile(join(target.dir, "src", "routes.generated.ts"), "export {};\n");
+        },
+        runDeploy: async (target) => {
+          at.push(target.dir);
+          await mkdir(join(target.dir, ".wrangler", "tmp"), { recursive: true });
+          await writeFile(join(target.dir, ".wrangler", "tmp", "bundle.js"), "bundled");
+          return "--dry-run: exiting now.";
+        },
+      });
+
+      expect(results).toEqual([{ name: "pithy-web", ok: true, built: true }]);
+      expect(at).toHaveLength(2);
+      for (const path of at) expect(path.startsWith(dir)).toBe(false);
+      expect(await snapshotTree(dir)).toEqual(before);
+    });
+
+    test("a failure in the copy is reported against the project's paths", async () => {
+      await writeWorker("web", "pithy-web");
+      await writeUi("web");
+
+      const results = await deployProject({
+        account: null,
+        projectDir: dir,
+        env: "prod",
+        dryRun: true,
+        runBuild: async (target) => {
+          throw new InternalError({ message: "vite build failed.", detail: `Could not resolve ${target.dir}/src/x` });
+        },
+        runDeploy: async () => "",
+      });
+
+      expect(results[0]?.error).toBe(`Could not resolve ${join(dir, "apps", "web")}/src/x`);
+    });
+
+    test("each Worker is checked under a step, and settles as what would happen", async () => {
+      await writeWorker("api", "pithy-api");
+      const events: ProgressEvent[] = [];
+
+      await narrate(
+        (event) => events.push(event),
+        async () => {
+          await deployProject({ account: null, projectDir: dir, env: "prod", dryRun: true, runDeploy: async () => "" });
+        },
+      );
+
+      expect(events).toEqual([
+        { phase: "start", what: "pithy-api" },
+        { phase: "settled", line: "pithy-api: would deploy.", data: { worker: { name: "pithy-api", ok: true } } },
+      ]);
+    });
   });
 });
 
@@ -980,6 +1287,21 @@ describe("summarizeDeploy", () => {
       verificationDetail: "https://api.example.com is serving 2 versions — a gradual deployment is in progress.",
     });
     expect(line.split("\n")[0]).toBe("pithy-api: deployed. v9");
+  });
+});
+
+describe("summarizePlannedDeploy", () => {
+  test("a Worker that bundled would deploy", () => {
+    expect(summarizePlannedDeploy({ name: "api", ok: true })).toBe("api: would deploy.");
+  });
+
+  test("a Worker that also built says so", () => {
+    expect(summarizePlannedDeploy({ name: "web", ok: true, built: true })).toBe("web: built, and would deploy.");
+  });
+
+  test("a failure reads exactly as the real run's", () => {
+    const failed = { name: "web", ok: false, built: false, error: "Could not resolve ./client" };
+    expect(summarizePlannedDeploy(failed)).toBe(summarizeDeploy(failed));
   });
 });
 

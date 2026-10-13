@@ -5,23 +5,31 @@ import { cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Capability } from "@pithy-sh/core/src/capability/capability";
+import { callerOf, pithyCommand } from "@pithy-sh/core/src/cli/command";
 import { ValidationError } from "@pithy-sh/core/src/error/pithyError";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { declineRefusal, type ReconcileApplied, type ReconcilePlan } from "../capabilities/reconcile";
 import { declaredSpecs } from "../kitPackages/ranges";
 import type { RegistryFetch } from "../kitPackages/registry";
+import { Plan } from "../plan/plan";
+import { AGENTS_FILE, BLOCK_CLOSE, BLOCK_OPEN, renderAgentsBlock, syncAgentsBlock } from "../project/agentInstructions";
 import { scaffoldProject } from "../project/scaffold";
 import { doctorHarness } from "../test-utils/doctorHarness";
 import { fakeInstall, fakePackument, fakeRegistry } from "../test-utils/fakeInstall";
+import { expectConforms } from "../test-utils/payloadContract";
 import { templateTarball } from "../test-utils/templateTarball";
+import { dirOf } from "../test-utils/workerDir";
 import { readManifestDocument, writeManifestDocument } from "../ui/workerUi";
 import { buildDoctorReport, installedCapabilityVersions, renderDoctorText } from "./doctor";
 import upgrade, {
   __test,
+  planUpgrade,
   runUpgrade,
+  type UpgradeRun,
   type UpgradeWorker,
   type UpgradeWorkerResult,
   upgradeFailed,
+  upgradeFollowUp,
   upgradeIncomplete,
   upgradeJsonLine,
   upgradeText,
@@ -94,7 +102,9 @@ describe("plan rendering", () => {
     const lines = __test.planLines(plan);
     expect(lines).toContain("auth: add 1 binding, 1 config key.");
     expect(lines).toContain("billing: ejected. Skipped.");
-    expect(lines).toContain("3 migrations pending. Run pithy upgrade --migrate, or pithy migrate --env dev.");
+    expect(lines).toContain(
+      "3 migrations pending. Run pithy upgrade --worker api --env dev --migrate, or pithy migrate --worker api --env dev.",
+    );
     // A capability with no drift produces no line.
     expect(lines.some((line) => line.startsWith("quiet:"))).toBe(false);
   });
@@ -157,7 +167,9 @@ describe("applied rendering", () => {
     const lines = __test.appliedLines(applied, plan);
     expect(lines).toContain("auth: added 1 binding, 1 config key.");
     expect(lines).toContain("billing: ejected. Skipped.");
-    expect(lines).toContain("3 migrations pending. Run pithy upgrade --migrate, or pithy migrate --env dev.");
+    expect(lines).toContain(
+      "3 migrations pending. Run pithy upgrade --worker api --env dev --migrate, or pithy migrate --worker api --env dev.",
+    );
   });
 
   test("reports a completed migration run instead of a pending note", () => {
@@ -206,7 +218,7 @@ describe("worker grouping", () => {
       "api:",
       "  auth: add 1 binding, 1 config key.",
       "  billing: ejected. Skipped.",
-      "  3 migrations pending. Run pithy upgrade --migrate, or pithy migrate --env dev.",
+      "  3 migrations pending. Run pithy upgrade --worker api --env dev --migrate, or pithy migrate --worker api --env dev.",
       "collab:",
       "  Nothing to upgrade.",
     ]);
@@ -316,6 +328,52 @@ describe("runUpgrade — fan-out over apps/", () => {
       expect(applied).toBeNull(); // dry run writes nothing
       expect(plan.perCapability.find((cap) => cap.name === "auth")?.missingBindings).toHaveLength(3);
     }
+  });
+
+  /**
+   * **The dry run's plan is the one shape every `--dry-run` shares (#697)**, read off the reconcile plans:
+   * one `wrangler.jsonc` edit per Worker naming each binding it adds, none for a run that writes.
+   */
+  test("a dry run carries the shared plan: each worker's wrangler.jsonc, one change per binding", async () => {
+    const run = await runUpgrade({ account: null, ...base, projectDir: dir, resolveWorkers: resolve });
+    const plan = Plan.parse(run.plan);
+    const wrangler = plan.files.filter((file) => file.path.endsWith("/wrangler.jsonc"));
+    expect(wrangler.map((file) => file.path)).toEqual(["apps/api/wrangler.jsonc", "apps/collab/wrangler.jsonc"]);
+    for (const file of wrangler) {
+      expect(file.action).toBe("edit");
+      expect(file.changes.filter((change) => change.startsWith("Adds DB (d1)"))).toHaveLength(3);
+    }
+    expect(JSON.parse(upgradeJsonLine(run, "dev", true)).plan).toEqual(run.plan);
+
+    const real = await runUpgrade({ account: null, ...base, dryRun: false, projectDir: dir, resolveWorkers: resolve });
+    expect(real.plan).toBeUndefined();
+    expect(JSON.parse(upgradeJsonLine(real, "dev", false)).plan).toBeUndefined();
+  });
+
+  test("a required option with no default is a note that the upgrade refuses, never a planned edit", async () => {
+    const run = await runUpgrade({ account: null, ...base, projectDir: dir, resolveWorkers: resolve });
+    const reconciledRun = {
+      ...run,
+      workers: run.workers.map((result) =>
+        result.state === "reconciled"
+          ? {
+              ...result,
+              plan: {
+                ...result.plan,
+                perCapability: result.plan.perCapability.map((cap) => ({
+                  ...cap,
+                  missingConfigKeys: [{ key: "billingSubject", describe: "Who holds a subscription." }],
+                })),
+              },
+            }
+          : result,
+      ),
+    } as typeof run;
+    const plan = await planUpgrade(dir, reconciledRun, false);
+    expect(plan.files.some((file) => file.path.endsWith("pithy.config.ts"))).toBe(false);
+    expect(plan.notes).toContain(
+      "auth: billingSubject has no default. The upgrade refuses until apps/api/pithy.config.ts sets it.",
+    );
   });
 
   test("--worker narrows the fan-out to one worker", async () => {
@@ -617,6 +675,26 @@ describe("runUpgrade — a worker that will not reconcile", () => {
     expect(failed && "applied" in failed).toBe(false);
   });
 
+  // The rerun an unapplied Worker names is the caller's own run, from its context (#711): it was rebuilt from the
+  // Worker, the environment and --migrate, and dropped the --json an agent's call had asked for.
+  test("an unapplied Worker's rerun is the caller's own run, --json included", async () => {
+    const run = await runUpgrade({
+      ...base,
+      dryRun: false,
+      migrate: true,
+      projectDir: dir,
+      caller: callerOf("upgrade", { env: "dev", migrate: true, json: true }),
+      runMigrate: async ({ worker }) => {
+        if (worker === "collab") throw new Error("planted: this worker's migrations will not run");
+        return [];
+      },
+    });
+    const failed = run.workers[1];
+    expect(failed?.state === "unapplied" && failed.again).toBe(
+      "pithy upgrade --env dev --migrate --json --worker collab",
+    );
+  });
+
   test("either failure still fails the run — the gate does not weaken, it stops taking the report with it", async () => {
     // Both ledgers read. A stub rather than the real read, because the Workers here are a double over a
     // scaffold with nothing installed: the real read discovers the rest of the project beside them, and a
@@ -645,7 +723,12 @@ describe("runUpgrade — a worker that will not reconcile", () => {
     ]);
     expect(plans).not.toContain("Nothing to upgrade.");
 
-    const partial = __test.workerLines({ state: "unapplied", worker: "collab", plan: { ...plan, worker: "collab" } });
+    const partial = __test.workerLines({
+      state: "unapplied",
+      worker: "collab",
+      plan: { ...plan, worker: "collab" },
+      again: pithyCommand("upgrade", { flags: { "--worker": dirOf("collab"), "--env": "dev" } }),
+    });
     expect(partial[0]).toBe("Upgrade failed partway. Its wiring may hold part of the plan below.");
     expect(partial[1]).toBe("Check it, then re-run: pithy upgrade --worker collab --env dev.");
   });
@@ -722,7 +805,7 @@ describe("declined bindings", () => {
       state: "read",
       declines: [{ state: "required", name: "DB", type: "d1", capability: "auth", reason: "own database" }],
     });
-    const refusal = declineRefusal(built);
+    const refusal = declineRefusal(built, ["dev", "staging", "prod"], []);
     expect(refusal).not.toBeNull();
     const lines = __test.workerLines({
       state: "refused",
@@ -794,12 +877,83 @@ describe("a refused decline in both tenses", () => {
   test("the plan itself carries the refusal, so both paths read one fact", () => {
     // Neither tense recomputes anything: the refusal is a function of the plan, and the plan is built
     // once. That is what makes "they agree" structural rather than a pair of code paths kept in step.
-    expect(declineRefusal(refusing)).not.toBeNull();
-    expect(declineRefusal({ ...refusing, declinedBindings: { state: "read", declines: [] } })).toBeNull();
+    expect(declineRefusal(refusing, ["dev", "staging", "prod"], [])).not.toBeNull();
+    expect(declineRefusal({ ...refusing, declinedBindings: { state: "read", declines: [] } }, ["dev"], [])).toBeNull();
+  });
+
+  // `vector provision` acts on one environment and defaults to dev, and an undeclinable binding is provisioned in
+  // every environment the Worker has: so the line names one command per environment, production as the person's
+  // decision it is — never only the `dev` the plan happened to count migrations in (#711).
+  test("a declined Workflow whose provision acts on one environment names every environment the Worker has", () => {
+    const refusal = declineRefusal(
+      {
+        ...refusing,
+        env: "dev",
+        declinedBindings: {
+          state: "read",
+          declines: [
+            { state: "undeclinable", name: "VECTOR_REPROCESS", type: "workflow", capability: "vector", reason: "none" },
+          ],
+        },
+      },
+      ["dev", "staging", "prod"],
+      [],
+    );
+    expect(refusal?.payload.action).toContain(
+      "Run `pithy vector provision --worker api --env dev` and `pithy vector provision --worker api --env staging`.",
+    );
+    expect(refusal?.payload.action).toMatch(
+      /`pithy vector provision --worker api --env prod` runs against prod, a production environment\./,
+    );
+  });
+
+  // #711: the project's own production environment is a person's decision as well, never a routine provision.
+  test("an environment the project calls production is a person's decision in the refusal", () => {
+    const refusal = declineRefusal(
+      {
+        ...refusing,
+        declinedBindings: {
+          state: "read",
+          declines: [
+            { state: "undeclinable", name: "VECTOR_REPROCESS", type: "workflow", capability: "vector", reason: "none" },
+          ],
+        },
+      },
+      ["dev", "staging", "live"],
+      ["live"],
+    );
+    expect(refusal?.payload.action).toContain(
+      "Run `pithy vector provision --worker api --env dev` and `pithy vector provision --worker api --env staging`.",
+    );
+    expect(refusal?.payload.action).toContain(
+      "`pithy vector provision --worker api --env live` runs against live, a production environment.",
+    );
+  });
+
+  // `testers provision` with no `--env` covers every environment, and refuses `--env dev`: one command, no `--env`.
+  // Bare, `testers provision` runs against production too (#711), so it is named per deployed environment: staging
+  // as a command, prod as a person's decision.
+  test("a declined Workflow whose provision spans every environment names each deployed one, prod as a decision", () => {
+    const refusal = declineRefusal(
+      {
+        ...refusing,
+        declinedBindings: {
+          state: "read",
+          declines: [
+            { state: "undeclinable", name: "TESTERS_DAILY", type: "workflow", capability: "testers", reason: "none" },
+          ],
+        },
+      },
+      ["dev", "staging", "prod"],
+      [],
+    );
+    expect(refusal?.payload.action).toContain(
+      "Run `pithy testers provision --worker api --env staging`. `pithy testers provision --worker api --env prod` runs against prod, a production environment. That is a person's decision, not a fix.",
+    );
   });
 
   test("a refused Worker fails the exit whether or not anything was written", () => {
-    const refusal = declineRefusal(refusing);
+    const refusal = declineRefusal(refusing, ["dev", "staging", "prod"], []);
     // biome-ignore lint/style/noNonNullAssertion: asserted non-null in the case above.
     const result = { state: "refused" as const, worker: "api", plan: refusing, refusal: refusal!.payload };
     expect(upgradeIncomplete({ workers: [result], manifestFaults: [] })).toBe(true);
@@ -881,6 +1035,9 @@ describe("runUpgrade --packages", () => {
     const installed = join(boardDir, "node_modules", "@pithy-sh", "ui-react", "templates", "src", "routes", "pithy");
     await mkdir(installed, { recursive: true });
     await writeFile(join(installed, "sign-in.tsx"), SIGN_IN_020);
+    // The block is current, so the report below is the package step's alone. The block's own lines are
+    // held in "runUpgrade — agent instructions".
+    await syncAgentsBlock(dir, { dryRun: false });
   });
 
   afterEach(async () => {
@@ -909,7 +1066,8 @@ describe("runUpgrade --packages", () => {
     expect(run.packages).toBeUndefined();
     expect(upgradeText(run, false)).toEqual([...__test.renderUpgrade(run), "Done."]);
     const json = JSON.parse(upgradeJsonLine(run, "dev", false)) as Record<string, unknown>;
-    expect(Object.keys(json)).toEqual(["command", "env", "dryRun", "workers", "manifestFaults"]);
+    expect(Object.keys(json)).toEqual(["command", "env", "dryRun", "workers", "manifestFaults", "agents"]);
+    await expectConforms("upgrade", () => upgradeJsonLine(run, "dev", false));
     expect(await readFile(join(dir, "package.json"), "utf8")).toContain('"@pithy-sh/auth": "^0.2.0"');
   });
 
@@ -1067,7 +1225,18 @@ describe("runUpgrade --packages", () => {
     expect(text).toContain("  Reconciled against the current install. The moves above are not installed.");
     expect(text.at(-1)).toBe("Dry run. Nothing written.");
     const json = JSON.parse(upgradeJsonLine(dry, "dev", true)) as Record<string, unknown>;
-    expect(Object.keys(json)).toEqual(["command", "env", "dryRun", "workers", "manifestFaults", "packages"]);
+    expect(Object.keys(json)).toEqual([
+      "command",
+      "env",
+      "dryRun",
+      "workers",
+      "manifestFaults",
+      "packages",
+      "agents",
+      "plan",
+    ]);
+    expect(Plan.parse(json.plan).files.map((file) => file.path)).toContain("package.json");
+    await expectConforms("upgrade", () => upgradeJsonLine(dry, "dev", true));
   });
 
   test("a registry that does not answer: nothing written, the reconcile still runs, and the run fails", async () => {
@@ -1123,6 +1292,8 @@ describe("runUpgrade --packages", () => {
     });
     expect(resolveWorkers).not.toHaveBeenCalled();
     expect(run.workers).toEqual([]);
+    // Nor does the old CLI write its own block: the new one, run next, writes its own.
+    expect(run.agents).toBeUndefined();
     expect(run.packages?.reconciled).toBe(false);
     expect(upgradeFailed(run)).toBe(false);
     expect(upgradeText(run, false).slice(-2)).toEqual([
@@ -1135,6 +1306,136 @@ describe("runUpgrade --packages", () => {
       reconciled: false,
       installed: true,
     });
+    // The same command, as data: the reconcile this run left to the CLI it moved (#697).
+    expect(JSON.parse(upgradeJsonLine(run, "dev", false)).next).toEqual([
+      {
+        command: "bun x pithy upgrade",
+        why: "@pithy-sh/cli moved, so the new one reconciles. This run wrote no Worker.",
+      },
+    ]);
+  });
+});
+
+/**
+ * **The Pithy block in `AGENTS.md`, refreshed by every upgrade (#697).** A project scaffolded before the
+ * block existed gets it; a stale one is rewritten in place, with every byte outside the markers as it was;
+ * a current one is not written. The merge itself is `project/agentInstructions.test.ts`'s; these hold
+ * `runUpgrade` to calling it, in the right tense, at the right moment, and never failing the run over it.
+ */
+describe("runUpgrade — agent instructions", () => {
+  let dir: string;
+  const agents = () => join(dir, AGENTS_FILE);
+  const ledger = async () => ({ state: "read" as const, pending: 0, undeclared: [] });
+  const workers = async (): Promise<UpgradeWorker[]> => [
+    { name: "api", dir: join(dir, "apps", "api"), capabilities: [] },
+  ];
+  const run = (dryRun: boolean, extra: { worker?: string } = {}) =>
+    runUpgrade({
+      account: null,
+      env: "dev",
+      migrate: false,
+      readLedger: ledger,
+      projectDir: dir,
+      dryRun,
+      resolveWorkers: workers,
+      ...extra,
+    });
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "pithy-upgrade-agents-"));
+    // `scaffoldProject` writes no AGENTS.md — `init` does, after it — so this is a project from before #697.
+    await scaffoldProject({ targetDir: dir, appName: "agents-test" });
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  /**
+   * **`next` names `pithy migrate` for the migrations this run counted and did not run (#697)** — and nothing
+   * under `--migrate`, which ran them, or under `--dry-run`, which changed nothing to follow up on.
+   */
+  test("next names migrate for what it counted and did not apply, and nothing when it did or only planned", async () => {
+    const behind = async () => ({ state: "read" as const, pending: 2, undeclared: [] });
+    const options = { account: null, env: "staging", migrate: false, readLedger: behind, projectDir: dir } as const;
+    const real = await runUpgrade({ ...options, dryRun: false, resolveWorkers: workers });
+    expect(JSON.parse(upgradeJsonLine(real, "staging", false)).next).toEqual([
+      {
+        command: "pithy migrate --env staging",
+        why: "2 migrations are not applied to staging. Upgrade migrates only under --migrate.",
+      },
+    ]);
+    await expectConforms("upgrade", () => upgradeJsonLine(real, "staging", false));
+    expect(Object.hasOwn(JSON.parse(upgradeJsonLine(real, "staging", false, true)), "next")).toBe(false);
+    const dry = await runUpgrade({ ...options, dryRun: true, resolveWorkers: workers });
+    expect(Object.hasOwn(JSON.parse(upgradeJsonLine(dry, "staging", true)), "next")).toBe(false);
+  });
+
+  test("a project without the block gets it, says so above the Workers, and --json carries it", async () => {
+    const result = await run(false);
+    expect(result.agents).toEqual({ path: AGENTS_FILE, state: "added", reason: null });
+    expect(await readFile(agents(), "utf8")).toBe(`${renderAgentsBlock()}\n`);
+    const text = upgradeText(result, false);
+    expect(text[0]).toBe("AGENTS.md: Pithy block added.");
+    expect(text.indexOf("api:")).toBeGreaterThan(0);
+    expect(JSON.parse(upgradeJsonLine(result, "dev", false)).agents).toEqual(result.agents);
+    await expectConforms("upgrade", () => upgradeJsonLine(result, "dev", false));
+  });
+
+  test("a stale block is refreshed, and the text outside it is byte-identical", async () => {
+    const before = "# Our agents\n\nRun the tests first.\n\n";
+    const after = "\n## Release\n\nNever tag by hand.\n";
+    await writeFile(agents(), `${before}${BLOCK_OPEN}\nRun pithy catalog.\n${BLOCK_CLOSE}${after}`);
+    const result = await run(false);
+    expect(result.agents?.state).toBe("updated");
+    expect(upgradeText(result, false)[0]).toBe("AGENTS.md: Pithy block refreshed.");
+    expect(await readFile(agents(), "utf8")).toBe(`${before}${renderAgentsBlock()}${after}`);
+  });
+
+  test("a second run finds it current, writes nothing and says nothing about it", async () => {
+    await run(false);
+    const second = await run(false);
+    expect(second.agents?.state).toBe("unchanged");
+    expect(upgradeText(second, false).some((line) => line.startsWith("AGENTS.md"))).toBe(false);
+  });
+
+  test("a dry run says what it would do and writes nothing", async () => {
+    const result = await run(true);
+    expect(result.agents?.state).toBe("added");
+    expect(upgradeText(result, true)[0]).toBe("AGENTS.md: would add the Pithy block.");
+    await expect(readFile(agents(), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("--worker narrows the Workers, not the project: the block is still refreshed", async () => {
+    expect((await run(false, { worker: "api" })).agents?.state).toBe("added");
+  });
+
+  test("a refused AGENTS.md is reported and does not fail the run", async () => {
+    const document = `${BLOCK_OPEN}\nmine\n`;
+    await writeFile(agents(), document);
+    const result = await run(false);
+    expect(result.agents?.state).toBe("refused");
+    expect(upgradeText(result, false)[0]).toMatch(
+      /^AGENTS\.md has a pithy:begin marker without its pithy:end\..* Not written\.$/,
+    );
+    expect(upgradeFailed(result)).toBe(false);
+    expect(await readFile(agents(), "utf8")).toBe(document);
+  });
+
+  test("a run that cannot resolve its Workers writes no block — it may not be a project at all", async () => {
+    await expect(
+      runUpgrade({
+        account: null,
+        env: "dev",
+        migrate: false,
+        projectDir: dir,
+        dryRun: false,
+        resolveWorkers: async () => {
+          throw new ValidationError({ message: "No apps/ here." });
+        },
+      }),
+    ).rejects.toThrow("No apps/ here.");
+    await expect(readFile(agents(), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
 
@@ -1282,5 +1583,367 @@ describe("doctor's advice clears its own line", () => {
     expect(authRow(await doctorWith(fetch))).toMatchObject({ state: "outdated", installed: "0.2.3" });
     await upgradeWith(fetch, true);
     expect(authRow(await doctorWith(fetch))).toMatchObject({ state: "current", installed: "0.3.1" });
+  });
+});
+
+/**
+ * **`planUpgrade`, branch by branch (#697).** Each case hands it a run built by hand, the way the dry run
+ * hands it the one it just read, so what is under test is the restatement alone: which file each finding
+ * lands in, and the sentence an agent reads for it. The project directory is real only where the plan
+ * reads the disk — whether `AGENTS.md` exists, and where `main` points.
+ */
+describe("planUpgrade", () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "pithy-plan-upgrade-"));
+  });
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  /** A run of one reconciled Worker, with `plan`'s drift replaced by what each case sets. */
+  function runOf(overrides: Partial<ReconcilePlan>, rest: Partial<UpgradeRun> = {}): UpgradeRun {
+    const quiet = { name: "auth", missingBindings: [], missingConfigKeys: [], missingEntryExports: [] };
+    const built: ReconcilePlan = {
+      ...plan,
+      worker: "board",
+      perCapability: [quiet],
+      ledger: { state: "read", pending: 0, undeclared: [] },
+      ...overrides,
+    };
+    return { workers: [entry(built)], manifestFaults: [], ...rest };
+  }
+
+  test("a clean run plans nothing", async () => {
+    const planned = await planUpgrade(root, runOf({}), false);
+    expect(Plan.parse(planned)).toEqual({ files: [], resources: [], migrations: [], secrets: [], data: [], notes: [] });
+  });
+
+  test("a missing binding names its stanza: the top-level one for dev, env.<name> for the rest", async () => {
+    const planned = await planUpgrade(
+      root,
+      runOf({
+        perCapability: [
+          {
+            name: "auth",
+            missingBindings: [
+              { env: "dev", name: "DB", type: "d1" },
+              { env: "staging", name: "DB", type: "d1" },
+            ],
+            missingConfigKeys: [],
+            missingEntryExports: [],
+          },
+        ],
+      }),
+      false,
+    );
+    expect(planned.files).toEqual([
+      {
+        path: "apps/board/wrangler.jsonc",
+        action: "edit",
+        changes: ["Adds DB (d1) to the top-level stanza, for auth.", "Adds DB (d1) to env.staging, for auth."],
+      },
+    ]);
+  });
+
+  test("a missing export lands in the entry `main` names, once however many capabilities need it", async () => {
+    await mkdir(join(root, "apps", "board"), { recursive: true });
+    await writeFile(join(root, "apps", "board", "wrangler.jsonc"), '{ "main": "src/index.ts" }\n');
+    const planned = await planUpgrade(
+      root,
+      runOf({
+        perCapability: [
+          { name: "collab", missingBindings: [], missingConfigKeys: [], missingEntryExports: ["Room", "Lobby"] },
+          { name: "presence", missingBindings: [], missingConfigKeys: [], missingEntryExports: ["Room"] },
+        ],
+      }),
+      false,
+    );
+    expect(planned.files).toEqual([
+      { path: "apps/board/src/index.ts", action: "edit", changes: ["Exports Room, Lobby from the Worker's entry."] },
+    ]);
+  });
+
+  test("with no entry to name, the export is planned against wrangler.jsonc, which says where it is", async () => {
+    const exportsRoom = {
+      perCapability: [{ name: "collab", missingBindings: [], missingConfigKeys: [], missingEntryExports: ["Room"] }],
+    };
+    // No `wrangler.jsonc` at all: the read throws, and the plan still names a file rather than failing.
+    const unread = await planUpgrade(root, runOf(exportsRoom), false);
+    expect(unread.files.map((file) => file.path)).toEqual(["apps/board/wrangler.jsonc"]);
+
+    // A `wrangler.jsonc` with no `main`.
+    await mkdir(join(root, "apps", "board"), { recursive: true });
+    await writeFile(join(root, "apps", "board", "wrangler.jsonc"), '{ "name": "board" }\n');
+    const unnamed = await planUpgrade(root, runOf(exportsRoom), false);
+    expect(unnamed.files).toEqual([
+      { path: "apps/board/wrangler.jsonc", action: "edit", changes: ["Exports Room from the Worker's entry."] },
+    ]);
+  });
+
+  test("a missing version_metadata binding is one edit to wrangler.jsonc", async () => {
+    const planned = await planUpgrade(root, runOf({ missingVersionMetadata: true }), false);
+    expect(planned.files).toEqual([
+      {
+        path: "apps/board/wrangler.jsonc",
+        action: "edit",
+        changes: ["Adds the CF_VERSION_METADATA version_metadata binding."],
+      },
+    ]);
+  });
+
+  test("pending migrations are a note, worded for whether --migrate was passed", async () => {
+    const pending = runOf({ ledger: { state: "read", pending: 1, undeclared: [] } });
+    // The sentence `docs/commands/upgrade.md` shows, word for word.
+    expect((await planUpgrade(root, pending, false)).notes).toEqual([
+      "board: 1 migration pending on dev. pithy upgrade --worker board --env dev --migrate applies them.",
+    ]);
+    expect((await planUpgrade(root, pending, true)).notes).toEqual(["board: then applies 1 migration pending on dev."]);
+  });
+
+  test("a partial ledger reports the count it could read", async () => {
+    const partial = runOf({
+      env: "staging",
+      ledger: {
+        state: "partial",
+        counted: { pending: 2, undeclared: [] },
+        unreadable: [{ database: "collab", binding: "COLLAB_DB" }],
+      },
+    });
+    expect((await planUpgrade(root, partial, false)).notes).toEqual([
+      "board: 2 migrations pending on staging. pithy upgrade --worker board --env staging --migrate applies them.",
+    ]);
+  });
+
+  test("the Pithy block is a create where AGENTS.md is missing and an edit where it is stale", async () => {
+    const added = await planUpgrade(
+      root,
+      runOf({}, { agents: { path: AGENTS_FILE, state: "added", reason: null } }),
+      false,
+    );
+    expect(added.files).toEqual([{ path: AGENTS_FILE, action: "create", changes: ["Adds the Pithy block."] }]);
+
+    await writeFile(join(root, AGENTS_FILE), "# Agents\n");
+    const updated = await planUpgrade(
+      root,
+      runOf({}, { agents: { path: AGENTS_FILE, state: "updated", reason: null } }),
+      false,
+    );
+    expect(updated.files).toEqual([
+      { path: AGENTS_FILE, action: "edit", changes: ["Refreshes the Pithy block. Nothing outside it changes."] },
+    ]);
+
+    // Current already: nothing to write, so nothing planned.
+    const unchanged = await planUpgrade(
+      root,
+      runOf({}, { agents: { path: AGENTS_FILE, state: "unchanged", reason: null } }),
+      false,
+    );
+    expect(unchanged.files).toEqual([]);
+  });
+
+  test("a package move edits its manifest, and the install it needs is the package manager's own", async () => {
+    const packages: UpgradeRun["packages"] = {
+      state: "read",
+      packageManager: "bun",
+      installed: false,
+      reconciled: false,
+      moves: [
+        {
+          name: "@pithy-sh/auth",
+          manifest: "apps/board/package.json",
+          field: "dependencies",
+          from: "^0.8.0",
+          to: "^0.9.0",
+          target: "0.9.0",
+        },
+      ],
+      held: [],
+      leftAlone: [],
+      mismatches: [],
+      templates: [],
+    };
+    const planned = await planUpgrade(root, runOf({}, { packages }), false);
+    expect(planned.files).toEqual([
+      { path: "apps/board/package.json", action: "edit", changes: ["Moves @pithy-sh/auth from ^0.8.0 to ^0.9.0."] },
+    ]);
+    // The command the real run spawns: `bun install`, never `bun x bun install`.
+    expect(planned.notes).toEqual(["Then runs bun install at the project root."]);
+  });
+});
+
+/**
+ * **`upgradeFollowUp`, held directly (#697).** The two `runUpgrade` cases above reach it through the `--json`
+ * line on one state each; these are the rest of its inputs. The count is summed across Workers and is only
+ * ever whole — a Worker that is not reconciled, or a ledger read in part, fails the run, and a failed run
+ * names no step — and `--packages` defers to the project's own CLI only when it moved `@pithy-sh/cli` and
+ * left the reconcile to it.
+ */
+describe("upgradeFollowUp", () => {
+  const options = { env: "staging", dryRun: false, migrate: false } as const;
+
+  /** A reconciled Worker whose ledger read `pending`. */
+  const worker = (name: string, pending: number): UpgradeWorkerResult =>
+    entry({ ...plan, worker: name, ledger: { state: "read", pending, undeclared: [] } });
+
+  /** A `--packages` report that moved `names` and reconciled or not. */
+  const packagesMoving = (names: string[], reconciled: boolean): NonNullable<UpgradeRun["packages"]> => ({
+    state: "read",
+    packageManager: "bun",
+    installed: true,
+    reconciled,
+    moves: names.map((name) => ({
+      name,
+      manifest: "package.json",
+      field: "dependencies",
+      from: "^0.8.0",
+      to: "^0.9.0",
+      target: "0.9.0",
+    })),
+    held: [],
+    leftAlone: [],
+    mismatches: [],
+    templates: [],
+  });
+
+  const commands = (run: UpgradeRun) => upgradeFollowUp(run, options)?.map((step) => step.command);
+
+  test("pending migrations are summed across every reconciled Worker into one migrate step", () => {
+    const next = upgradeFollowUp({ workers: [worker("api", 2), worker("web", 1)], manifestFaults: [] }, options);
+    expect(next).toEqual([
+      {
+        command: "pithy migrate --env staging",
+        why: "3 migrations are not applied to staging. Upgrade migrates only under --migrate.",
+      },
+    ]);
+  });
+
+  test("nothing pending, --migrate that ran them, or a dry run, is no step", () => {
+    const behind: UpgradeRun = { workers: [worker("api", 2)], manifestFaults: [] };
+    expect(upgradeFollowUp({ workers: [worker("api", 0)], manifestFaults: [] }, options)).toBeUndefined();
+    expect(upgradeFollowUp(behind, { ...options, migrate: true })).toBeUndefined();
+    expect(upgradeFollowUp(behind, { ...options, dryRun: true })).toBeUndefined();
+  });
+
+  // The undercount a partial read would make is never a step: the run failed, and its failure is what to read.
+  test("a ledger read in part fails the run, so its counted pending is no step", () => {
+    const partial = entry({
+      ...plan,
+      ledger: {
+        state: "partial",
+        counted: { pending: 4, undeclared: [] },
+        unreadable: [{ database: "app", binding: "DB" }],
+      },
+    });
+    const run: UpgradeRun = { workers: [partial], manifestFaults: [] };
+    expect(upgradeFailed(run)).toBe(true);
+    expect(upgradeFollowUp(run, options)).toBeUndefined();
+  });
+
+  test("an unplanned, unapplied or refused Worker beside a behind one fails the run, so neither is a step", () => {
+    const others: UpgradeWorkerResult[] = [
+      { state: "unplanned", worker: "web" },
+      {
+        state: "unapplied",
+        worker: "web",
+        plan,
+        again: pithyCommand("upgrade", { flags: { "--worker": dirOf("web") } }),
+      },
+    ];
+    for (const other of others) {
+      const run: UpgradeRun = { workers: [worker("api", 2), other], manifestFaults: [] };
+      expect(upgradeFailed(run)).toBe(true);
+      expect(upgradeFollowUp(run, options)).toBeUndefined();
+    }
+    const refusing: ReconcilePlan = {
+      ...plan,
+      declinedBindings: {
+        state: "read",
+        declines: [{ state: "required", name: "DB", type: "d1", capability: "auth", reason: "own database" }],
+      },
+    };
+    const refusal = declineRefusal(refusing, ["dev", "staging", "prod"], []);
+    if (refusal === null) throw new Error("planted: a required decline is refused");
+    const refused: UpgradeRun = {
+      workers: [worker("api", 2), { state: "refused", worker: "web", plan: refusing, refusal: refusal.payload }],
+      manifestFaults: [],
+    };
+    expect(upgradeFollowUp(refused, options)).toBeUndefined();
+  });
+
+  test("--packages that moved only other packages and reconciled still names the migrations it counted", () => {
+    const run: UpgradeRun = {
+      workers: [worker("api", 2)],
+      manifestFaults: [],
+      packages: packagesMoving(["@pithy-sh/auth"], true),
+    };
+    expect(commands(run)).toEqual(["pithy migrate --env staging"]);
+  });
+
+  test("--packages that moved @pithy-sh/cli and reconciled anyway leaves no reconcile step", () => {
+    const run: UpgradeRun = {
+      workers: [worker("api", 0)],
+      manifestFaults: [],
+      packages: packagesMoving(["@pithy-sh/cli", "@pithy-sh/auth"], true),
+    };
+    expect(upgradeFollowUp(run, options)).toBeUndefined();
+    expect(commands({ ...run, workers: [worker("api", 1)] })).toEqual(["pithy migrate --env staging"]);
+  });
+
+  test("--packages that moved @pithy-sh/cli and left the reconcile names the project's own CLI, and only that", () => {
+    const run: UpgradeRun = {
+      workers: [],
+      manifestFaults: [],
+      packages: packagesMoving(["@pithy-sh/cli"], false),
+    };
+    expect(commands(run)).toEqual(["bun x pithy upgrade --env staging"]);
+    // A move that left the reconcile but did not touch the CLI is not this case: nothing is deferred.
+    expect(upgradeFollowUp({ ...run, packages: packagesMoving(["@pithy-sh/auth"], false) }, options)).toBeUndefined();
+  });
+
+  /**
+   * **The rerun is the caller's own run, less the package move it already made (#711).** `--env`, `--worker` and
+   * `--migrate` each change what the reconcile acts on, so the line that hands the reconcile to the new CLI
+   * carries every one the caller gave; `--packages` and `--latest` did their work in this run, and a rerun that
+   * repeated them would move the packages again. `--worker` cannot reach here beside `--packages` today
+   * (`validateUpgradeFlags`), and the rerun would carry it the day it could.
+   */
+  test("the reconcile it leaves to the new CLI keeps the caller's --env, --worker and --migrate", () => {
+    const run: UpgradeRun = { workers: [], manifestFaults: [], packages: packagesMoving(["@pithy-sh/cli"], false) };
+    const given = {
+      env: "staging",
+      worker: "api",
+      migrate: true,
+      packages: true,
+      latest: true,
+      "dry-run": false,
+      json: false,
+    };
+    const rerun = "bun x pithy upgrade --env staging --worker api --migrate";
+    expect(upgradeText(run, false, callerOf("upgrade", given))).toContain(
+      `@pithy-sh/cli moved to 0.9.0. Run ${rerun} to reconcile with it.`,
+    );
+    expect(
+      upgradeFollowUp(run, { ...options, migrate: true, caller: callerOf("upgrade", given) })?.map(
+        (step) => step.command,
+      ),
+    ).toEqual([rerun]);
+  });
+
+  test("the reconcile it leaves to the new CLI names no flag the caller did not need", () => {
+    const run: UpgradeRun = { workers: [], manifestFaults: [], packages: packagesMoving(["@pithy-sh/cli"], false) };
+    const given = { env: "dev", migrate: false, packages: true, latest: false, "dry-run": false, json: false };
+    expect(upgradeText(run, false, callerOf("upgrade", given))).toContain(
+      "@pithy-sh/cli moved to 0.9.0. Run bun x pithy upgrade to reconcile with it.",
+    );
+    expect(
+      upgradeFollowUp(run, { ...options, env: "dev", caller: callerOf("upgrade", given) })?.map((step) => step.command),
+    ).toEqual(["bun x pithy upgrade"]);
+    // A named environment is carried on its own: it is where the reconcile writes a missing binding.
+    expect(upgradeText(run, false, callerOf("upgrade", { ...given, env: "staging" }))).toContain(
+      "@pithy-sh/cli moved to 0.9.0. Run bun x pithy upgrade --env staging to reconcile with it.",
+    );
   });
 });

@@ -1,19 +1,27 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
+import { callerOf } from "@pithy-sh/core/src/cli/command";
 import { generatedMigrationGroup } from "@pithy-sh/core/src/migrations/groups";
 import { LOCAL_ENVIRONMENT } from "@pithy-sh/core/src/naming/environment";
 import { defineCommand } from "citty";
+import { z } from "zod";
+import { withContract } from "../contract/commandContract";
 import { DESTROY_RETAINED_DESCRIPTION, parseDestroyRetained, rollbackConfirmPhrase } from "../migrations/confirm";
 import { requireMigrationGroup } from "../migrations/groups";
 import {
+  DatabaseRun,
   type MigrationProgress,
   migratedBeforeFailure,
   migrateProject,
+  planMigrateProject,
   type WorkerMigrationRun,
 } from "../migrations/run";
+import { DRY_RUN_ARG, emptyPlan, type Plan, PlanKey, planText } from "../plan/plan";
 import { loadProject, projectCloudflareAccount, requireProjectName } from "../project/config";
 import { ENV_ARG, requireEnvironment } from "../project/environment";
+import { canceled } from "../terminal/exitClass";
+import { mayPrompt } from "../terminal/inputMode";
 import { formatDone, formatJsonLine, withErrorReporting } from "../terminal/output";
 
 /**
@@ -39,8 +47,8 @@ export interface MigrateRender {
   json: boolean;
   /**
    * The run's group (#694) — the caller's `--group`, or the timestamp this run generated for itself.
-   * Optional because a rollback that was refused never renders, and a caller rendering a report of its
-   * own may hold no group.
+   * Optional because a rollback that was refused never renders, a forward `--dry-run` naming no `--group`
+   * generates none, and a caller rendering a report of its own may hold no group.
    */
   group?: string;
 }
@@ -64,6 +72,7 @@ export function formatMigrateReport(workers: WorkerMigrationRun[], options: Migr
       env: options.env,
       rollback: options.rollback,
       group: options.group,
+      dryRun: false,
     };
     return `${formatJsonLine({ ...payload, workers })}\n`;
   }
@@ -99,7 +108,7 @@ function keptLines(workers: WorkerMigrationRun[]): string[] {
  * A fan-out has no transaction across databases: the third one throws and the first two are already
  * ahead of it. Until now the throw took the whole report with it, so the operator was told a migration
  * failed and nothing about which schemas had moved — on the one command where that is the first
- * question. `withErrorReporting` writes the failure to stderr and exits 1; this writes what the run did
+ * question. `withErrorReporting` writes the failure to stderr and exits by its kind; this writes what the run did
  * to stdout first, so both streams and the exit code agree that it failed and name what it changed.
  *
  * The three states are kept apart on purpose. A database that migrated, the one that failed, and one
@@ -113,6 +122,7 @@ export function formatMigrateProgress(progress: MigrationProgress, options: Migr
       env: options.env,
       rollback: options.rollback,
       group: options.group,
+      dryRun: false,
       workers: progress.migrated,
       failed: progress.failed,
       unreached: progress.unreached,
@@ -134,6 +144,26 @@ export function formatMigrateProgress(progress: MigrationProgress, options: Migr
 }
 
 /**
+ * Render `pithy migrate --dry-run`: the `--json` line with its plan, or the plan's lines and the line that
+ * says nothing was written (#697). `workers` is empty, because nothing ran; `plan.migrations` is what would.
+ */
+export function formatMigratePlan(plan: Plan, options: MigrateRender): string {
+  if (options.json) {
+    return `${formatJsonLine({
+      command: "migrate",
+      project: options.project,
+      env: options.env,
+      rollback: options.rollback,
+      group: options.group,
+      dryRun: true,
+      workers: [],
+      plan,
+    })}\n`;
+  }
+  return `${[...planText(plan), "Dry run. Nothing written."].join("\n")}\n`;
+}
+
+/**
  * Ask a terminal for the rollback phrase — never under `--json`, never without a TTY, and never for `dev`,
  * which needs none. The prompt says what the command does, and **which group it is about to reverse**,
  * before asking anyone to agree to it (#694). With no group named it says so rather than naming one: the
@@ -141,94 +171,200 @@ export function formatMigrateProgress(progress: MigrationProgress, options: Migr
  * group on top.
  */
 async function promptRollback(env: string, json: boolean, group: string | undefined): Promise<string | undefined> {
-  const interactive = !json && Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
+  const interactive = mayPrompt(json);
   if (!interactive || env === LOCAL_ENVIRONMENT) return undefined;
   const { isCancel, text } = await import("@clack/prompts");
   const subject = group === undefined ? "a group of migrations" : `group ${group}`;
   const answer = await text({
     message: `This reverses ${subject} in every database ${env} binds. Type "${rollbackConfirmPhrase(env)}" to confirm:`,
   });
-  return isCancel(answer) ? "" : answer;
+  if (isCancel(answer)) canceled();
+  return answer;
 }
 
-export default defineCommand({
-  meta: { name: "migrate", description: "Run migrations for an environment" },
-  args: {
-    env: ENV_ARG,
-    worker: { type: "string", description: "Migrate one worker instead of every worker in apps/" },
-    binding: { type: "string", description: "Migrate only the database behind this D1 binding" },
-    group: {
-      type: "string",
-      description:
-        "Name the group this run applies under, instead of the timestamp it would generate. Required by --rollback, which reverses the named group",
+/** What {@link rollbackPhrase} decides from. */
+export interface RollbackPhraseOptions {
+  /** The environment being migrated. */
+  env: string;
+  /** Whether the command answers `--json`. */
+  json: boolean;
+  /** Whether this run is a `--rollback`. */
+  rollback: boolean;
+  /** The `--confirm-rollback` value, when one was passed. */
+  flagged?: string;
+  /** The group the rollback reverses, for the prompt to name. */
+  group?: string;
+}
+
+/**
+ * The phrase a rollback is confirmed with: the flag wherever it is present, a person at a terminal
+ * otherwise, and nothing when nobody may be asked — which `assertRollbackConfirmed` refuses as
+ * `core/person_required`, naming `--confirm-rollback` (#697). Ctrl-C at the prompt ends the run, exit 130.
+ */
+export async function rollbackPhrase(options: RollbackPhraseOptions): Promise<string | undefined> {
+  if (!options.rollback || options.flagged !== undefined) return options.flagged;
+  return promptRollback(options.env, options.json, options.group);
+}
+
+const Target = z
+  .object({
+    binding: z.string().describe("The D1 binding, as `wrangler.jsonc` declares it."),
+    database: z.string().describe("The database name: a capability's `databases` key."),
+  })
+  .describe("One database in scope.");
+
+/** `pithy migrate --json`: the run, grouped per Worker — and, on a run that died partway, how far it got. */
+const MigratePayload = z
+  .object({
+    command: z.literal("migrate").describe('`"migrate"`.'),
+    project: z.string().describe("The project every migrated database is stamped with."),
+    env: z.string().describe("The environment migrated."),
+    rollback: z.boolean().describe("Whether this run reversed a group."),
+    group: z
+      .string()
+      .optional()
+      .describe(
+        "The run's group: the `--group` named, or the timestamp it generated. Absent from a refused rollback, and from a forward `--dry-run` that names no `--group`.",
+      ),
+    workers: z
+      .array(
+        z
+          .object({
+            worker: z.string().describe("The Worker's name."),
+            databases: z.array(DatabaseRun).describe("Its databases, in registry order."),
+          })
+          .describe("One Worker's slice of the run."),
+      )
+      .describe(
+        "Every Worker, in fan-out order. On an interrupted run, only what completed. Empty under `--dry-run`, which runs nothing.",
+      ),
+    failed: Target.optional().describe("The database the run died on. Present only when `interrupted`."),
+    unreached: z
+      .array(Target)
+      .optional()
+      .describe("Every database the run never opened. Present only when `interrupted`."),
+    interrupted: z.literal(true).optional().describe("Present only on a run that failed partway."),
+    dryRun: z.boolean().describe("Whether this was `--dry-run`. Nothing was applied or reversed when it is `true`."),
+    plan: PlanKey,
+  })
+  .describe("What `pithy migrate` applied or reversed, or under `--dry-run` would.");
+
+export default withContract(
+  defineCommand({
+    meta: { name: "migrate", description: "Run migrations for an environment" },
+    args: {
+      env: ENV_ARG,
+      worker: { type: "string", description: "Migrate one worker instead of every worker in apps/" },
+      binding: { type: "string", description: "Migrate only the database behind this D1 binding" },
+      group: {
+        type: "string",
+        description:
+          "Name the group this run applies under, instead of the timestamp it would generate. Required by --rollback, which reverses the named group",
+      },
+      rollback: {
+        type: "boolean",
+        default: false,
+        description:
+          "Reverse the --group named, in every database in scope (narrow with --worker and --binding). Refuses without a group, and refuses to drop rows in retained tables",
+      },
+      "confirm-rollback": {
+        type: "string",
+        description: 'Unlock a non-dev rollback non-interactively: "yes, i really want to roll back <env>"',
+      },
+      "destroy-retained": { type: "string", description: DESTROY_RETAINED_DESCRIPTION },
+      "dry-run": DRY_RUN_ARG,
+      json: { type: "boolean", default: false, description: "Machine-readable output" },
     },
-    rollback: {
-      type: "boolean",
-      default: false,
-      description:
-        "Reverse the --group named, in every database in scope (narrow with --worker and --binding). Refuses without a group, and refuses to drop rows in retained tables",
-    },
-    "confirm-rollback": {
-      type: "string",
-      description: 'Unlock a non-dev rollback non-interactively: "yes, i really want to roll back <env>"',
-    },
-    "destroy-retained": { type: "string", description: DESTROY_RETAINED_DESCRIPTION },
-    json: { type: "boolean", default: false, description: "Machine-readable output" },
-  },
-  run: ({ args }) =>
-    withErrorReporting(args.json, async () => {
-      const env = requireEnvironment(args.env);
-      const projectDir = process.cwd();
-      // The non-guessing name: it is stamped into every database this run touches, and a later run
-      // checks against it, so a fallback that differs between checkouts would lock a project out of
-      // its own database. `requireProjectName` refuses to guess (docs/CLI.md §3.3).
-      const project = requireProjectName(await loadProject(projectDir));
-      // And the account this project belongs to, before anything resolves a credential. `migrateProject`
-      // states the hazard in its own words: a remote migration alters a real schema, so the wrong
-      // account's credentials would run it against another company's database (#206). This command is
-      // the one that has to supply the answer, and for a long while it did not.
-      const account = await projectCloudflareAccount(projectDir);
-      // One group for the whole run. A forward run that names none is stamped with the moment it ran —
-      // resolved here, so the line this command prints and the value the run records are the same one. A
-      // rollback is handed exactly what the operator passed: none is the refusal, not a new group (#694).
-      const named = requireMigrationGroup(args.group);
-      const group = args.rollback ? named : (named ?? generatedMigrationGroup());
-      const render = {
-        project,
-        env,
-        rollback: args.rollback,
-        json: args.json,
-        ...(group !== undefined ? { group } : {}),
-      };
-      const destroyRetained = parseDestroyRetained(args["destroy-retained"]);
-      // A rollback outside dev is asked for in words (#588). The flag wins wherever it is present; a
-      // terminal without it is asked; a script without it is refused by `migrateProject`, which checks.
-      const confirmRollback =
-        args.rollback && args["confirm-rollback"] === undefined
-          ? await promptRollback(env, args.json, group)
-          : args["confirm-rollback"];
-      let workers: WorkerMigrationRun[];
-      try {
-        workers = await migrateProject({
+    run: ({ args }) =>
+      withErrorReporting(args.json, async () => {
+        const env = requireEnvironment(args.env);
+        const projectDir = process.cwd();
+        // The non-guessing name: it is stamped into every database this run touches, and a later run
+        // checks against it, so a fallback that differs between checkouts would lock a project out of
+        // its own database. `requireProjectName` refuses to guess (docs/CLI.md §3.3).
+        const config = await loadProject(projectDir);
+        const project = requireProjectName(config);
+        // And the account this project belongs to, before anything resolves a credential. `migrateProject`
+        // states the hazard in its own words: a remote migration alters a real schema, so the wrong
+        // account's credentials would run it against another company's database (#206). This command is
+        // the one that has to supply the answer, and for a long while it did not.
+        const account = await projectCloudflareAccount(projectDir);
+        // One group for the whole run. A forward run that names none is stamped with the moment it ran —
+        // resolved here, so the line this command prints and the value the run records are the same one. A
+        // rollback is handed exactly what the operator passed: none is the refusal, not a new group (#694).
+        const named = requireMigrationGroup(args.group);
+        const dryRun = args["dry-run"];
+        // A plan applies nothing, so it generates no group: one it named would never be the group the real
+        // run records, and an agent handed it would reverse nothing with it.
+        const group = args.rollback || dryRun ? named : (named ?? generatedMigrationGroup());
+        const render = {
+          project,
+          env,
+          rollback: args.rollback,
+          json: args.json,
+          ...(group !== undefined ? { group } : {}),
+        };
+        const destroyRetained = parseDestroyRetained(args["destroy-retained"]);
+        const scope = {
           projectDir,
           project,
           account,
           env,
+          // The caller's own run, the one input a refusal naming it again is built from (#711).
+          caller: callerOf("migrate", args),
           ...(args.worker !== undefined ? { worker: args.worker } : {}),
           ...(args.binding !== undefined ? { binding: args.binding } : {}),
           ...(group !== undefined ? { group } : {}),
           rollback: args.rollback,
-          ...(confirmRollback !== undefined ? { confirmRollback } : {}),
           ...(destroyRetained !== undefined ? { destroyRetained } : {}),
+          ...(config.seed?.productionEnvironments
+            ? { productionEnvironments: config.seed.productionEnvironments }
+            : {}),
+        };
+        if (dryRun) {
+          // Before the rollback phrase: a plan reverses nothing, so there is nothing for anybody to agree to.
+          const migrations = await planMigrateProject(scope);
+          process.stdout.write(formatMigratePlan({ ...emptyPlan(), migrations }, render));
+          return;
+        }
+        // A rollback outside dev is asked for in words (#588). The flag wins wherever it is present; a
+        // terminal without it is asked; a script without it is refused by `migrateProject`, which checks.
+        const confirmRollback = await rollbackPhrase({
+          env,
+          json: args.json,
+          rollback: args.rollback,
+          ...(args["confirm-rollback"] === undefined ? {} : { flagged: args["confirm-rollback"] }),
+          ...(group === undefined ? {} : { group }),
         });
-      } catch (error) {
-        // A run that failed on the third database has already moved the first two, and until #380 the
-        // report of it died with the throw. What ran is printed here, then the same error is rethrown
-        // unchanged for `withErrorReporting` to render and exit 1 on.
-        const progress = migratedBeforeFailure(error);
-        if (progress) process.stdout.write(formatMigrateProgress(progress, render));
-        throw error;
-      }
-      process.stdout.write(formatMigrateReport(workers, render));
-    }),
-});
+        let workers: WorkerMigrationRun[];
+        try {
+          workers = await migrateProject({ ...scope, ...(confirmRollback !== undefined ? { confirmRollback } : {}) });
+        } catch (error) {
+          // A run that failed on the third database has already moved the first two, and until #380 the
+          // report of it died with the throw. What ran is printed here, then the same error is rethrown
+          // unchanged for `withErrorReporting` to render and exit by its kind.
+          const progress = migratedBeforeFailure(error);
+          if (progress) process.stdout.write(formatMigrateProgress(progress, render));
+          throw error;
+        }
+        process.stdout.write(formatMigrateReport(workers, render));
+      }),
+  }),
+  {
+    output: "document",
+    schemaVersion: 1,
+    payload: MigratePayload,
+    mutates: true,
+    idempotent: true,
+    needsNetwork: true,
+    flagGroups: [
+      {
+        kind: "requires",
+        flag: "--rollback",
+        needs: ["--group"],
+        any: false,
+        rule: "--rollback reverses a named group, so it needs --group.",
+      },
+    ],
+  },
+);

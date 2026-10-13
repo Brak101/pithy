@@ -221,6 +221,8 @@ describe("doctor reports each environment's migrations from that environment", (
       { env: "qa", state: "not-composed" },
     ]);
     // The same answers are what `--json` carries: no second rendering of them substitutes one for another.
+    // Each with its `fix` beside it (#697): pending is migrate, an environment with no database its
+    // provision — none for prod, whose provision is a person's — and a config that did not compose, nothing.
     expect(
       (renderDoctorJson(report).project as { health: ProjectHealth }).health.workers.map((worker) =>
         worker.state === "checked" ? worker.migrations : null,
@@ -229,15 +231,35 @@ describe("doctor reports each environment's migrations from that environment", (
       {
         ok: false,
         environments: [
-          { env: "dev", state: "checked", ledger: { state: "read", pending: 1, undeclared: [] } },
-          { env: "staging", state: "checked", ledger: { state: "read", pending: 2, undeclared: [] } },
-          { env: "prod", state: "not-provisioned", unprovisioned: [{ database: "app", binding: "DB" }] },
-          { env: "qa", state: "not-composed" },
+          {
+            env: "dev",
+            state: "checked",
+            ledger: { state: "read", pending: 1, undeclared: [] },
+            fix: "pithy migrate --env dev",
+          },
+          {
+            env: "staging",
+            state: "checked",
+            ledger: { state: "read", pending: 2, undeclared: [] },
+            fix: "pithy migrate --env staging",
+          },
+          {
+            env: "prod",
+            state: "not-provisioned",
+            unprovisioned: [{ database: "app", binding: "DB" }],
+            fix: null,
+          },
+          { env: "qa", state: "not-composed", fix: null },
         ],
       },
       {
         ok: false,
-        environments: ["dev", "staging", "prod", "qa"].map((env) => ({ env, state: "checked", ledger: three })),
+        environments: ["dev", "staging", "prod", "qa"].map((env) => ({
+          env,
+          state: "checked",
+          ledger: three,
+          fix: `pithy migrate --env ${env}`,
+        })),
       },
     ]);
 
@@ -245,7 +267,7 @@ describe("doctor reports each environment's migrations from that environment", (
     expect(lines).toEqual([
       "    migrations   dev: 1 pending — run: pithy migrate --env dev",
       "                 staging: 2 pending — run: pithy migrate --env staging",
-      "                 prod: DB (app) not provisioned — run: pithy provision --env prod",
+      "                 prod: DB (app) not provisioned — `pithy provision --env prod --yes` with its --confirm phrase, which only a person gives, runs against prod, a production environment. That is a person's decision, not a fix.",
       "                 qa: couldn't be checked — pithy.config.ts does not compose for qa",
     ]);
     // Stated as the rule, over whatever lines there are: a command on an environment's line names that
@@ -283,7 +305,7 @@ describe("doctor reports each environment's migrations from that environment", (
     expect(migrationLines(renderDoctorText(report, "/home/u"))).toEqual([
       "    migrations   dev: 1 pending — run: pithy migrate --env dev",
       "                 staging: skipped — offline, so no database was read",
-      "                 prod: DB (app) not provisioned — run: pithy provision --env prod",
+      "                 prod: DB (app) not provisioned — `pithy provision --env prod --yes` with its --confirm phrase, which only a person gives, runs against prod, a production environment. That is a person's decision, not a fix.",
       "                 qa: couldn't be checked — pithy.config.ts does not compose for qa",
     ]);
   });

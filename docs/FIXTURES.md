@@ -34,7 +34,7 @@ It runs there rather than in a suite hook for the reason the debris sweep does: 
 
 ## Where the values go
 
-Either a gitignored `packages/cloudflare/.dev.vars`, or plain environment variables. The file wins where both state a key. CI passes them as variables and has no file.
+Either a gitignored `packages/cloudflare/.dev.vars`, or plain environment variables. The file wins where both state a key. CI passes them as variables and has no file. A variable reaches a suite run through turbo only if `test:integration` lists it in `passThroughEnv` in `turbo.jsonc`.
 
 ```sh
 CLOUDFLARE_ACCOUNT_ID=…
@@ -57,7 +57,7 @@ describe.skipIf(!fixtureReady("turnstile-widget"))("turnstile — LIVE", () => {
 
 `fixtureReady` is the only gate. Do not read `process.env` in a live suite: a second spelling of a fixture is a fixture the report cannot see, and a suite the report cannot explain.
 
-Adding a fixture means adding an entry to `LIVE_FIXTURES` in `packages/cloudflare/src/test-utils/fixtures.ts` **and** a section here. A test fails if a fixture's `doc` points at a heading this file does not have.
+Adding a fixture means adding an entry to `LIVE_FIXTURES` in `packages/cloudflare/src/test-utils/fixtures.ts`, a section here, **and** its variables to `test:integration`'s `passThroughEnv` in `turbo.jsonc`. A test fails if a fixture's `doc` points at a heading this file does not have, and `packages/cli/src/ci/integrationBuild.test.ts` fails if a fixture's variable is not handed through.
 
 ---
 
@@ -139,7 +139,7 @@ It arms the secrets round trip — provision, write, rotate, audit, teardown —
 Every name it touches is composed under the reserved project `pithy-int-test`, so teardown can only ever address its own.
 
 ```sh
-PITHY_LIVE_DEPLOY=1 bun run --filter @pithy-sh/cli test:integration
+PITHY_LIVE_DEPLOY=1 bunx turbo run test:integration --filter=@pithy-sh/cli
 ```
 
 **Make it.** Nothing to make. Set the variable when you mean it.
@@ -193,13 +193,13 @@ A real Turnstile widget. Unlocks the real-widget half of the sign-in gating suit
 
 One zone on the account, named the way a Worker's `domains` declaration names it — the registrable domain, `example.com`, not a zone id. Unlocks the route-scoped CI token round trip (#651).
 
-**What it proves.** `pithy token mint ci-system` now puts a second, zone-scoped policy on the token — Workers Routes Write, on exactly the zones the project's declared domains sit in — because `pithy deploy` of an environment with a custom domain ends in `POST /zones/<zone>/workers/routes` and the account-scoped token could not make that call. Nothing local can prove the grant is the right one: the permission-group name, its scope, and whether Cloudflare accepts an account policy and a zone policy on one token are all facts about the account. So the suite mints both shapes — the token as it was, and the token as it is — deploys a throwaway Worker under the minted credential, and attaches a real route with each. The old shape must be refused and the new one must work, or the fix is not a fix.
+**What it proves.** `pithy token mint ci-system` now puts a second, zone-scoped policy on the token — Workers Routes Write, on exactly the zones the project's declared domains sit in — because `pithy deploy` of an environment with a custom domain ends in `POST /zones/<zone>/workers/routes` and the account-scoped token could not make that call. Nothing local can prove the grant is the right one: the permission-group name, its scope, and whether Cloudflare accepts an account policy and a zone policy on one token are all facts about the account. So the suite mints both shapes — the token as it was, and the token as it is — deploys a throwaway Worker under the minted credential, and points each at the zone's routes, read and write. The old shape must be refused there and the new one must work, or the fix is not a fix. The new shape then attaches the custom domain too, which proves the added zone policy costs the deploy's other call nothing.
 
 **It already exists on the maintainer account.** Any of `pithy-sh.com`, `pithy.run`, `pithysh.com` will do. Set the **name**, not the id — the resolver looks a declared zone up by name against the account's own list, and naming it here exercises that lookup.
 
 Do not use `pithy.sh`: its apex MX is Google Workspace and it carries real mail.
 
-**What it creates, and what it removes.** A Workers route is not a DNS record, so the throwaway `pithy-int-…/<zone>/*` pattern resolves nowhere. The **custom domain** is different: attaching one creates a proxied DNS record on the zone and starts certificate issuance for `pithy-int-….<zone>`. It is covered because it is the endpoint a declared domain is actually attached with — `PUT /accounts/<id>/workers/domains`, an account path whose grant is nonetheless the *zone's* `Workers Routes Write` ([Workers roles and permissions](https://developers.cloudflare.com/workers/authorization/workers/)) — and a suite that only wrote the zone route would pass green through a regression there.
+**What it creates, and what it removes.** A Workers route is not a DNS record, so the throwaway `pithy-int-…/<zone>/*` pattern resolves nowhere. The **custom domain** is different: attaching one creates a proxied DNS record on the zone and starts certificate issuance for `pithy-int-….<zone>`. It is covered because it is the endpoint a declared domain is actually attached with — `PUT /accounts/<id>/workers/domains` — and the token `ci-system` now mints must still make that call. **Its grant is account-scoped, measured.** Cloudflare's [Workers roles and permissions](https://developers.cloudflare.com/workers/authorization/workers/) says a custom domain needs the zone's `Workers Routes Write`, and this suite asserted the old shape refused until its first live run (integration.yml run 38323817975, #709) watched the account-only token attach the domain. So the custom domain has no negative control: the zone grant is for the route calls, and only they can show the old shape falling short.
 
 The domain, the route, the script and both tokens are removed in a teardown that runs unconditionally, looks each one up rather than trusting an id captured mid-test, polls through a list that has not caught up, and **names on stderr anything it could not delete _or could not confirm gone_** — a read that errored is not an absence, and neither is a write this run made that the list does not show yet. Read the end of a failed run before assuming the account is clean.
 

@@ -7,9 +7,20 @@ import { promisify } from "node:util";
 import { ValidationError } from "@pithy-sh/core/src/error/pithyError";
 import type { ArgsDef, CommandDef } from "citty";
 import { describe, expect, test } from "vitest";
-import { flagsOf, refusePrettyFlags, refuseUndeclaredFlags, undeclaredFlags } from "./declaredFlags";
+import {
+  asksForJson,
+  flagsOf,
+  refuseEventsFlag,
+  refuseJsonFlag,
+  refuseNoInputFlag,
+  refusePrettyFlags,
+  refuseUndeclaredFlags,
+  undeclaredFlags,
+} from "./declaredFlags";
 import { ownNamesOnly } from "./dispatch";
 import { main } from "./main";
+import { EXIT } from "./terminal/exitClass";
+import { resolveInputForbidden } from "./terminal/inputMode";
 
 const run = promisify(execFile);
 const bin = join(import.meta.dirname, "bin.ts");
@@ -231,12 +242,27 @@ describe("refuseUndeclaredFlags", () => {
     ]);
   });
 
-  test("names every undeclared flag, and says so when a command takes none", async () => {
+  // `--help`, `--version`, `--pretty` and `--no-input` work on every command, a group's and the root included, so
+  // "takes no flags" sent a caller away from flags that would have worked (#697).
+  test("names every undeclared flag, and points a command with none of its own at the global ones", async () => {
     const error = (await refuseUndeclaredFlags(tree, ["token", "mint", "--a", "--b"]).catch((e: unknown) => e)) as
       | ValidationError
       | undefined;
     expect(error?.payload.message).toBe("Unknown flags: --a, --b.");
-    expect(error?.payload.action).toBe("`pithy token mint` takes no flags.");
+    expect(error?.payload.action).toBe(
+      "`pithy token mint` takes only the global flags, which `pithy schema --json` lists.",
+    );
+    const group = (await refuseUndeclaredFlags(tree, ["token", "--a"]).catch((e: unknown) => e)) as ValidationError;
+    expect(group.payload.action).toBe("`pithy token` takes only the global flags, which `pithy schema --json` lists.");
+  });
+
+  // The command is named by the builder (#711), so a path the CLI does not have is refused rather than spelled, and
+  // the root — no command at all — is named as the binary.
+  test("names the command through the builder, the root included", async () => {
+    const root = (await refuseUndeclaredFlags(tree, ["--a"]).catch((e: unknown) => e)) as ValidationError;
+    expect(root.payload.action).toBe("`pithy` takes only the global flags, which `pithy schema --json` lists.");
+    const unknown: CommandDef = { meta: { name: "pithy" }, subCommands: { frobnicate: { run: () => {} } } };
+    await expect(refuseUndeclaredFlags(unknown, ["frobnicate", "--a"])).rejects.toThrow(/not a command/);
   });
 
   test("an invocation whose flags are all declared passes", async () => {
@@ -374,9 +400,9 @@ async function pithy(...args: string[]): Promise<{ code: number; stdout: string;
 }
 
 describe("the real bin", () => {
-  test("`pithy doctor --bogus-flag yes` exits 1 naming the flag and doctor's real flags", async () => {
+  test("`pithy doctor --bogus-flag yes` exits 2 naming the flag and doctor's real flags", async () => {
     const { code, stdout, stderr } = await pithy("doctor", "--bogus-flag", "yes");
-    expect(code).toBe(1);
+    expect(code).toBe(EXIT.usage);
     expect(stdout).toBe("");
     expect(stderr).toContain("Unknown flag: --bogus-flag.");
     expect(stderr).toContain("`pithy doctor` takes --worker,");
@@ -385,7 +411,7 @@ describe("the real bin", () => {
 
   test("`--json` reports the refusal as one machine-readable line", async () => {
     const { code, stdout, stderr } = await pithy("doctor", "--json", "--bogus-flag", "yes");
-    expect(code).toBe(1);
+    expect(code).toBe(EXIT.usage);
     expect(stdout).toBe("");
     const lines = stderr.trim().split("\n");
     expect(lines).toHaveLength(1);
@@ -394,16 +420,24 @@ describe("the real bin", () => {
     expect(error.message).toBe("Unknown flag: --bogus-flag.");
   }, 120_000);
 
+  /** citty reads `--json --no-json` as no JSON, so the refusal is text too — one reading, not two (#697 review). */
+  test("`--json --no-json` reports the refusal as text, the way the command would have rendered", async () => {
+    const { code, stderr } = await pithy("doctor", "--json", "--no-json", "--bogus-flag");
+    expect(code).toBe(EXIT.usage);
+    expect(stderr).toContain("Unknown flag: --bogus-flag.");
+    expect(stderr.trimStart().startsWith("{")).toBe(false);
+  }, 120_000);
+
   test("a typo after a positional is refused before the command runs", async () => {
     const { code, stdout, stderr } = await pithy("token", "rotate", "ci-system", "--env", "prod", "--keep-previos");
-    expect(code).toBe(1);
+    expect(code).toBe(EXIT.usage);
     expect(stdout).toBe("");
     expect(stderr).toContain("Unknown flag: --keep-previos.");
   }, 120_000);
 
   test("a group given a flag is refused rather than answered with its usage", async () => {
     const { code, stderr } = await pithy("token", "--bogus-flag");
-    expect(code).toBe(1);
+    expect(code).toBe(EXIT.usage);
     expect(stderr).toContain("Unknown flag: --bogus-flag.");
   }, 120_000);
 
@@ -415,7 +449,7 @@ describe("the real bin", () => {
   test("a flag answered before any command runs does not hide an undeclared one", async () => {
     for (const early of ["--version", "--pithiest"]) {
       const { code, stdout, stderr } = await pithy("doctor", "--bogus-flag", early);
-      expect(`${early}: exit ${code}`).toBe(`${early}: exit 1`);
+      expect(`${early}: exit ${code}`).toBe(`${early}: exit ${EXIT.usage}`);
       expect(stdout).toBe("");
       expect(stderr).toContain("--bogus-flag");
     }
@@ -569,4 +603,214 @@ describe("the dev logs reader", () => {
     expect(() => refusePrettyFlags(["dev", "logs", "--no-pretty"])).toThrow(ValidationError);
     expect(() => refusePrettyFlags(["dev", "logs", "--json", "--pretty"])).not.toThrow();
   });
+});
+
+/** `--no-input` needs no `--json`, but a value it cannot mean is refused rather than ignored (#697). */
+describe("refuseNoInputFlag", () => {
+  test("the bare flag and =true / =false pass, on any command, with or without --json", () => {
+    expect(() => refuseNoInputFlag(["init", "--no-input"])).not.toThrow();
+    expect(() => refuseNoInputFlag(["init", "--no-input=false", "--json"])).not.toThrow();
+    expect(() => refuseNoInputFlag(["remove", "auth", "--no-input=true"])).not.toThrow();
+  });
+
+  test("a malformed value is refused, naming the token and the spellings it takes", () => {
+    let thrown: unknown;
+    try {
+      refuseNoInputFlag(["init", "--no-input=1"]);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(ValidationError);
+    const payload = (thrown as ValidationError).payload;
+    expect(payload.message).toBe("--no-input=1 is not a value --no-input takes.");
+    expect(payload.action).toBe("Write --no-input on its own, or --no-input=true or --no-input=false.");
+    expect(payload.issues[0]?.path).toEqual(["--no-input"]);
+  });
+
+  test("--no-input is declared on every command, so the undeclared-flag check lets it through", async () => {
+    expect(await undeclaredFlags(ownNamesOnly(main), ["add", "auth", "--no-input"])).toBeNull();
+    expect(await undeclaredFlags(ownNamesOnly(main), ["worker", "list", "--no-input=false"])).toBeNull();
+  });
+});
+
+/**
+ * **`--events` streams progress as `--json` records, so without `--json` there is nothing to stream it into
+ * (#697).** Refused in one place, as `--pretty` is. `deploy` and `provision` are the commands that declare it;
+ * every other command refuses it as undeclared before this rule is asked.
+ */
+/**
+ * **`--json` is read once, the way citty parses it (#697 review).** `asksForJson` decides the shape of a refusal and
+ * whether prompts are forbidden; the command reads its own `args.json` from citty. A bare `--no-json` wins wherever
+ * it is, so `--json --no-json` is a text run with prompts allowed — it was a JSON refusal line with prompts
+ * forbidden, beside a command that rendered text.
+ */
+describe("asksForJson", () => {
+  test("--json --no-json is not a JSON run, and does not forbid prompts", () => {
+    expect(asksForJson(["init", "--json", "--no-json"])).toBe(false);
+    expect(resolveInputForbidden({ json: asksForJson(["init", "--json", "--no-json"]) })).toBe(false);
+    expect(asksForJson(["init", "--no-json", "--json"])).toBe(false);
+  });
+
+  test("reads --json, --json=true and --json=<anything but false> as on, as citty does", () => {
+    expect(asksForJson(["doctor", "--json"])).toBe(true);
+    expect(asksForJson(["doctor", "--json=true"])).toBe(true);
+    expect(asksForJson(["doctor", "--json=false"])).toBe(false);
+    expect(asksForJson(["doctor", "--json=false", "--json"])).toBe(true);
+    expect(asksForJson(["dev", "--", "--json"])).toBe(false);
+  });
+});
+
+describe("refuseJsonFlag", () => {
+  test("says nothing for the spellings citty reads as written", () => {
+    for (const argv of [[], ["--json"], ["--no-json"], ["--json=true"], ["--json=false"], ["--json", "--no-json"]]) {
+      expect(() => refuseJsonFlag(argv)).not.toThrow();
+    }
+  });
+
+  test("refuses a value citty would read as on whatever it says, and a --no-json it would not read at all", () => {
+    for (const token of ["--json=maybe", "--json=", "--no-json=true", "--no-json=false"]) {
+      let thrown: unknown;
+      try {
+        refuseJsonFlag(["doctor", token]);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(ValidationError);
+      const { payload } = thrown as ValidationError;
+      expect(payload.message).toBe(`${token} is not a spelling --json takes.`);
+      expect(payload.action).toBe("Write --json, --no-json, --json=true or --json=false.");
+    }
+    expect(() => refuseJsonFlag(["dev", "--", "--json=maybe"])).not.toThrow();
+  });
+});
+
+describe("refuseEventsFlag", () => {
+  test("says nothing when it is not typed, or is typed beside --json", () => {
+    expect(() => refuseEventsFlag(["deploy"])).not.toThrow();
+    expect(() => refuseEventsFlag(["deploy", "--json", "--events"])).not.toThrow();
+    expect(() => refuseEventsFlag(["--events", "provision", "--env", "staging", "--json"])).not.toThrow();
+    expect(() => refuseEventsFlag(["deploy", "--json=true", "--events=true"])).not.toThrow();
+  });
+
+  test("the spellings that ask for nothing ask for nothing to stream, so they pass alone", () => {
+    expect(() => refuseEventsFlag(["deploy", "--no-events"])).not.toThrow();
+    expect(() => refuseEventsFlag(["deploy", "--events=false"])).not.toThrow();
+  });
+
+  test("refuses --events alone, in exactly the words the issue promises", () => {
+    let thrown: unknown;
+    try {
+      refuseEventsFlag(["deploy", "--env", "staging", "--events"]);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(ValidationError);
+    const { payload } = thrown as ValidationError;
+    expect(payload.message).toBe("--events needs --json.");
+    expect(payload.action).toBe("Add --json, or drop --events.");
+    expect(payload.issues[0]?.path).toEqual(["--events"]);
+  });
+
+  test("refuses a value that is neither true nor false, as --pretty does, before the --json rule", () => {
+    for (const token of ["--events=maybe", "--events=", "--events=1"]) {
+      let thrown: unknown;
+      try {
+        refuseEventsFlag(["deploy", "--json", token]);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(ValidationError);
+      const { payload } = thrown as ValidationError;
+      const [name] = token.split("=") as [string];
+      expect(payload.message).toBe(`${token} is not a value ${name} takes.`);
+      expect(payload.action).toBe(`Write ${name} on its own, or ${name}=true or ${name}=false.`);
+      expect(payload.issues[0]).toMatchObject({ path: [name], code: "invalid_value" });
+    }
+    // The value is the more specific mistake, so it is reported even where --json is missing too.
+    expect(() => refuseEventsFlag(["deploy", "--events=maybe"])).toThrow(
+      "--events=maybe is not a value --events takes.",
+    );
+  });
+
+  test("passes every well-formed spelling beside --json, and --eventsx, which is not its token", () => {
+    for (const token of ["--events", "--no-events", "--events=true", "--events=false", "--eventsx=1"]) {
+      expect(() => refuseEventsFlag(["deploy", "--json", token]), token).not.toThrow();
+    }
+  });
+
+  test("names the first malformed token, not a later one", () => {
+    expect(() => refuseEventsFlag(["deploy", "--json", "--events=maybe", "--events=1"])).toThrow(
+      "--events=maybe is not a value --events takes.",
+    );
+  });
+
+  /** citty ignores `--no-events=<value>` outright, so the bin may not read it either way. */
+  test("refuses a --no-events carrying any value, as a spelling citty does not read", () => {
+    for (const argv of [
+      ["provision", "--no-events=1"],
+      ["deploy", "--json", "--events", "--no-events=true"],
+      ["deploy", "--no-events=false"],
+    ]) {
+      const token = argv.find((arg) => arg.startsWith("--no-events=")) as string;
+      expect(() => refuseEventsFlag(argv), token).toThrow(`${token} is not a spelling --events takes.`);
+    }
+  });
+
+  test("a malformed value after `--` is payload, not a flag", () => {
+    expect(() => refuseEventsFlag(["dev", "--", "--events=maybe"])).not.toThrow();
+    expect(() => refuseEventsFlag(["deploy", "--json", "--", "--no-events=false"])).not.toThrow();
+  });
+
+  /**
+   * **`--events --no-events=true` declines (#697 review).** citty ignores `--no-events=<value>` and would stream; a
+   * reader that took it as "off" would let the run through on a reading the command never makes. So the token is
+   * refused, with the spellings that do work, and nothing streams.
+   */
+  test("--no-events with a value is refused, because citty would read --events past it", () => {
+    for (const argv of [
+      ["deploy", "--json", "--events", "--no-events=true"],
+      ["deploy", "--events", "--no-events=true"],
+      ["deploy", "--json", "--no-events=false"],
+    ]) {
+      let thrown: unknown;
+      try {
+        refuseEventsFlag(argv);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(ValidationError);
+      const { payload } = thrown as ValidationError;
+      const token = argv.find((entry) => entry.startsWith("--no-events=")) as string;
+      expect(payload.message).toBe(`${token} is not a spelling --events takes.`);
+      expect(payload.action).toBe("Write --events, --no-events, --events=true or --events=false.");
+      expect(payload.issues[0]).toMatchObject({ path: ["--no-events"], code: "invalid_value" });
+    }
+  });
+
+  test("--json=false is not --json, and an --events after `--` is not a flag", () => {
+    expect(() => refuseEventsFlag(["provision", "--json=false", "--events"])).toThrow(ValidationError);
+    expect(() => refuseEventsFlag(["dev", "--", "--events"])).not.toThrow();
+  });
+
+  /** citty applies a bare `--no-json` after everything else, so it wins wherever it is typed (`booleanToken.ts`). */
+  test("--json is read as citty reads it: a bare --no-json anywhere, else the last --json", () => {
+    expect(() => refuseEventsFlag(["deploy", "--json", "--no-json", "--events"])).toThrow(ValidationError);
+    expect(() => refuseEventsFlag(["deploy", "--no-json", "--json", "--events"])).toThrow(ValidationError);
+    expect(() => refuseEventsFlag(["deploy", "--json", "--json=false", "--events"])).toThrow(ValidationError);
+    expect(() => refuseEventsFlag(["deploy", "--json=false", "--json", "--events"])).not.toThrow();
+  });
+
+  test("only deploy and provision declare it, so the undeclared-flag check refuses it everywhere else", async () => {
+    const root = ownNamesOnly(main);
+    expect(await undeclaredFlags(root, ["deploy", "--json", "--events"])).toBeNull();
+    expect(await undeclaredFlags(root, ["provision", "--env", "staging", "--json", "--events"])).toBeNull();
+    expect((await undeclaredFlags(root, ["migrate", "--json", "--events"]))?.undeclared).toEqual(["--events"]);
+  });
+
+  test("the real bin refuses it before deploy runs, as a usage error", async () => {
+    const { code, stdout, stderr } = await pithy("deploy", "--events");
+    expect(code).toBe(EXIT.usage);
+    expect(stdout).toBe("");
+    expect(stderr).toContain("--events needs --json.");
+  }, 120_000);
 });

@@ -2,13 +2,19 @@
 // SPDX-License-Identifier: MIT
 
 import { readdir } from "node:fs/promises";
-import { basename, join, sep } from "node:path";
-import { ConflictError, NotFoundError, ValidationError } from "@pithy-sh/core/src/error/pithyError";
+import { join, sep } from "node:path";
+import type { WorkerDir } from "@pithy-sh/core/src/cli/command";
+import { commandAlternatives, pithyCommand } from "@pithy-sh/core/src/cli/command";
+import { ConflictError, NotFoundError } from "@pithy-sh/core/src/error/pithyError";
+import { capabilityNotComposed } from "../capabilities/notComposed";
+import { emptyPlan, type Plan } from "../plan/plan";
+import { inShadow } from "../plan/shadow";
 import { allCapabilities, projectEnvironments, type WorkerConfig } from "../project/config";
 import { detectPackageManager, type PackageManager } from "../project/packageManager";
 import { readOptionalFile } from "../project/readOptionalFile";
 import { withRollback } from "../project/rollback";
 import { pathExists } from "../project/scaffold";
+import { workerDirName } from "../project/workerIdentity";
 import { deriveWorkerFirst, uncoveredRoutes } from "./routeAllowlist";
 import { scaffoldFiles } from "./scaffold";
 import { PITHY_SCREEN_DIR, unstyledScreenClasses } from "./screenStyles";
@@ -56,8 +62,8 @@ export type UiScreenPrompt = (request: { screens: UiScreenSet; suggestion: boole
  * Everything below is either a path or a `--worker` value, and both are the directory. The deployed name
  * belongs in `wrangler.jsonc` and nowhere else.
  */
-function workerName(workerDir: string): string {
-  return basename(workerDir);
+function workerName(workerDir: string): WorkerDir {
+  return workerDirName({ dir: workerDir });
 }
 
 /** One entry of `pithy ui list`. */
@@ -98,12 +104,14 @@ export interface UiAddOptions {
   prompt?: UiScreenPrompt;
   /** Package-manager override. Tests set it; otherwise it is detected from the project's lockfile. */
   packageManager?: PackageManager;
+  /** Make every write in a copy of the project and report the difference as `plan`, writing nothing here. */
+  dryRun?: boolean;
 }
 
 /** What `pithy ui add` did. */
 export interface UiAddReport {
-  /** The worker the front end landed in. */
-  worker: string;
+  /** The worker the front end landed in, by its `apps/` directory. */
+  worker: WorkerDir;
   /** The stub that wrote it. */
   framework: string;
   /** Whether the auth template was included. */
@@ -140,6 +148,8 @@ export interface UiAddReport {
   devDependencies: string[];
   /** Script names added (or superseded, for a `dev` that still held `wrangler dev`). */
   scripts: string[];
+  /** What a `--dry-run` would write. Only under `dryRun`, where every other field is the prediction. */
+  plan?: Plan;
 }
 
 /**
@@ -162,10 +172,14 @@ async function resolveScreens(
     wanted = options.prompt ? await options.prompt({ screens, suggestion: composed }) : composed;
   if (wanted && !composed) {
     const worker = workerName(options.workerDir);
-    throw new ValidationError({
-      message: `The ${screens} screens need the ${screens} capability, and ${worker} doesn't compose it.`,
-      action: `Run pithy add ${screens} --worker ${worker} first, or leave them out with --no-${screens}.`,
-    });
+    throw capabilityNotComposed(
+      screens,
+      {
+        message: `The ${screens} screens need the ${screens} capability, and ${worker} doesn't compose it.`,
+        action: (add) => `Run ${add} first, or leave them out with --no-${screens}.`,
+      },
+      { projectDir: options.projectDir, workerDir: options.workerDir },
+    );
   }
   return wanted;
 }
@@ -216,7 +230,7 @@ async function planFiles(
   if (fresh === 0) {
     throw new ConflictError({
       message: `${worker} already has a ${current.stub} front end.`,
-      action: "Add screens by dropping files into src/routes/app/. Run pithy ui sync to re-derive its route allowlist.",
+      action: `Add screens by dropping files into src/routes/app/. Run ${pithyCommand("ui sync", { flags: { "--worker": worker } })} to re-derive its route allowlist.`,
     });
   }
   // The whole record, non-strict: the writer skips what exists and reports it, so the run says what
@@ -313,20 +327,39 @@ export async function runUiAdd(options: UiAddOptions): Promise<UiAddReport> {
   // reads nothing this run is about to write — which is what makes moving it ahead of the write legal.
   const patterns = deriveWorkerFirst(options.config, await projectEnvironments(options.projectDir));
 
-  const scope = { root: options.projectDir, paths: touchedPaths(options, plan.files) };
-  const result = await withRollback(scope, async () => {
-    const written = await scaffoldFiles({ workerDir: options.workerDir, files: plan.files, strict: plan.strict });
-    const assets = await wireAssets(options.workerDir, patterns);
-    await wireManifest(options.workerDir, stub, packageManager);
-    const pkg = await wirePackage(options.projectDir, options.workerDir, stub);
+  // One write, run against the project or, under `--dry-run`, against a copy of it — so the plan is this
+  // write's own output and cannot describe a different one (`plan/shadow.ts`).
+  const write = async (projectDir: string, workerDir: string) => {
+    const written = await scaffoldFiles({ workerDir, framework: stub.id, files: plan.files, strict: plan.strict });
+    const assets = await wireAssets(workerDir, patterns);
+    await wireManifest(workerDir, stub, packageManager);
+    const pkg = await wirePackage(projectDir, workerDir, stub);
     // Last, and project-wide rather than per-worker: the client's programs join the root solution file so
     // `bun run typecheck` builds them. Two tsconfigs nothing references are two tsconfigs nothing checks.
-    await wireSolution(options.projectDir, workerName(options.workerDir));
+    await wireSolution(projectDir, workerName(options.workerDir));
     // Read inside the scope, because it reads the files this block just wrote — outside, a rollback
     // would already have taken them away.
-    const unstyled = await unstyledOnDisk(options.workerDir);
+    const unstyled = await unstyledOnDisk(workerDir);
     return { written, assets, pkg, unstyled };
-  });
+  };
+
+  let result: Awaited<ReturnType<typeof write>>;
+  let planned: Plan | undefined;
+  if (options.dryRun) {
+    // Under the same rollback as the real run, in the copy: its first act is to read every file it may restore,
+    // and a file the run cannot read is refused there — so the dry run is refused there too, with that sentence.
+    const run = await inShadow(options.projectDir, (shadow) => {
+      const projectDir = shadow.root;
+      const workerDir = shadow.at(options.workerDir);
+      const scope = { root: projectDir, paths: touchedPaths({ ...options, projectDir, workerDir }, plan.files) };
+      return withRollback(scope, () => write(projectDir, workerDir));
+    });
+    result = run.result;
+    planned = { ...emptyPlan(), files: run.files, notes: run.notes };
+  } else {
+    const scope = { root: options.projectDir, paths: touchedPaths(options, plan.files) };
+    result = await withRollback(scope, () => write(options.projectDir, options.workerDir));
+  }
 
   return {
     worker: workerName(options.workerDir),
@@ -342,13 +375,14 @@ export async function runUiAdd(options: UiAddOptions): Promise<UiAddReport> {
     dependencies: result.pkg.dependencies,
     devDependencies: result.pkg.devDependencies,
     scripts: result.pkg.scripts,
+    ...(planned === undefined ? {} : { plan: planned }),
   };
 }
 
 /** What `pithy ui sync` did. */
 export interface UiSyncReport {
-  /** The worker whose allowlist was re-derived. */
-  worker: string;
+  /** The worker whose allowlist was re-derived, by its `apps/` directory. */
+  worker: WorkerDir;
   /** The allowlist before this run. */
   before: string[];
   /** The allowlist after it. */
@@ -421,7 +455,7 @@ export async function runUiSync(options: {
   if (!current) {
     throw new NotFoundError({
       message: `${worker} has no front end.`,
-      action: `Run pithy ui add react --worker ${worker} to scaffold one.`,
+      action: `Run ${commandAlternatives(Object.keys(UI_STUBS).map((framework) => pithyCommand("ui add", { args: [framework], flags: { "--worker": worker } })))} to scaffold one.`,
     });
   }
 

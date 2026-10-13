@@ -93,11 +93,15 @@ async function currentOwner(db: Kysely<OwnerDatabase>): Promise<MigrationOwner |
   return row ? MigrationOwner.parse(row) : undefined;
 }
 
-/** The refusal: both project names in the problem line, both remedies in the action line. */
-function foreignDatabase(owner: string, project: string, binding: string | undefined): ConflictError {
+/**
+ * The refusal for a database another project owns: both project names in the problem line, both remedies in the
+ * action line. Exported so a reader that only checks the claim — `pithy migrate --dry-run`, which stamps nothing —
+ * refuses in the words the claim refuses with, rather than a copy of them (#697).
+ */
+export function foreignOwnerRefusal(owner: string, project: string, binding: string | undefined): ConflictError {
   return new ConflictError({
     message: `${binding ?? "This database"} belongs to project "${owner}", not "${project}".`,
-    action: `Bind ${project} to its own database, or set the project name back to ${owner}. Run pithy migrate again.`,
+    action: `Bind ${project} to its own database, or set the project name back to ${owner}. Then run this again.`,
     detail: `Recorded owner "${owner}" in ${MIGRATION_OWNER_TABLE}.`,
   });
 }
@@ -133,7 +137,7 @@ export async function claimMigrationOwnership(
   const db = migrationKysely<OwnerDatabase>(database);
   const existing = await currentOwner(db);
   if (existing) {
-    if (existing.project !== project) throw foreignDatabase(existing.project, project, options.binding);
+    if (existing.project !== project) throw foreignOwnerRefusal(existing.project, project, options.binding);
     return { project, outcome: "confirmed", stampedAt: existing.stampedAt };
   }
 
@@ -157,10 +161,10 @@ export async function claimMigrationOwnership(
   if (!settled) {
     throw new ConflictError({
       message: `${options.binding ?? "This database"} could not be stamped as "${project}".`,
-      action: "Check the database is writable. Run pithy migrate again.",
+      action: "Check the database is writable, then run this again.",
       detail: `No row in ${MIGRATION_OWNER_TABLE} after the claim insert.`,
     });
   }
-  if (settled.project !== project) throw foreignDatabase(settled.project, project, options.binding);
+  if (settled.project !== project) throw foreignOwnerRefusal(settled.project, project, options.binding);
   return { project, outcome: "adopted", stampedAt: settled.stampedAt };
 }

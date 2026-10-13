@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
+import { type Command, pithyCommand } from "@pithy-sh/core/src/cli/command";
 import { NotFoundError } from "@pithy-sh/core/src/error/pithyError";
 import type { DeclaredEnvironments } from "@pithy-sh/core/src/naming/environment";
 import type {
@@ -19,6 +20,8 @@ import {
 } from "@pithy-sh/secrets/src/rotation/rotateValue";
 import type { ManagedEnvironment } from "@pithy-sh/secrets/src/scope";
 import type { CliAuditEmit } from "../audit/cliAudit";
+import { emptyPlan, type Plan } from "../plan/plan";
+import { EXIT } from "../terminal/exitClass";
 
 /**
  * **`pithy secrets rotate` — the command side of the rotation core.**
@@ -48,16 +51,14 @@ import type { CliAuditEmit } from "../audit/cliAudit";
  */
 
 /**
- * The exit status for **rolled at the issuer, not recorded**.
+ * The exit status for **rolled at the issuer, not recorded**: 5, needs a person (`terminal/exitClass.ts`).
  *
- * Distinct from `1`, which every ordinary failure uses, because the two need different reactions and a
+ * Distinct from `1`, which an ordinary failure uses, because the two need different reactions and a
  * script cannot tell them apart from a message. `1` means the previous credential is still live and the
- * command can be run again. `3` means it is not, and nothing automated will fix it.
- *
- * `2` is left alone: shells and citty both use it for usage errors, and a status that could mean either
- * "you typed it wrong" or "a production credential is dead" is no signal at all.
+ * command can be run again. `5` means it is not, and nothing automated will fix it — the same class as
+ * the `secrets/rotation_unrecorded` code it reports, so the `--json` line's `exit` and the process agree.
  */
-export const EXIT_ROLLED_NOT_RECORDED = 3;
+export const EXIT_ROLLED_NOT_RECORDED = EXIT.person;
 
 /**
  * What a rotation needs from the manager: the write, **the refusals asked before it**, and the ledger row
@@ -215,9 +216,9 @@ function documentationOf(entry: SecretRegistryEntry): string | undefined {
   return entry.rotation !== undefined && entry.rotation.kind !== "local" ? entry.rotation.documentation : undefined;
 }
 
-/** `pithy secrets update <NAME> --env <env>` — the command that records a value a human obtained. */
-function updateCommand(name: string, env: ManagedEnvironment | undefined): string {
-  return `pithy secrets update ${name}${env === undefined ? "" : ` --env ${env}`}`;
+/** The `pithy secrets update` that records a value a human obtained, for the environment it is about. */
+function updateCommand(name: string, env: ManagedEnvironment | undefined): Command {
+  return pithyCommand("secrets update", { args: [name], ...(env === undefined ? {} : { flags: { "--env": env } }) });
 }
 
 /**
@@ -331,4 +332,39 @@ export function unrecordedFailure(
 function describeCause(cause: unknown): string {
   if (cause instanceof Error) return cause.message;
   return cause === undefined ? "no cause recorded" : String(cause);
+}
+
+/**
+ * **`pithy secrets rotate --dry-run`, as the one plan every dry run shares (#697).** One `rotate` per
+ * environment the rotation would store into — the same targets the run resolves, through the same rule —
+ * and a note for what a secret entry cannot say: a `provider` rolls the credential at its issuer first, and
+ * a `manual` secret is a person's job, so its plan rotates nothing.
+ */
+export function planSecretRotation(
+  registry: SecretRegistry,
+  command: Pick<SecretRotateCommand, "name" | "env" | "environments">,
+  kind: SecretRotationOutcome["kind"],
+): Plan {
+  const entry = requireEntry(registry, command.name);
+  if (kind === "manual") {
+    return { ...emptyPlan(), notes: [`${command.name} is replaced by a person at its issuer. A run calls nothing.`] };
+  }
+  const targets = entry.keyed
+    ? []
+    : secretWriteTargets({
+        name: command.name,
+        backend: entry.backend,
+        scope: entry.scope,
+        mode: "update",
+        requested: command.env,
+        declared: command.environments,
+      });
+  return {
+    ...emptyPlan(),
+    secrets: targets.map((env) => ({ name: command.name, env, action: "rotate", where: entry.backend })),
+    notes: [
+      ...(kind === "provider" ? ["Rolls the credential at its issuer first, then stores the new value."] : []),
+      "Records the rotation in each environment's rotation ledger.",
+    ],
+  };
 }

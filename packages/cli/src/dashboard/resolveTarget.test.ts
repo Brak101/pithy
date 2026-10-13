@@ -6,11 +6,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Capability } from "@pithy-sh/core/src/capability/capability";
 import { controlplane } from "@pithy-sh/core/src/controlPlane/capability";
-import { PithyError } from "@pithy-sh/core/src/error/pithyError";
+import { NotFoundError, PithyError } from "@pithy-sh/core/src/error/pithyError";
 import { describe, expect, test } from "vitest";
 import type { WorkerConfig } from "../project/config";
 import { featureConfigPath } from "../provision/featureConfig";
-import { composedForGrant, resolveConnectScopes, resolveConnectTarget } from "./resolveTarget";
+import { EXIT, exitCodeOf, fixOf } from "../terminal/exitClass";
+import { composedForGrant, connectSentence, resolveConnectScopes, resolveConnectTarget } from "./resolveTarget";
 
 /** A capability that declares nothing but an admin surface — enough for a grant to be derived from it. */
 const support: Capability = {
@@ -114,6 +115,37 @@ describe("resolveConnectScopes", () => {
 });
 
 /**
+ * **Two different mistakes, as `project/capabilityWorker.ts` tells them apart (#697).** A Worker the caller named
+ * with `--worker` that composes no seam is a call another `--worker` fixes: exit 2. The Worker the project
+ * resolved to on its own lacks what the call depends on: exit 3, with `pithy add controlplane` as the step.
+ */
+describe("a Worker composing no seam", () => {
+  async function thrown(call: Promise<unknown>): Promise<PithyError> {
+    const error = await call.catch((caught: unknown) => caught);
+    if (!(error instanceof PithyError)) throw new Error("the call resolved where a refusal was expected");
+    return error;
+  }
+
+  test("resolved by the project, is a precondition with pithy add controlplane, naming the apps/ directory", async () => {
+    const project = {
+      ...addressless([support]),
+      discoverWorkers: async () => [{ name: "demo-api", dir: "/project/apps/api" }],
+    };
+    const error = await thrown(resolveConnectScopes(project));
+    expect(error.payload.code).toBe("core/precondition_failed");
+    expect(exitCodeOf(error.payload)).toBe(EXIT.precondition);
+    expect(fixOf(error)).toMatch(/^pithy add controlplane --worker api\b/);
+  });
+
+  test("named with --worker, is the call's mistake: exit 2, and no add", async () => {
+    const error = await thrown(resolveConnectScopes({ ...addressless([support]), worker: "api" }));
+    expect(error.payload.code).toBe("validation/invalid_input");
+    expect(exitCodeOf(error.payload)).toBe(EXIT.usage);
+    expect(fixOf(error)).toBeUndefined();
+  });
+});
+
+/**
  * **Which composed surface feeds the grant, and the one case that has to go and read it.**
  *
  * A resolved address already carries the composition, so it answers. Nothing else does — except
@@ -210,5 +242,98 @@ describe("resolveConnectTarget on a feature", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * **The `pithy dashboard connect` a sentence names runs as written (#711).** One Worker needs no `--worker`;
+ * with several, each Worker composing the seam is named, because `connect` refuses `input/required` without
+ * one and refuses a Worker that does not compose it.
+ */
+describe("connectSentence", () => {
+  const seam = controlplane();
+  const project = (workers: Record<string, Capability[]>) => ({
+    projectDir: "/project",
+    environment: "staging",
+    discoverWorkers: async () => Object.keys(workers).map((name) => ({ name, dir: `/project/apps/${name}` })),
+    loadConfig: async (dir: string) => ({ capabilities: workers[dir.split("/").pop() ?? ""] ?? [] }) as WorkerConfig,
+  });
+
+  test("one Worker: named all the same, since connect acts on one", async () => {
+    expect(await connectSentence(project({ api: [seam] }))).toBe(
+      "`pithy dashboard connect --env staging --worker api`",
+    );
+  });
+
+  test("several: the one composing the seam, by its apps/ directory", async () => {
+    expect(await connectSentence(project({ api: [seam], web: [] }))).toBe(
+      "`pithy dashboard connect --env staging --worker api`",
+    );
+  });
+
+  test("several composing it: one command each", async () => {
+    expect(await connectSentence(project({ api: [seam], admin: [seam] }))).toBe(
+      "`pithy dashboard connect --env staging --worker admin` or `pithy dashboard connect --env staging --worker api`",
+    );
+  });
+
+  test("a re-point names the flags the reader supplies, never a placeholder", async () => {
+    expect(await connectSentence({ ...project({ api: [seam], web: [] }), update: true })).toBe(
+      "`pithy dashboard connect` with --env staging, --worker, --update and the new --worker-url",
+    );
+  });
+
+  test("several, none composing the seam yet: every Worker, each of which runs and says what it lacks", async () => {
+    expect(await connectSentence(project({ web: [], api: [] }))).toBe(
+      "`pithy dashboard connect --env staging --worker api` or `pithy dashboard connect --env staging --worker web`",
+    );
+  });
+
+  /** The project above, with the named Workers' configs throwing as a broken `pithy.config.ts` does. */
+  const unreadable = (workers: Record<string, Capability[]>, broken: string[]) => {
+    const base = project(workers);
+    return {
+      ...base,
+      loadConfig: async (dir: string) => {
+        if (broken.includes(dir.split("/").pop() ?? "")) throw new Error("SyntaxError: Unexpected token");
+        return base.loadConfig(dir);
+      },
+    };
+  };
+
+  test("one of two configs unreadable: both Workers are still named, because the bare command is refused", async () => {
+    expect(await connectSentence(unreadable({ api: [seam], web: [] }, ["web"]))).toBe(
+      "`pithy dashboard connect --env staging --worker api` or `pithy dashboard connect --env staging --worker web`",
+    );
+  });
+
+  test("every config unreadable: every discovered Worker is named", async () => {
+    expect(await connectSentence(unreadable({ api: [seam], web: [] }, ["api", "web"]))).toBe(
+      "`pithy dashboard connect --env staging --worker api` or `pithy dashboard connect --env staging --worker web`",
+    );
+  });
+
+  test("one Worker whose config is unreadable: still that Worker", async () => {
+    expect(await connectSentence(unreadable({ api: [seam] }, ["api"]))).toBe(
+      "`pithy dashboard connect --env staging --worker api`",
+    );
+  });
+
+  test("a dev-only process beside one Worker is not a Worker connect can name", async () => {
+    const base = project({ api: [seam] });
+    expect(
+      await connectSentence({
+        ...base,
+        // A Vite frontend joining the dev set: a manifest, no wrangler.jsonc, no pithy.config.ts.
+        loadConfig: async (dir: string) => {
+          if (dir.endsWith("/site")) throw new NotFoundError({ message: "No pithy.config.ts here." });
+          return base.loadConfig(dir);
+        },
+        discoverWorkers: async () => [
+          { name: "api", dir: "/project/apps/api", hasWrangler: true },
+          { name: "site", dir: "/project/apps/site", hasWrangler: false },
+        ],
+      }),
+    ).toBe("`pithy dashboard connect --env staging --worker api`");
   });
 });

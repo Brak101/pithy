@@ -24,6 +24,7 @@ import {
   workerSet,
 } from "../test-utils/doctorHarness";
 import { linkKitPackages } from "../test-utils/linkKit";
+import { dirOf } from "../test-utils/workerDir";
 import doctor, {
   buildDoctorReport,
   type DoctorReport,
@@ -450,7 +451,7 @@ describe("renderDoctorText", () => {
       capabilityReach: {
         ok: false,
         reachable: ["auth"],
-        unreachable: [{ capability: "payments", package: "@pithy-sh/payments", workers: ["api"] }],
+        unreachable: [{ capability: "payments", package: "@pithy-sh/payments", workers: [dirOf("api")] }],
         split: [],
       },
     };
@@ -463,7 +464,7 @@ describe("renderDoctorText", () => {
         "      composed by api",
         "      Nothing resolves it — not the project root, not any Worker's own node_modules — so",
         "      every command that reaches into it refuses, and every check below skips it.",
-        "      Run: pithy add payments",
+        "      Run: `pithy add payments --worker api --with-prerequisites --set billingSubject=user` or `pithy add payments --worker api --with-prerequisites --set billingSubject=organization`",
       ].join("\n"),
     );
   });
@@ -497,7 +498,7 @@ describe("renderDoctorText", () => {
         readCapabilityReach: async () => ({
           ok: false,
           reachable: [],
-          unreachable: [{ capability: "payments", package: "@pithy-sh/payments", workers: ["api"] }],
+          unreachable: [{ capability: "payments", package: "@pithy-sh/payments", workers: [dirOf("api")] }],
           split: [],
         }),
       }),
@@ -532,7 +533,7 @@ describe("renderDoctorText", () => {
         readCapabilityReach: async () => ({
           ok: false,
           reachable: [],
-          unreachable: [{ capability: "payments", package: "@pithy-sh/payments", workers: ["api"] }],
+          unreachable: [{ capability: "payments", package: "@pithy-sh/payments", workers: [dirOf("api")] }],
           split: [],
         }),
       }),
@@ -610,6 +611,8 @@ describe("renderDoctorText", () => {
           { worker: "api", version: "5.9.9" },
           { worker: "admin", version: "5.0.0" },
         ],
+        // A version skew is an install to settle, not a command to run (#697).
+        fix: null,
       },
     ]);
   });
@@ -649,6 +652,7 @@ describe("renderDoctorText", () => {
             kind: "d1",
             expected: "acme-global-email-suppressions",
             credential: null,
+            composing: [dirOf("api")],
             stale: [{ worker: "api", env: "dev", name: "acme-dev-email-suppressions" }],
             repointable: true,
           },
@@ -705,6 +709,7 @@ describe("renderDoctorText", () => {
             kind: "d1",
             expected: "acme-global-email-suppressions",
             credential: null,
+            composing: [dirOf("api")],
             stale: [{ worker: "api", env: "staging", name: "acme-staging-email-suppressions" }],
             repointable: true,
           },
@@ -795,6 +800,7 @@ describe("renderDoctorText", () => {
             kind: "r2",
             expected: "acme-global-support",
             credential: "support-r2-credentials",
+            composing: [dirOf("api")],
             stale: [{ worker: "api", env: "staging", name: "acme-staging-support-bucket" }],
             repointable: true,
           },
@@ -880,6 +886,7 @@ describe("renderDoctorText", () => {
             kind: "d1",
             expected: "acme-global-email-suppressions",
             credential: null,
+            composing: [dirOf("api")],
             stale: [{ worker: "api", env: "staging", name: "acme-staging-email-suppressions" }],
             repointable: false,
           },
@@ -930,6 +937,7 @@ describe("renderDoctorText", () => {
             kind: "d1",
             expected: "acme-global-email-suppressions",
             credential: null,
+            composing: [dirOf("api")],
             ids: [
               { id: "sup-1", at: [{ worker: "api", env: "staging" }] },
               { id: "sup-2", at: [{ worker: "api", env: "prod" }] },
@@ -958,7 +966,10 @@ describe("renderDoctorText", () => {
     // the split branch enumerates from, and this branch was degrading it to a placeholder nobody can
     // paste — on the screen where the decision is actually made.
     expect(text).toContain("Then run: pithy provision --env staging");
-    expect(text).toContain("Then run: pithy provision --env prod");
+    // Production is a person's decision, said as one rather than handed over as a command (#711).
+    expect(text).toContain(
+      "`pithy provision --env prod --yes` with its --confirm phrase, which only a person gives, runs against prod, a production environment.",
+    );
     expect(text).not.toContain("pithy provision --env <env>");
 
     // The decision is named, and so is the fact that the command does not make it.
@@ -1004,6 +1015,7 @@ describe("renderDoctorText", () => {
             kind: "d1",
             expected: "acme-global-email-suppressions",
             credential: null,
+            composing: [dirOf("api")],
             ids: [
               { id: "sup-1", at: [{ worker: "api", env: "staging" }] },
               { id: "sup-2", at: [{ worker: "api", env: "prod" }] },
@@ -1061,6 +1073,7 @@ describe("renderDoctorText", () => {
             kind: "d1",
             expected: "acme-global-email-suppressions",
             credential: null,
+            composing: [dirOf("api")],
             ids: [
               { id: "sup-local", at: [{ worker: "api", env: "dev" }] },
               { id: "sup-1", at: [{ worker: "api", env: "prod" }] },
@@ -1079,7 +1092,7 @@ describe("renderDoctorText", () => {
     );
     // No remedy, because there is nothing to choose between and nothing for a run to change.
     expect(text).not.toContain("Two databases are open and one survives.");
-    expect(text).not.toContain("Then run: pithy provision --env prod");
+    expect(text).not.toContain("pithy provision --env prod");
   });
 
   /**
@@ -1115,6 +1128,7 @@ describe("renderDoctorText", () => {
             kind: "d1",
             expected: "acme-global-email-suppressions",
             credential: null,
+            composing: [dirOf("api")],
             stale: [{ worker: "api", env: "staging", name: "acme-staging-email-suppressions" }],
             repointable: true,
           },
@@ -1128,6 +1142,7 @@ describe("renderDoctorText", () => {
             expected: "acme-global-support",
             credential: "support-r2-credentials",
             repointable: true,
+            composing: [dirOf("api")],
             ids: [
               { id: "b-1", at: [{ worker: "api", env: "staging" }] },
               { id: "b-2", at: [{ worker: "api", env: "prod" }] },
@@ -1196,7 +1211,7 @@ describe("renderDoctorText", () => {
     );
     expect(renderDoctorText(report, "/home/u")).toContain(
       [
-        "    entitlements gated routes, no provider — run: pithy add payments",
+        "    entitlements gated routes, no provider. Compose a provider, such as `pithy add payments --worker api --with-prerequisites --set billingSubject=user` or `pithy add payments --worker api --with-prerequisites --set billingSubject=organization`.",
         "                 src/routes/reports.ts",
         "                 src/routes/team.ts",
       ].join("\n"),
@@ -1464,7 +1479,7 @@ describe("doctorExitCode", () => {
           state: "drifted",
           drift: [
             {
-              worker: "board",
+              worker: dirOf("board"),
               env: "prod",
               fault: "unserved-origin",
               origin: "https://app.example.com",
@@ -1488,7 +1503,7 @@ describe("doctorExitCode", () => {
       baseOptions({
         checkOrigins: async () => ({
           state: "drifted",
-          drift: [{ worker: "board", env: "staging", fault: "no-origin", origin: null }],
+          drift: [{ worker: dirOf("board"), env: "staging", fault: "no-origin", origin: null }],
         }),
       }),
     );
@@ -1508,7 +1523,7 @@ describe("doctorExitCode", () => {
           state: "drifted",
           drift: [
             {
-              worker: "board",
+              worker: dirOf("board"),
               env: "prod",
               fault: "unsynced-stanza",
               declared: {
@@ -2666,7 +2681,8 @@ describe("environment configs", () => {
     const json = renderDoctorJson(report) as {
       environmentConfigs: { unresolved: { environment: string; reason: string }[]; detail: string[] };
     };
-    expect(json.environmentConfigs.unresolved).toEqual(unloadable.unresolved);
+    // Each with `fix: null`: the config's own refusal is the remedy, and it is an edit (#697).
+    expect(json.environmentConfigs.unresolved).toEqual(unloadable.unresolved.map((entry) => ({ ...entry, fix: null })));
     expect(json.environmentConfigs.detail).toEqual(["prod: Set payments.billing in apps/api/pithy.config.ts."]);
   });
 

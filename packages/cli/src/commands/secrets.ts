@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
+import { callerOf, rerunCommand } from "@pithy-sh/core/src/cli/command";
 import { isErrorCode } from "@pithy-sh/core/src/error/extend";
-import { PithyError, ValidationError } from "@pithy-sh/core/src/error/pithyError";
+import { NotFoundError, PithyError, UpstreamError, ValidationError } from "@pithy-sh/core/src/error/pithyError";
 import { RetainedBudget } from "@pithy-sh/core/src/migrations/retained";
 import { DEFAULT_ENVIRONMENTS, type DeclaredEnvironments } from "@pithy-sh/core/src/naming/environment";
 import { environmentScope } from "@pithy-sh/core/src/naming/provisionScope";
@@ -20,16 +21,20 @@ import { deprovisionSecrets, provisionSecrets } from "@pithy-sh/secrets/src/prov
 import { SecretBackend, type SecretRegistry, type SecretRegistryEntry } from "@pithy-sh/secrets/src/registry";
 import { canonicalGlobalEnvironment, type ManagedEnvironment, managedEnvironments } from "@pithy-sh/secrets/src/scope";
 import { defineCommand } from "citty";
+import { z } from "zod";
 import { createProjectCliAudit } from "../audit/cliAudit";
+import { addAction, withAddFix } from "../capabilities/addCommand";
 import {
-  type MintedSecret,
+  MintedSecret,
   mintDeclaredSecrets,
   mintedBeforeFailure,
   mintReportLines,
   storeSecretMinter,
 } from "../capabilities/mintSecrets";
+import { resolveAdd } from "../capabilities/notComposed";
 import {
   EXIT_ROLLED_NOT_RECORDED,
+  planSecretRotation,
   rotationReportLines,
   runSecretRotation,
   type SecretRotationDispatcher,
@@ -58,30 +63,32 @@ import { readSecretValue } from "../capabilities/secretValue";
 import { projectTokenStoreEntries, storeEntryCensus } from "../capabilities/storeEntryCensus";
 import { storeSecretWriter } from "../capabilities/storeSecretWrites";
 import {
-  firstUnreachable,
   runSecretsVerification,
   sweepStoreEntries,
   type VerificationReport,
-  verificationExitCode,
   verificationJson,
+  verificationOutcome,
   verificationReportLines,
-  verificationVerdict,
 } from "../capabilities/verifySecrets";
-import type { ConfirmedAccount } from "../cloudflare/accountAnswer";
 import { cloudflareClients } from "../cloudflare/clients";
-import { type CloudflareAccountSelection, cloudflareAccountConfirmation, cloudflareEnv } from "../cloudflare/config";
+import { commandCredentials, type StoreNeed } from "../cloudflare/commandCredentials";
+import { cloudflareEnv } from "../cloudflare/config";
+import { withContract } from "../contract/commandContract";
 import { editDevSecrets } from "../devSecrets/edit";
 import { resolveDevSecretsFile } from "../devSecrets/location";
 import { mergedSecretRegistry, resolveDevSecretsTargets } from "../devSecrets/targets";
 import { DESTROY_RETAINED_DESCRIPTION, parseDestroyRetained } from "../migrations/confirm";
+import { DRY_RUN_ARG, PlanKey } from "../plan/plan";
 import { loadProject, projectCloudflareAccount, projectEnvironments, requireProjectName } from "../project/config";
 import { requireManagedEnvironment, requireTeardownEnvironment, TEARDOWN_ENV_ARG } from "../project/environment";
 import { confineTeardown } from "../project/teardown";
-import { resolveWorkers } from "../project/workerScope";
+import { type ResolvedWorker, resolveWorkers } from "../project/workerScope";
 import { secretsStoreBindings, workerSecretRegistry } from "../provision/secretBindings";
 import { removedStoreEntryNote } from "../provision/secretEntryRemedy";
 import { cloudflareSecretsStore } from "../provision/store";
 import { applySecretBindings } from "../provision/wranglerEnv";
+import { canceled } from "../terminal/exitClass";
+import { mayDraw } from "../terminal/inputMode";
 import {
   formatDone,
   formatError,
@@ -99,10 +106,11 @@ import {
  * name, not just the alphabetically-first Worker's. A Worker that does not compose `secrets` simply
  * contributes nothing; when no Worker does, the capability's own actionable error is what surfaces.
  */
-async function projectSecrets(
+export async function mergedProjectSecrets(
   projectDir: string,
+  resolve: (options: { projectDir: string }) => Promise<ResolvedWorker[]> = resolveWorkers,
 ): Promise<{ registry: SecretRegistry; branches: SecretBranches; complete: boolean }> {
-  const workers = await resolveWorkers({ projectDir });
+  const workers = await resolve({ projectDir });
   const registries: SecretRegistry[] = [];
   let branches: SecretBranches = {};
   let absent: unknown;
@@ -132,7 +140,27 @@ async function projectSecrets(
     branches = mergeSecretBranches(branches, secretBranchDeclarations(worker.capabilities));
   }
   const first = registries[0];
-  if (!first) throw absent;
+  if (!first) {
+    // No Worker composes `secrets`: the project is missing what every subcommand depends on, and `pithy add
+    // secrets` is the step — named for this project's Workers, runnable as written, or not at all (#697).
+    // The sentence names the command the `fix` carries, from one builder (#711), and one command per Worker
+    // where no single Worker can be named.
+    if (absent instanceof PithyError && isErrorCode(absent.payload, "core/not_found")) {
+      const add = resolveAdd("secrets", { projectDir, workerDirs: workers.map((worker) => worker.dir) });
+      const refusal = new NotFoundError(
+        {
+          message: absent.payload.message,
+          action: addAction(
+            add,
+            (run) => `Add secrets({ registry }) to a Worker's pithy.config.ts capabilities (run ${run}).`,
+          ),
+        },
+        { cause: absent },
+      );
+      throw withAddFix(refusal, add);
+    }
+    throw absent;
+  }
   return {
     registry: registries.length === 1 ? first : (Object.assign({}, ...registries) as SecretRegistry),
     branches,
@@ -144,9 +172,9 @@ async function projectSecrets(
   };
 }
 
-/** The project's merged secret registry. See {@link projectSecrets}. */
+/** The project's merged secret registry. See {@link mergedProjectSecrets}. */
 async function projectSecretRegistry(projectDir: string): Promise<SecretRegistry> {
-  return (await projectSecrets(projectDir)).registry;
+  return (await mergedProjectSecrets(projectDir)).registry;
 }
 
 /**
@@ -170,8 +198,8 @@ async function buildAudit(projectDir: string, env: string) {
 /**
  * The dispatcher a `--dry-run` gets: every seam present, none of them reachable, and none of them called.
  *
- * A dry run answers what *would* happen and must reach no account at all — which is what makes it usable
- * before the credentials exist. `rotateSecretValue` returns `unchanged` before it opens a rotation row, so
+ * A dry run answers what *would* happen and must reach no account at all. It still refuses where the run
+ * would before reaching one — missing credentials are read off this machine (`requireRotationPreconditions`). `rotateSecretValue` returns `unchanged` before it opens a rotation row, so
  * `openRotation` here is unreachable rather than merely unused; it throws instead of returning a plausible
  * id, because a dry run that quietly recorded a rotation would be the one thing it promises never to do.
  */
@@ -205,7 +233,7 @@ const DRY_RUN_DISPATCHER: SecretRotationDispatcher = {
 async function buildDispatcher(
   projectDir: string,
 ): Promise<PreflightSecretDispatcher & SecretProbe & SecretRotationRecorder & SecretStoreVerifier> {
-  const { accountId, apiToken } = loadCloudflareCreds(await projectCloudflareAccount(projectDir));
+  const { accountId, apiToken } = commandCredentials(await projectCloudflareAccount(projectDir));
   const project = requireProjectName(await loadProject(projectDir));
   return buildSecretDispatcher(accountId, apiToken, project);
 }
@@ -261,6 +289,26 @@ async function buildRotationDispatcher(projectDir: string): Promise<SecretRotati
   };
 }
 
+/**
+ * **What a rotation refuses on before it reaches anything, asked of this machine alone** — for `--dry-run`,
+ * which reaches no account (#697). The same reads {@link buildRotationDispatcher} makes on the way to its
+ * clients, in the same order and with the same words: the credentials, the project's name, and — for a
+ * secret the Secrets Store holds — the store's id, which the run's pre-flight demands before the issuer is
+ * called. The pre-flight's own question, whether the store would take the value, needs the account and is
+ * left to the run.
+ */
+async function requireRotationPreconditions(projectDir: string, backend: SecretBackend | undefined): Promise<void> {
+  const account = await projectCloudflareAccount(projectDir);
+  commandCredentials(account);
+  requireProjectName(await loadProject(projectDir));
+  if (backend === "cf-secrets-store") commandCredentials(account, secretsStoreNeed(projectDir));
+}
+
+/** What every secrets command that writes the store needs it for, as the refusal for a missing id says. */
+function secretsStoreNeed(projectDir: string): StoreNeed {
+  return { projectDir, why: "create a Secrets Store in the Cloudflare dashboard" };
+}
+
 /** The per-backend writers, over one project resolution — the routing table both dispatchers share. */
 async function writeRoutes(
   projectDir: string,
@@ -272,7 +320,7 @@ async function writeRoutes(
     d1: manager,
     "cf-secrets-store": storeSecretWriter({
       store: async () => {
-        const { accountId, apiToken, storeId } = loadCloudflareCreds(account, { requireStore: true });
+        const { accountId, apiToken, storeId } = commandCredentials(account, secretsStoreNeed(projectDir));
         return cloudflareSecretsStore(await cloudflareClients({ accountId, apiToken }), storeId);
       },
       // Provisioning's own namer, so an operator's value lands at the address `secretsStoreBindings` will
@@ -280,36 +328,6 @@ async function writeRoutes(
       scope: (env) => environmentScope(project, env),
     }),
   };
-}
-
-/** The CF credentials and Secrets Store id provisioning needs, from `.dev.vars` then `process.env`. */
-function loadCloudflareCreds(
-  account: CloudflareAccountSelection | null,
-  options: { requireStore?: boolean } = {},
-): {
-  account: ConfirmedAccount;
-  accountId: string;
-  apiToken: string;
-  storeId: string;
-} {
-  const vars = cloudflareEnv({ account });
-  const confirmation = cloudflareAccountConfirmation({ account });
-  const accountId = vars.CLOUDFLARE_ACCOUNT_ID ?? "";
-  const apiToken = vars.CLOUDFLARE_API_TOKEN ?? "";
-  const storeId = vars.SECRETS_STORE_ID ?? "";
-  if (!accountId || !apiToken) {
-    throw new ValidationError({
-      message: "Cloudflare credentials are missing.",
-      action: "Run pithy init to record CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN, or export them.",
-    });
-  }
-  if (options.requireStore && !storeId) {
-    throw new ValidationError({
-      message: "The CF Secrets Store id is missing.",
-      action: "Run pithy add secrets to record SECRETS_STORE_ID (create a Secrets Store in the Cloudflare dashboard).",
-    });
-  }
-  return { account: { accountId, confirmation }, accountId, apiToken, storeId };
 }
 
 /**
@@ -329,11 +347,11 @@ function loadCloudflareCreds(
  * silently read the operator's terminal for a credential with no prompt and no masking. Two questions,
  * two answers, and neither derivable from the other.
  *
- * `ci/interactiveGate.test.ts` holds the three-term gate for every command that writes one, and records
- * why this file no longer appears in its scan.
+ * The rule itself is `mayDraw` in `terminal/inputMode.ts`, the seam every command reads, so
+ * `PITHY_NONINTERACTIVE=1` and `--no-input` forbid this prompt like every other (#697).
  */
 export function canPrompt(json: boolean): boolean {
-  return !json && Boolean(process.stdout.isTTY);
+  return mayDraw(json);
 }
 
 /**
@@ -349,11 +367,13 @@ async function readValue(
   mode: "create" | "update",
   entry: SecretRegistryEntry | undefined,
   branches: readonly string[] | undefined,
-  json: boolean,
+  args: { name: string; env?: string; json: boolean },
 ): Promise<string> {
+  const json = args.json;
   const value = await readSecretValue({
     name,
     mode,
+    rerun: rerunCommand(callerOf(`secrets ${mode}`, args), { args: [name] }),
     entry,
     branches,
     canPrompt: canPrompt(json),
@@ -361,10 +381,7 @@ async function readValue(
     // asked where the document would be read.
     stdin: process.stdin,
   });
-  if (value === null) {
-    process.stderr.write("Canceled.\n");
-    process.exit(1);
-  }
+  if (value === null) canceled();
   return value;
 }
 
@@ -427,7 +444,7 @@ async function write(
   args: { name: string; env?: string; json: boolean; backend?: string },
 ): Promise<void> {
   const projectDir = process.cwd();
-  const { registry, branches } = await projectSecrets(projectDir);
+  const { registry, branches } = await mergedProjectSecrets(projectDir);
   const environments = await projectEnvironments(projectDir);
   // `--env` as the operator gave it, or nothing. Not resolved to a default: the absence is the whole
   // difference between *narrow this write* and *say nothing*, and it is what the rule turns on.
@@ -435,9 +452,7 @@ async function write(
   const backend = args.backend === undefined ? undefined : requireBackend(args.backend);
   checkWriteIsCoherent(registry, mode, args.name, env, environments, backend);
   const value =
-    mode === "delete"
-      ? undefined
-      : await readValue(args.name, mode, registry[args.name], branches[args.name], args.json);
+    mode === "delete" ? undefined : await readValue(args.name, mode, registry[args.name], branches[args.name], args);
   const dispatcher = await buildWriteDispatcher(projectDir);
   const audit = await buildAudit(projectDir, auditOrigin(env, environments));
 
@@ -453,7 +468,7 @@ async function write(
     // **A fan-out has no rollback, so what it wrote is said before the error is.** Three environments and
     // the third throws leaves the first two holding the new value; without this the operator reads a
     // failure and has no way to know that. `withErrorReporting` then puts `{ error }` on stderr and exits
-    // 1 — the streams agree, and neither reports success.
+    // by the failure's kind (`terminal/exitClass.ts`) — the streams agree, and neither reports success.
     const written = environmentsWrittenBeforeFailure(error);
     if (written.length > 0) {
       const landed = mode === "delete" ? "removed from" : "written to";
@@ -516,17 +531,198 @@ const sharedArgs = {
   json: { type: "boolean", default: false, description: "Machine-readable output" },
 } as const;
 
-const create = defineCommand({
-  meta: { name: "create", description: "Create a secret (fails if it already exists)" },
-  args: { ...nameArg, ...sharedArgs },
-  run: ({ args }) => withErrorReporting(args.json, () => write("create", args)),
-});
+const SecretName = z.string().describe("The secret name given on the command line.");
+const Environments = (what: string) => z.array(z.string().describe("An environment.")).describe(what);
+const Interrupted = z
+  .literal(true)
+  .optional()
+  .describe("Present only on a fan-out that failed after something was written. What landed is beside it.");
 
-const update = defineCommand({
-  meta: { name: "update", description: "Update a secret (fails if it doesn't exist)" },
-  args: { ...nameArg, ...sharedArgs },
-  run: ({ args }) => withErrorReporting(args.json, () => write("update", args)),
-});
+/** What `create`, `update` and `rm` write. `rm` reports the mode it ran, which is `delete`. */
+const WriteResult = (mode: "create" | "update" | "delete") =>
+  z
+    .object({
+      command: z.literal(`secrets ${mode}`).describe(`\`"secrets ${mode}"\`.`),
+      name: SecretName,
+      environments: Environments("The managed environments the write reached — what landed, never what was planned."),
+      accountEntry: z
+        .literal(true)
+        .optional()
+        .describe("Present when the write changed one account-level entry every listed environment binds."),
+      interrupted: Interrupted,
+    })
+    .describe(`What \`pithy secrets ${mode === "delete" ? "rm" : mode}\` wrote.`);
+
+const SecretsCreatePayload = WriteResult("create");
+const SecretsUpdatePayload = WriteResult("update");
+const SecretsRmPayload = WriteResult("delete");
+
+/** `pithy secrets rotate --json`. `docs/commands/secrets.md`. */
+const SecretsRotatePayload = z
+  .object({
+    command: z.literal("secrets rotate").describe('`"secrets rotate"`.'),
+    name: SecretName,
+    dryRun: z.boolean().describe("Whether this was `--dry-run`. Nothing was rolled or written when it is `true`."),
+    rotations: z
+      .array(
+        z
+          .object({
+            name: z.string().describe("The secret's registry name. Never its value."),
+            status: z
+              .enum(["rotated", "unchanged", "unrecorded", "failed"])
+              .describe("`unrecorded` is rolled at the issuer and not stored, and the only status that exits 5."),
+            rotation: z.enum(["local", "provider", "manual"]).describe("How the registry says the secret is replaced."),
+            rolled: z.boolean().describe("Whether a third party's credential was actually changed."),
+            rollFailed: z
+              .literal(true)
+              .optional()
+              .describe("Present when the rotator itself failed, so `rolled` is a guess."),
+            recorded: Environments("The environments that took the new value, in order."),
+            stranded: Environments("The environments the new value never reached."),
+            reason: z
+              .enum(["manual", "dry-run"])
+              .optional()
+              .describe("Why nothing was called. Present only when `status` is `unchanged`."),
+          })
+          .describe("One secret's rotation."),
+      )
+      .describe("One record per secret. Always one today."),
+    plan: PlanKey,
+  })
+  .describe("What `pithy secrets rotate` did, or under `--dry-run` would.");
+
+/** `pithy secrets ls --json`. */
+const SecretsLsPayload = z
+  .object({
+    command: z.literal("secrets ls").describe('`"secrets ls"`.'),
+    secrets: z
+      .array(
+        z
+          .object({
+            name: z.string().describe("The registry key — a secret name, or a keyspace."),
+            description: z.string().describe("The entry's routing facts, joined by ` · `."),
+            applies: z.boolean().describe("Whether anything this project composes reads it."),
+            reason: z.string().optional().describe("Why it does not apply. Present only when `applies` is false."),
+          })
+          .describe("One declared name."),
+      )
+      .describe("Every declared name, sorted. Names that apply to nothing are left out without `--all`."),
+    hidden: z.number().int().describe("How many names were left out because they apply to nothing. `0` under `--all`."),
+    unresolved: z
+      .array(
+        z
+          .object({
+            environment: z.string().describe("The environment that could not be composed."),
+            reason: z.string().describe("That failure's action line."),
+          })
+          .describe("One environment."),
+      )
+      .describe("The environments whose `pithy.config.ts` would not compose. Empty on an ordinary project."),
+  })
+  .describe("The project's declared secrets. Never a value.");
+
+/** `pithy secrets edit --json`. */
+const SecretsEditPayload = z
+  .object({
+    command: z.literal("secrets edit").describe('`"secrets edit"`.'),
+    path: z.string().describe("The absolute path of `<config>/<project>/secrets.jsonc`."),
+    changed: z.boolean().describe("Whether the file was written."),
+    secrets: z.number().int().describe("How many secrets the file holds now."),
+  })
+  .describe("What `pithy secrets edit` wrote.");
+
+/** `pithy secrets verify --json`. */
+const SecretsVerifyPayload = z
+  .object({
+    command: z.literal("secrets verify").describe('`"secrets verify"`.'),
+    verdict: z.enum(["verified", "withheld", "failed", "key-unreadable"]).describe("The field to key a gate on."),
+    verified: z.boolean().describe("`true` only for `verified`."),
+    exitCode: z.number().int().describe("The status this run exits with."),
+    environments: z
+      .array(
+        z
+          .object({
+            env: z.string().describe("The environment."),
+            state: z
+              .enum(["verified", "unreachable"])
+              .describe("`verified` when its manager answered, whatever it said; `unreachable` when it did not."),
+            verification: z
+              .looseObject({})
+              .optional()
+              .describe("What the manager answered. Present only when it answered."),
+          })
+          .describe("One environment."),
+      )
+      .describe("One entry per environment verified."),
+    sweep: z.looseObject({}).optional().describe("The store sweep. Present only when one ran."),
+    notSwept: z.string().optional().describe("Why a sweep that was asked for could not run."),
+  })
+  .describe("Whether every stored secret still opens, and what the store holds.");
+
+/** `pithy secrets provision --json`. */
+const SecretsProvisionPayload = z
+  .object({
+    command: z.literal("secrets provision").describe('`"secrets provision"`.'),
+    environments: z
+      .array(
+        z
+          .object({
+            env: z.string().describe("The environment."),
+            databaseId: z.string().describe("The id of that environment's secrets D1."),
+            storeId: z.string().describe("The Secrets Store its master key was written to."),
+          })
+          .describe("One managed environment."),
+      )
+      .describe("One entry per managed environment, in order."),
+    wired: z
+      .array(
+        z
+          .object({
+            worker: z.string().describe("The Worker, as `pithy worker list` shows it."),
+            env: z.string().describe("The environment whose stanza was written."),
+            bindings: z
+              .array(z.string().describe("A binding."))
+              .describe("The binding names written into that stanza."),
+            created: z.array(z.string().describe("A binding.")).describe("The bindings whose value this run minted."),
+          })
+          .describe("One Worker and environment."),
+      )
+      .describe("One entry per Worker and environment whose `secrets_store_secrets` stanza this run wrote."),
+    generated: z.array(MintedSecret).describe("One entry per `d1` secret the registry declares mintable."),
+    interrupted: Interrupted,
+  })
+  .describe("What `pithy secrets provision` provisioned.");
+
+/** `pithy secrets deprovision --json`. */
+const SecretsDeprovisionPayload = z
+  .object({
+    command: z.literal("secrets deprovision").describe('`"secrets deprovision"`.'),
+    env: z.string().describe("The one environment torn down."),
+    keysDeleted: z.boolean().describe("Whether the environment's master key was deleted with the rest."),
+    managerTokenDeleted: z.boolean().describe("Whether the shared manager token was removed."),
+  })
+  .describe("What `pithy secrets deprovision` removed.");
+
+/** Every managed subcommand reaches the project's managers through Cloudflare. */
+const MANAGED = { output: "document", schemaVersion: 1, needsNetwork: true } as const;
+
+const create = withContract(
+  defineCommand({
+    meta: { name: "create", description: "Create a secret (fails if it already exists)" },
+    args: { ...nameArg, ...sharedArgs },
+    run: ({ args }) => withErrorReporting(args.json, () => write("create", args)),
+  }),
+  { ...MANAGED, payload: SecretsCreatePayload, mutates: true, idempotent: false },
+);
+
+const update = withContract(
+  defineCommand({
+    meta: { name: "update", description: "Update a secret (fails if it doesn't exist)" },
+    args: { ...nameArg, ...sharedArgs },
+    run: ({ args }) => withErrorReporting(args.json, () => write("update", args)),
+  }),
+  { ...MANAGED, payload: SecretsUpdatePayload, mutates: true, idempotent: true },
+);
 
 /**
  * `pithy secrets rm` — remove a secret from where its registry entry says it lives.
@@ -535,19 +731,28 @@ const update = defineCommand({
  * whose old value is still sitting where nothing reads it (#596). See `secretWriteRouting` for what holds it
  * to that purpose.
  */
-const rm = defineCommand({
-  meta: { name: "rm", description: "Remove a secret" },
-  args: {
-    ...nameArg,
-    ...sharedArgs,
-    backend: {
-      type: "string",
-      description:
-        "Remove it from this store instead of the declared one (d1 | cf-secrets-store) — for a value a secret left behind when its declaration moved. Needs --env",
+const rm = withContract(
+  defineCommand({
+    meta: { name: "rm", description: "Remove a secret" },
+    args: {
+      ...nameArg,
+      ...sharedArgs,
+      backend: {
+        type: "string",
+        description:
+          "Remove it from this store instead of the declared one (d1 | cf-secrets-store) — for a value a secret left behind when its declaration moved. Needs --env",
+      },
     },
+    run: ({ args }) => withErrorReporting(args.json, () => write("delete", args)),
+  }),
+  {
+    ...MANAGED,
+    payload: SecretsRmPayload,
+    mutates: true,
+    idempotent: true,
+    flags: { backend: { enum: SecretBackend.options } },
   },
-  run: ({ args }) => withErrorReporting(args.json, () => write("delete", args)),
-});
+);
 
 /**
  * `pithy secrets rotate` — replace one secret's value against the rotation its registry entry declares.
@@ -575,135 +780,164 @@ const rm = defineCommand({
  * `--dry-run` is here because it costs almost nothing and answers the question an operator has just before
  * the irreversible one: *is this secret rolled at somebody else's API, or minted here?*
  */
-const rotate = defineCommand({
-  meta: { name: "rotate", description: "Rotate one secret against its declared rotator" },
-  args: {
-    ...nameArg,
-    ...sharedArgs,
-    "dry-run": { type: "boolean", default: false, description: "Say what would happen; call nothing" },
-  },
-  run: ({ args }) =>
-    withErrorReporting(args.json, async () => {
-      const projectDir = process.cwd();
-      const registry = await projectSecretRegistry(projectDir);
-      const environments = await projectEnvironments(projectDir);
-      const env = args.env ? requireManagedEnvironment(args.env, environments) : undefined;
-      const entry = registry[args.name];
-      const dryRun = args["dry-run"];
-
-      // **The dispatcher is built before anything is rolled**, and the ordering is load-bearing rather
-      // than tidy. Missing credentials raise here, with the previous value untouched; built after the
-      // roll, the same missing credentials would strand a live one behind a message about `pithy init`.
-      // A dry run reaches no account at all, which is what makes it usable before the credentials exist.
-      //
-      // **Routed by backend, like every other write** (#517). It was the manager's alone, which reaches
-      // one environment's D1 — so rotating a `cf-secrets-store` secret ended in a 500 raised at the
-      // store write, after a `provider` rotator had already rolled the credential at its issuer.
-      const dispatcher = dryRun ? DRY_RUN_DISPATCHER : await buildRotationDispatcher(projectDir);
-      const audit = dryRun ? async () => {} : await buildAudit(projectDir, auditOrigin(env, environments));
-
-      const outcome = await runSecretRotation(
-        registry,
-        dispatcher,
-        { name: args.name, env, environments, dryRun },
-        audit,
-      );
-      // `runSecretRotation` refuses an undeclared name before anything else happens, so reaching here with
-      // no entry is impossible — this narrows for the type checker rather than for a state that can occur.
-      if (!entry) throw new ValidationError({ message: `Secret '${args.name}' is not declared in the registry.` });
-
-      if (args.json) {
-        const rotations = [
-          {
-            name: outcome.name,
-            status: outcome.status,
-            rotation: outcome.kind,
-            rolled: outcome.rolled,
-            ...(outcome.rollFailed === undefined ? {} : { rollFailed: outcome.rollFailed }),
-            recorded: outcome.recorded,
-            stranded: outcome.stranded,
-            ...(outcome.reason === undefined ? {} : { reason: outcome.reason }),
-          },
-        ];
-        process.stdout.write(`${formatJsonLine({ command: "secrets rotate", name: args.name, rotations })}\n`);
-      } else {
-        for (const line of rotationReportLines(entry, outcome, env)) process.stdout.write(`${line}\n`);
-      }
-
-      // **The two ends of the same run, and they must never disagree.** Whatever the outcome, stdout has
-      // already said per secret what happened; these decide what the shell learns.
-      if (outcome.status === "unrecorded") {
-        const failure = unrecordedFailure(entry, outcome, env);
-        process.stderr.write(`${args.json ? formatErrorJson(failure.payload) : formatError(failure.payload)}\n`);
-        // Not a throw: `withErrorReporting` would exit 1, and 1 is the status that means *the previous
-        // credential is still live*. This state is the one thing in the command that is not that.
-        process.exitCode = EXIT_ROLLED_NOT_RECORDED;
-        return;
-      }
-      if (outcome.status === "failed") {
-        // Ordinary: nothing was rolled, so the previous value is still live and the run can be repeated.
-        // The cause is what the operator needs, and `withErrorReporting` puts it on stderr with exit 1. The
-        // fallback is not decoration — `throw undefined` would exit non-zero with a blank stderr, which is
-        // the one report worse than a bad one.
-        throw (
-          outcome.cause ??
-          new ValidationError({
-            message: `Secret '${args.name}' was not rotated.`,
-            action: "Run it again. The previous value is still live.",
-            detail: `rotate '${args.name}': store refused with no recorded cause`,
-          })
-        );
-      }
-      if (args.json) return;
-      if (dryRun) {
-        process.stdout.write("Dry run. Nothing rolled, nothing written.\n");
-        return;
-      }
-      // **No `Done.` over a `manual` secret.** The lines above have just told the operator that a human has
-      // to go to a console, and `Done.` under them reads as the command having handled it. The last thing
-      // they see is the instruction, which is the only thing left to act on.
-      if (outcome.reason === "manual") return;
-      process.stdout.write(`${formatDone()}\n`);
-    }),
-});
-
-const ls = defineCommand({
-  meta: { name: "ls", description: "List the secrets this project's configuration actually uses" },
-  args: {
-    all: {
-      type: "boolean",
-      default: false,
-      description: "Include the secrets this configuration will never read, and why",
+const rotate = withContract(
+  defineCommand({
+    meta: { name: "rotate", description: "Rotate one secret against its declared rotator" },
+    args: {
+      ...nameArg,
+      ...sharedArgs,
+      "dry-run": DRY_RUN_ARG,
     },
-    json: { type: "boolean", default: false, description: "Machine-readable output" },
-  },
-  run: ({ args }) =>
-    withErrorReporting(args.json, async () => {
-      const projectDir = process.cwd();
-      const registry = await projectSecretRegistry(projectDir);
-      // What the configuration says each of those names can reach (#541). Never throws: an answer it
-      // could not establish is an empty one, and every row then reads exactly as it did before.
-      const applicability = await projectSecretApplicability(projectDir);
-      // Hidden by default (#552). `--all` applies to both surfaces rather than only the terminal: two
-      // listings that answer the same flag differently is a thing somebody has to learn, and an agent
-      // reading `--json` is asking the same question a person at a terminal is.
-      const rows = secretListRows(registry, applicability.project, args.all);
-      const hidden = args.all ? 0 : applicability.project.size;
-      if (args.json) {
-        // `unresolved` is its own key rather than a field on a row, because it is a fact about the
-        // *answer* and not about any one secret: it says which environments these marks were decided
-        // from. An agent acting on `applies` has to be able to tell a whole project's answer from one
-        // drawn out of two of its three environments (#548).
-        process.stdout.write(
-          `${formatJsonLine({ command: "secrets ls", secrets: rows, hidden, unresolved: applicability.unresolved })}\n`,
+    run: ({ args }) =>
+      withErrorReporting(args.json, async () => {
+        const projectDir = process.cwd();
+        const registry = await projectSecretRegistry(projectDir);
+        const environments = await projectEnvironments(projectDir);
+        const env = args.env ? requireManagedEnvironment(args.env, environments) : undefined;
+        const entry = registry[args.name];
+        const dryRun = args["dry-run"];
+
+        // **The dispatcher is built before anything is rolled**, and the ordering is load-bearing rather
+        // than tidy. Missing credentials raise here, with the previous value untouched; built after the
+        // roll, the same missing credentials would strand a live one behind a message about `pithy init`.
+        // A dry run reaches no account at all — but it makes the refusals the run makes here, which are read
+        // off this machine, because a plan for a run that would be refused is a promise nobody can keep
+        // (`docs/CLI.md` §1.2, #697).
+        //
+        // **Routed by backend, like every other write** (#517). It was the manager's alone, which reaches
+        // one environment's D1 — so rotating a `cf-secrets-store` secret ended in a 500 raised at the
+        // store write, after a `provider` rotator had already rolled the credential at its issuer.
+        if (dryRun) await requireRotationPreconditions(projectDir, entry?.backend);
+        const dispatcher = dryRun ? DRY_RUN_DISPATCHER : await buildRotationDispatcher(projectDir);
+        const audit = dryRun ? async () => {} : await buildAudit(projectDir, auditOrigin(env, environments));
+
+        const outcome = await runSecretRotation(
+          registry,
+          dispatcher,
+          { name: args.name, env, environments, dryRun },
+          audit,
         );
-        return;
-      }
-      process.stdout.write(
-        `${formatList(rows)}${hiddenNote(hidden)}${unresolvedNote(applicability.unresolved, hidden)}\n`,
-      );
-    }),
-});
+        // `runSecretRotation` refuses an undeclared name before anything else happens, so reaching here with
+        // no entry is impossible — this narrows for the type checker rather than for a state that can occur.
+        if (!entry) throw new ValidationError({ message: `Secret '${args.name}' is not declared in the registry.` });
+
+        if (args.json) {
+          const rotations = [
+            {
+              name: outcome.name,
+              status: outcome.status,
+              rotation: outcome.kind,
+              rolled: outcome.rolled,
+              ...(outcome.rollFailed === undefined ? {} : { rollFailed: outcome.rollFailed }),
+              recorded: outcome.recorded,
+              stranded: outcome.stranded,
+              ...(outcome.reason === undefined ? {} : { reason: outcome.reason }),
+            },
+          ];
+          const plan = dryRun
+            ? planSecretRotation(registry, { name: args.name, env, environments }, outcome.kind)
+            : undefined;
+          process.stdout.write(
+            `${formatJsonLine({ command: "secrets rotate", name: args.name, dryRun, rotations, plan })}\n`,
+          );
+        } else {
+          for (const line of rotationReportLines(entry, outcome, env)) process.stdout.write(`${line}\n`);
+        }
+
+        // **The two ends of the same run, and they must never disagree.** Whatever the outcome, stdout has
+        // already said per secret what happened; these decide what the shell learns.
+        if (outcome.status === "unrecorded") {
+          const failure = unrecordedFailure(entry, outcome, env);
+          process.stderr.write(`${args.json ? formatErrorJson(failure.payload) : formatError(failure.payload)}\n`);
+          // Not a throw: the report above is already on stdout, and `withErrorReporting`'s `process.exit` does
+          // not wait for a pipe to drain. The status is the same 5 the line's `exit` names.
+          process.exitCode = EXIT_ROLLED_NOT_RECORDED;
+          return;
+        }
+        if (outcome.status === "failed") {
+          // Ordinary: nothing was rolled, so the previous value is still live and the run can be repeated.
+          throw rotationFailure(args.name, outcome.cause);
+        }
+        if (args.json) return;
+        if (dryRun) {
+          process.stdout.write("Dry run. Nothing rolled, nothing written.\n");
+          return;
+        }
+        // **No `Done.` over a `manual` secret.** The lines above have just told the operator that a human has
+        // to go to a console, and `Done.` under them reads as the command having handled it. The last thing
+        // they see is the instruction, which is the only thing left to act on.
+        if (outcome.reason === "manual") return;
+        process.stdout.write(`${formatDone()}\n`);
+      }),
+  }),
+  { ...MANAGED, payload: SecretsRotatePayload, mutates: true, idempotent: false },
+);
+
+/**
+ * What a rotation that failed before anything rolled throws: its recorded cause, which `withErrorReporting` puts on
+ * stderr and exits by its own kind, or a refusal of its own when none was recorded. The fallback is not decoration —
+ * `throw undefined` would exit non-zero with a blank stderr, the one report worse than a bad one. It is an upstream
+ * failure (#697): nothing rolled, the previous value is still live, and its action says to run it again, so the exit
+ * says a retry can clear it. A `ValidationError` exited 2, which tells a script only a different call can work.
+ */
+export function rotationFailure(name: string, cause: unknown): unknown {
+  return (
+    cause ??
+    new UpstreamError({
+      message: `Secret '${name}' was not rotated.`,
+      action: "Run it again. The previous value is still live.",
+      detail: `rotate '${name}': store refused with no recorded cause`,
+    })
+  );
+}
+
+const ls = withContract(
+  defineCommand({
+    meta: { name: "ls", description: "List the secrets this project's configuration actually uses" },
+    args: {
+      all: {
+        type: "boolean",
+        default: false,
+        description: "Include the secrets this configuration will never read, and why",
+      },
+      json: { type: "boolean", default: false, description: "Machine-readable output" },
+    },
+    run: ({ args }) =>
+      withErrorReporting(args.json, async () => {
+        const projectDir = process.cwd();
+        const registry = await projectSecretRegistry(projectDir);
+        // What the configuration says each of those names can reach (#541). Never throws: an answer it
+        // could not establish is an empty one, and every row then reads exactly as it did before.
+        const applicability = await projectSecretApplicability(projectDir);
+        // Hidden by default (#552). `--all` applies to both surfaces rather than only the terminal: two
+        // listings that answer the same flag differently is a thing somebody has to learn, and an agent
+        // reading `--json` is asking the same question a person at a terminal is.
+        const rows = secretListRows(registry, applicability.project, args.all);
+        const hidden = args.all ? 0 : applicability.project.size;
+        if (args.json) {
+          // `unresolved` is its own key rather than a field on a row, because it is a fact about the
+          // *answer* and not about any one secret: it says which environments these marks were decided
+          // from. An agent acting on `applies` has to be able to tell a whole project's answer from one
+          // drawn out of two of its three environments (#548).
+          process.stdout.write(
+            `${formatJsonLine({ command: "secrets ls", secrets: rows, hidden, unresolved: applicability.unresolved })}\n`,
+          );
+          return;
+        }
+        process.stdout.write(
+          `${formatList(rows)}${hiddenNote(hidden)}${unresolvedNote(applicability.unresolved, hidden)}\n`,
+        );
+      }),
+  }),
+  {
+    output: "document",
+    schemaVersion: 1,
+    payload: SecretsLsPayload,
+    mutates: false,
+    idempotent: true,
+    needsNetwork: false,
+  },
+);
 
 /**
  * `pithy secrets edit` — the local dev values, in the adopter's editor (#157).
@@ -716,36 +950,46 @@ const ls = defineCommand({
  * It resolves the path, opens it, validates what comes back, and writes it atomically at `0600`. It
  * prints a path and a count, and never a name or a value: `secrets ls` is what lists names.
  */
-const edit = defineCommand({
-  meta: { name: "edit", description: "Edit this machine's dev secret values in your editor" },
-  args: { json: { type: "boolean", default: false, description: "Machine-readable output" } },
-  run: ({ args }) =>
-    withErrorReporting(args.json, async () => {
-      // The one resolution of where the file is (`devSecrets/location.ts`). It requires a project name
-      // rather than guessing one: a guess would open one checkout's secrets from another's worktree.
-      const path = await resolveDevSecretsFile(process.cwd());
-      // Best effort, and never a reason to refuse (#323). With a registry an edit is judged against the
-      // payload each secret's destination takes; without one the file is still checked as JSONC. A
-      // project whose config will not load is the state this command exists to get somebody out of.
-      const targets = await resolveDevSecretsTargets(process.cwd())
-        .then((resolved) => resolved.targets)
-        .catch(() => []);
-      const result = await editDevSecrets({ path, registry: mergedSecretRegistry(targets) });
+const edit = withContract(
+  defineCommand({
+    meta: { name: "edit", description: "Edit this machine's dev secret values in your editor" },
+    args: { json: { type: "boolean", default: false, description: "Machine-readable output" } },
+    run: ({ args }) =>
+      withErrorReporting(args.json, async () => {
+        // The one resolution of where the file is (`devSecrets/location.ts`). It requires a project name
+        // rather than guessing one: a guess would open one checkout's secrets from another's worktree.
+        const path = await resolveDevSecretsFile(process.cwd());
+        // Best effort, and never a reason to refuse (#323). With a registry an edit is judged against the
+        // payload each secret's destination takes; without one the file is still checked as JSONC. A
+        // project whose config will not load is the state this command exists to get somebody out of.
+        const targets = await resolveDevSecretsTargets(process.cwd())
+          .then((resolved) => resolved.targets)
+          .catch(() => []);
+        const result = await editDevSecrets({ path, registry: mergedSecretRegistry(targets) });
 
-      if (args.json) {
+        if (args.json) {
+          process.stdout.write(
+            `${formatJsonLine({ command: "secrets edit", path, changed: result.changed, secrets: result.secrets })}\n`,
+          );
+          return;
+        }
         process.stdout.write(
-          `${formatJsonLine({ command: "secrets edit", path, changed: result.changed, secrets: result.secrets })}\n`,
+          result.changed
+            ? `${path} written. ${result.secrets} ${result.secrets === 1 ? "secret" : "secrets"}.\n`
+            : `${path} unchanged.\n`,
         );
-        return;
-      }
-      process.stdout.write(
-        result.changed
-          ? `${path} written. ${result.secrets} ${result.secrets === 1 ? "secret" : "secrets"}.\n`
-          : `${path} unchanged.\n`,
-      );
-      process.stdout.write(`${formatDone()}\n`);
-    }),
-});
+        process.stdout.write(`${formatDone()}\n`);
+      }),
+  }),
+  {
+    output: "document",
+    schemaVersion: 1,
+    payload: SecretsEditPayload,
+    mutates: true,
+    idempotent: true,
+    needsNetwork: false,
+  },
+);
 
 /**
  * `pithy secrets verify` — does every stored secret still open, and does anything sit in the store that
@@ -763,55 +1007,58 @@ const edit = defineCommand({
  * Everything else is defaults: no prompt on any path, `--json` on the same facts the terminal gets, and
  * an exit code a cron can branch on (`capabilities/verifySecrets.ts`).
  */
-const verify = defineCommand({
-  meta: { name: "verify", description: "Check every stored secret still opens, and what the store holds" },
-  args: {
-    env: {
-      type: "string",
-      description: `Verify one environment instead of every declared one: ${DEFAULT_ENVIRONMENTS.join(" | ")}, or one declared in pithy.config.ts`,
+const verify = withContract(
+  defineCommand({
+    meta: { name: "verify", description: "Check every stored secret still opens, and what the store holds" },
+    args: {
+      env: {
+        type: "string",
+        description: `Verify one environment instead of every declared one: ${DEFAULT_ENVIRONMENTS.join(" | ")}, or one declared in pithy.config.ts`,
+      },
+      sweep: {
+        type: "boolean",
+        default: true,
+        description: "Also list the account's Secrets Store and report entries no composed name accounts for",
+      },
+      json: { type: "boolean", default: false, description: "Machine-readable output" },
     },
-    sweep: {
-      type: "boolean",
-      default: true,
-      description: "Also list the account's Secrets Store and report entries no composed name accounts for",
-    },
-    json: { type: "boolean", default: false, description: "Machine-readable output" },
-  },
-  run: ({ args }) =>
-    withErrorReporting(args.json, async () => {
-      const projectDir = process.cwd();
-      const environments = await projectEnvironments(projectDir);
-      const targets = args.env
-        ? [requireManagedEnvironment(args.env, environments)]
-        : managedEnvironments(environments);
+    run: ({ args }) =>
+      withErrorReporting(args.json, async () => {
+        const projectDir = process.cwd();
+        const environments = await projectEnvironments(projectDir);
+        const targets = args.env
+          ? [requireManagedEnvironment(args.env, environments)]
+          : managedEnvironments(environments);
 
-      const report: VerificationReport = {
-        environments: await runSecretsVerification({
-          verifier: await buildDispatcher(projectDir),
-          environments: targets,
-        }),
-        // The credentials the sweep needs are resolved inside it, so `--no-sweep` pays for none of them.
-        ...(args.sweep ? await storeSweep(projectDir, environments) : { sweep: null, notSwept: null }),
-      };
+        const report: VerificationReport = {
+          environments: await runSecretsVerification({
+            verifier: await buildDispatcher(projectDir),
+            environments: targets,
+          }),
+          // The credentials the sweep needs are resolved inside it, so `--no-sweep` pays for none of them.
+          ...(args.sweep ? await storeSweep(projectDir, environments) : { sweep: null, notSwept: null }),
+        };
 
-      if (args.json) process.stdout.write(`${formatJsonLine(verificationJson(report))}\n`);
-      else for (const line of verificationReportLines(report)) process.stdout.write(`${line}\n`);
+        // **The finding decides, and it decides before the fault does.** One flaky environment beside one
+        // broken store must not exit 4 — that is the code a cron retries, and this is the state no retry
+        // fixes. Only a run that found nothing ends as the fault, and then under `--json` the error line is
+        // the whole answer: a document beside it would say `exitCode: 0` for a process exiting otherwise (#697).
+        const outcome = verificationOutcome(report);
+        if (args.json) {
+          if (outcome.kind === "report") process.stdout.write(`${formatJsonLine(verificationJson(report))}\n`);
+        } else for (const line of verificationReportLines(report)) process.stdout.write(`${line}\n`);
 
-      // **The finding decides, and it decides before the fault does.** One flaky environment beside one
-      // broken store must not exit 1 — that is the code a cron retries, and this is the state no retry
-      // fixes. Only a run that found nothing rethrows, and only then does the exit status belong to
-      // whatever went wrong.
-      const verdict = verificationVerdict(report);
-      if (verdict === "failed" || verdict === "key-unreadable") {
-        process.exitCode = verificationExitCode(verdict);
-        return;
-      }
-      const unreachable = firstUnreachable(report);
-      if (unreachable !== undefined) throw unreachable;
-      if (args.json) return;
-      process.stdout.write(`${formatDone()}\n`);
-    }),
-});
+        if (outcome.kind === "fault") throw outcome.error;
+        if (outcome.exitCode !== 0) {
+          process.exitCode = outcome.exitCode;
+          return;
+        }
+        if (args.json) return;
+        process.stdout.write(`${formatDone()}\n`);
+      }),
+  }),
+  { ...MANAGED, payload: SecretsVerifyPayload, mutates: false, idempotent: true },
+);
 
 /**
  * The store half: list the account's Secrets Store and classify every entry against what this project
@@ -826,12 +1073,13 @@ async function storeSweep(
   environments: DeclaredEnvironments | readonly string[],
 ): Promise<Pick<VerificationReport, "sweep" | "notSwept">> {
   try {
-    const { accountId, apiToken, storeId } = loadCloudflareCreds(await projectCloudflareAccount(projectDir), {
-      requireStore: true,
-    });
+    const { accountId, apiToken, storeId } = commandCredentials(
+      await projectCloudflareAccount(projectDir),
+      secretsStoreNeed(projectDir),
+    );
     const project = requireProjectName(await loadProject(projectDir));
     const managed = managedEnvironments(environments);
-    const { registry, complete } = await projectSecrets(projectDir);
+    const { registry, complete } = await mergedProjectSecrets(projectDir);
     const cf = await cloudflareClients({ accountId, apiToken });
     // A `deleted` entry is not in the store (#643). Classifying one would report debris that Cloudflare
     // has already removed.
@@ -859,227 +1107,229 @@ async function storeSweep(
   }
 }
 
-const provision = defineCommand({
-  meta: { name: "provision", description: "Provision the per-environment secrets infrastructure" },
-  args: { json: { type: "boolean", default: false, description: "Machine-readable output" } },
-  run: ({ args }) =>
-    withErrorReporting(args.json, async () => {
-      const projectDir = process.cwd();
-      const { account, accountId, apiToken, storeId } = loadCloudflareCreds(
-        await projectCloudflareAccount(projectDir),
-        {
-          requireStore: true,
-        },
-      );
-      // Never `resolveProjectName`: every Secrets Store entry and the manager's token name derive from
-      // this, and deprovision has to recompute them exactly. A guessed name would name resources
-      // teardown can never find again.
-      const project = requireProjectName(await loadProject(projectDir));
-      const cf = await cloudflareClients({ accountId, apiToken });
-      // Provisioning spans every managed environment, not one — "dev" is the fallback the audit
-      // database resolves against when a command has no single target env (mirrors `pithy feature`).
-      const provisioner = new CloudflareSecretsProvisioner({
-        cf,
-        account,
-        project,
-        storeId,
-        deploy: buildManagerDeploy({ accountId, apiToken, cf, project, projectDir }),
-        audit: await buildAudit(projectDir, "dev"),
-      });
-
-      const environments = await projectEnvironments(projectDir);
-      const result = await provisionSecrets(provisioner, environments);
-
-      // **The step the deferral was deferring to (#238).** `pithy add` cannot write a `secret` binding —
-      // the entry needs a `store_id` and a `secret_name` that do not exist until an account has been
-      // reached — and `ensureSecretsStoreId` records nothing in five cases besides. Provisioning is when
-      // the store certainly exists and every entry has certainly been written, so this is where the
-      // adopter's own Workers get the stanza. It corrects an existing entry rather than duplicating it,
-      // and leaves a binding this registry does not declare exactly where the adopter put it.
-      //
-      // `dev` is deliberately not among them: local dev materializes every `cf-secrets-store` secret into
-      // the generated `.dev.vars` (#179), so a stanza there would name entries a local run never reads.
-      const store = cloudflareSecretsStore(cf, storeId);
-      // One emitter per environment, resolved once: `buildAudit` reaches the account and the Worker set,
-      // and it is the same answer for every Worker in a given environment.
-      const audits = new Map(
-        await Promise.all(environments.map(async (env) => [env, await buildAudit(projectDir, env)] as const)),
-      );
-      const wired: { worker: string; env: string; bindings: string[]; created: string[] }[] = [];
-      for (const worker of await resolveWorkers({ projectDir })) {
-        const registry = workerSecretRegistry(worker.capabilities);
-        if (!registry) continue;
-        for (const env of environments) {
-          const { bound, minted } = await secretsStoreBindings({
-            registry,
-            scope: environmentScope(project, env),
-            storeId,
-            exists: (name) => store.exists(name),
-            // Every environment's master key exists by now, so this is the point where a declared
-            // mintable secret can be created and bound in one pass rather than named as homework (#321).
-            mint: storeSecretMinter({
-              store,
-              environment: env,
-              ...(audits.get(env) ? { audit: audits.get(env) } : {}),
-            }),
-          });
-          if (bound.length === 0) continue;
-          await applySecretBindings(worker.dir, env, bound);
-          wired.push({ worker: worker.name, env, bindings: bound.map((entry) => entry.binding), created: minted });
-        }
-      }
-
-      // **The other half of #321, and the half its own commit message describes.** The loop above creates
-      // the `cf-secrets-store` secrets a Worker binds — the email link-signing key among them since #596.
-      // Every `d1` secret the *kit* declares arbitrary — the auth session secret — used to end provisioning
-      // with an operator told to go and generate random bytes for each. This is the point where it can stop
-      // doing that: `provisionSecrets` above has deployed each environment's manager, and the manager is
-      // the only thing that can decide whether one of these already exists, because its value is sealed
-      // under a master key the CLI never holds. So the managers are **asked** first, across every
-      // environment at once, and only then written to. See `capabilities/mintSecrets.ts`.
-      //
-      // One audit emitter is picked rather than one per environment: this loop spans every environment
-      // a `global` secret reaches, and the event's own `environments` field is what says where a value
-      // went. `dev` is the same fallback `buildAudit` above uses for a command with no single target.
-      //
-      // **A run that fails here has usually written something.** The fan-out creates a signing key per
-      // environment, so a fault after the first write leaves key material behind — and until #324 the
-      // report of it was assembled after the loop and died with the throw. So what landed is caught and
-      // printed *before* the error is rethrown: `withErrorReporting` then writes the failure to stderr
-      // and exits 1, and stdout carries what the run actually did. Both streams, and the exit code,
-      // agree that it failed and name what it wrote on the way.
-      const managers = await buildDispatcher(projectDir);
-      let generated: MintedSecret[];
-      try {
-        generated = await mintDeclaredSecrets({
-          registry: await projectSecretRegistry(projectDir),
-          dispatcher: managers,
-          probe: managers,
-          environments,
+const provision = withContract(
+  defineCommand({
+    meta: { name: "provision", description: "Provision the per-environment secrets infrastructure" },
+    args: { json: { type: "boolean", default: false, description: "Machine-readable output" } },
+    run: ({ args }) =>
+      withErrorReporting(args.json, async () => {
+        const projectDir = process.cwd();
+        const { account, accountId, apiToken, storeId } = commandCredentials(
+          await projectCloudflareAccount(projectDir),
+          secretsStoreNeed(projectDir),
+        );
+        // Never `resolveProjectName`: every Secrets Store entry and the manager's token name derive from
+        // this, and deprovision has to recompute them exactly. A guessed name would name resources
+        // teardown can never find again.
+        const project = requireProjectName(await loadProject(projectDir));
+        const cf = await cloudflareClients({ accountId, apiToken });
+        // Provisioning spans every managed environment, not one — "dev" is the fallback the audit
+        // database resolves against when a command has no single target env (mirrors `pithy feature`).
+        const provisioner = new CloudflareSecretsProvisioner({
+          cf,
+          account,
+          project,
+          storeId,
+          deploy: buildManagerDeploy({ accountId, apiToken, cf, project, projectDir }),
           audit: await buildAudit(projectDir, "dev"),
         });
-      } catch (error) {
-        const landed = mintedBeforeFailure(error);
+
+        const environments = await projectEnvironments(projectDir);
+        const result = await provisionSecrets(provisioner, environments);
+
+        // **The step the deferral was deferring to (#238).** `pithy add` cannot write a `secret` binding —
+        // the entry needs a `store_id` and a `secret_name` that do not exist until an account has been
+        // reached — and `ensureSecretsStoreId` records nothing in five cases besides. Provisioning is when
+        // the store certainly exists and every entry has certainly been written, so this is where the
+        // adopter's own Workers get the stanza. It corrects an existing entry rather than duplicating it,
+        // and leaves a binding this registry does not declare exactly where the adopter put it.
+        //
+        // `dev` is deliberately not among them: local dev materializes every `cf-secrets-store` secret into
+        // the generated `.dev.vars` (#179), so a stanza there would name entries a local run never reads.
+        const store = cloudflareSecretsStore(cf, storeId);
+        // One emitter per environment, resolved once: `buildAudit` reaches the account and the Worker set,
+        // and it is the same answer for every Worker in a given environment.
+        const audits = new Map(
+          await Promise.all(environments.map(async (env) => [env, await buildAudit(projectDir, env)] as const)),
+        );
+        const wired: { worker: string; env: string; bindings: string[]; created: string[] }[] = [];
+        for (const worker of await resolveWorkers({ projectDir })) {
+          const registry = workerSecretRegistry(worker.capabilities);
+          if (!registry) continue;
+          for (const env of environments) {
+            const { bound, minted } = await secretsStoreBindings({
+              registry,
+              scope: environmentScope(project, env),
+              storeId,
+              exists: (name) => store.exists(name),
+              // Every environment's master key exists by now, so this is the point where a declared
+              // mintable secret can be created and bound in one pass rather than named as homework (#321).
+              mint: storeSecretMinter({
+                store,
+                environment: env,
+                ...(audits.get(env) ? { audit: audits.get(env) } : {}),
+              }),
+            });
+            if (bound.length === 0) continue;
+            await applySecretBindings(worker.dir, env, bound);
+            wired.push({ worker: worker.name, env, bindings: bound.map((entry) => entry.binding), created: minted });
+          }
+        }
+
+        // **The other half of #321, and the half its own commit message describes.** The loop above creates
+        // the `cf-secrets-store` secrets a Worker binds — the email link-signing key among them since #596.
+        // Every `d1` secret the *kit* declares arbitrary — the auth session secret — used to end provisioning
+        // with an operator told to go and generate random bytes for each. This is the point where it can stop
+        // doing that: `provisionSecrets` above has deployed each environment's manager, and the manager is
+        // the only thing that can decide whether one of these already exists, because its value is sealed
+        // under a master key the CLI never holds. So the managers are **asked** first, across every
+        // environment at once, and only then written to. See `capabilities/mintSecrets.ts`.
+        //
+        // One audit emitter is picked rather than one per environment: this loop spans every environment
+        // a `global` secret reaches, and the event's own `environments` field is what says where a value
+        // went. `dev` is the same fallback `buildAudit` above uses for a command with no single target.
+        //
+        // **A run that fails here has usually written something.** The fan-out creates a signing key per
+        // environment, so a fault after the first write leaves key material behind — and until #324 the
+        // report of it was assembled after the loop and died with the throw. So what landed is caught and
+        // printed *before* the error is rethrown: `withErrorReporting` then writes the failure to stderr
+        // and exits by its kind, and stdout carries what the run actually did. Both streams, and the exit code,
+        // agree that it failed and name what it wrote on the way.
+        const managers = await buildDispatcher(projectDir);
+        let generated: MintedSecret[];
+        try {
+          generated = await mintDeclaredSecrets({
+            registry: await projectSecretRegistry(projectDir),
+            dispatcher: managers,
+            probe: managers,
+            environments,
+            audit: await buildAudit(projectDir, "dev"),
+          });
+        } catch (error) {
+          const landed = mintedBeforeFailure(error);
+          if (args.json) {
+            process.stdout.write(
+              `${formatJsonLine({
+                command: "secrets provision",
+                environments: result.perEnv,
+                wired,
+                generated: landed,
+                interrupted: true,
+              })}\n`,
+            );
+          } else {
+            for (const line of mintReportLines(landed)) process.stdout.write(`${line}\n`);
+          }
+          throw error;
+        }
+
+        if (args.json) {
+          process.stdout.write(
+            `${formatJsonLine({ command: "secrets provision", environments: result.perEnv, wired, generated })}\n`,
+          );
+          return;
+        }
+        for (const env of result.perEnv) {
+          process.stdout.write(`${env.env}: database, key, and manager ready.\n`);
+        }
+        for (const entry of wired) {
+          process.stdout.write(`${entry.worker} env.${entry.env} binds ${entry.bindings.join(", ")}.\n`);
+          if (entry.created.length > 0) {
+            process.stdout.write(`${entry.env}: created ${entry.created.join(", ")}.\n`);
+          }
+        }
+        // It used to say only "ready", because the manager decided whether a value was written and never
+        // reported back. It reports now, so the run can say the thing an operator actually needs to know:
+        // whether this run generated a production signing key, or found one already there. The same
+        // renderer as the interrupted path above — one phrasing, so a partial report cannot read as a
+        // complete one.
+        for (const line of mintReportLines(generated)) process.stdout.write(`${line}\n`);
+        process.stdout.write(`${formatDone()}\n`);
+      }),
+  }),
+  { ...MANAGED, payload: SecretsProvisionPayload, mutates: true, idempotent: true },
+);
+
+const deprovision = withContract(
+  defineCommand({
+    meta: { name: "deprovision", description: "Remove one environment's secrets manager Worker and database" },
+    args: {
+      // No default (#591): a bare `deprovision` deleted every declared environment's vault.
+      env: TEARDOWN_ENV_ARG,
+      keys: { type: "boolean", default: false, description: "Also delete the environment's master key (irreversible)" },
+      "destroy-retained": { type: "string", description: DESTROY_RETAINED_DESCRIPTION },
+      json: { type: "boolean", default: false, description: "Machine-readable output" },
+    },
+    run: ({ args }) =>
+      withErrorReporting(args.json, async () => {
+        const projectDir = process.cwd();
+        const declared = await projectEnvironments(projectDir);
+        // Settled before any credential is read: naming nothing, or something undeclared, costs nothing and
+        // lists what could be named. `deprovisionSecrets` resolves it again — it is the one that deletes.
+        const environment = requireTeardownEnvironment(args.env, declared);
+        const destroyRetained = parseDestroyRetained(args["destroy-retained"]);
+        const { account, accountId, apiToken, storeId } = commandCredentials(
+          await projectCloudflareAccount(projectDir),
+          secretsStoreNeed(projectDir),
+        );
+        const cf = await cloudflareClients({ accountId, apiToken });
+        const deprovisioner = new CloudflareSecretsDeprovisioner({
+          account,
+          cf,
+          project: requireProjectName(await loadProject(projectDir)),
+          storeId,
+          audit: await buildAudit(projectDir, "dev"),
+          // The operator's number, spent at the delete — never the count the preflight is about to make.
+          budget: new RetainedBudget(destroyRetained),
+        });
+
+        // Held here as well as in `deprovisionSecrets`: whichever copy runs deletes only what was typed, for this
+        // environment alone, and the shared token only once no other environment runs a manager (#591).
+        const confined = await confineTeardown({
+          kit: "@pithy-sh/secrets",
+          target: environment,
+          declared,
+          runs: (other) => deprovisioner.hasManager(other),
+          deprovisioner,
+          rules: {
+            countRetained: "read",
+            hasManager: "read",
+            deleteManager: "environment",
+            deleteMasterKey: args.keys ? "environment" : "refused",
+            deleteDatabase: "environment",
+            deleteManagerToken: "last",
+          },
+        });
+        const result = await deprovisionSecrets(
+          confined,
+          { environment, declared },
+          { deleteKeys: args.keys, destroyRetained },
+        );
+
         if (args.json) {
           process.stdout.write(
             `${formatJsonLine({
-              command: "secrets provision",
-              environments: result.perEnv,
-              wired,
-              generated: landed,
-              interrupted: true,
+              command: "secrets deprovision",
+              env: result.environment,
+              keysDeleted: args.keys,
+              managerTokenDeleted: result.managerTokenDeleted,
             })}\n`,
           );
-        } else {
-          for (const line of mintReportLines(landed)) process.stdout.write(`${line}\n`);
+          return;
         }
-        throw error;
-      }
-
-      if (args.json) {
         process.stdout.write(
-          `${formatJsonLine({ command: "secrets provision", environments: result.perEnv, wired, generated })}\n`,
+          `${result.environment}: manager and database removed${args.keys ? ", and the master key" : ""}.\n`,
         );
-        return;
-      }
-      for (const env of result.perEnv) {
-        process.stdout.write(`${env.env}: database, key, and manager ready.\n`);
-      }
-      for (const entry of wired) {
-        process.stdout.write(`${entry.worker} env.${entry.env} binds ${entry.bindings.join(", ")}.\n`);
-        if (entry.created.length > 0) {
-          process.stdout.write(`${entry.env}: created ${entry.created.join(", ")}.\n`);
-        }
-      }
-      // It used to say only "ready", because the manager decided whether a value was written and never
-      // reported back. It reports now, so the run can say the thing an operator actually needs to know:
-      // whether this run generated a production signing key, or found one already there. The same
-      // renderer as the interrupted path above — one phrasing, so a partial report cannot read as a
-      // complete one.
-      for (const line of mintReportLines(generated)) process.stdout.write(`${line}\n`);
-      process.stdout.write(`${formatDone()}\n`);
-    }),
-});
-
-const deprovision = defineCommand({
-  meta: { name: "deprovision", description: "Remove one environment's secrets manager Worker and database" },
-  args: {
-    // No default (#591): a bare `deprovision` deleted every declared environment's vault.
-    env: TEARDOWN_ENV_ARG,
-    keys: { type: "boolean", default: false, description: "Also delete the environment's master key (irreversible)" },
-    "destroy-retained": { type: "string", description: DESTROY_RETAINED_DESCRIPTION },
-    json: { type: "boolean", default: false, description: "Machine-readable output" },
-  },
-  run: ({ args }) =>
-    withErrorReporting(args.json, async () => {
-      const projectDir = process.cwd();
-      const declared = await projectEnvironments(projectDir);
-      // Settled before any credential is read: naming nothing, or something undeclared, costs nothing and
-      // lists what could be named. `deprovisionSecrets` resolves it again — it is the one that deletes.
-      const environment = requireTeardownEnvironment(args.env, declared);
-      const destroyRetained = parseDestroyRetained(args["destroy-retained"]);
-      const { account, accountId, apiToken, storeId } = loadCloudflareCreds(
-        await projectCloudflareAccount(projectDir),
-        {
-          requireStore: true,
-        },
-      );
-      const cf = await cloudflareClients({ accountId, apiToken });
-      const deprovisioner = new CloudflareSecretsDeprovisioner({
-        account,
-        cf,
-        project: requireProjectName(await loadProject(projectDir)),
-        storeId,
-        audit: await buildAudit(projectDir, "dev"),
-        // The operator's number, spent at the delete — never the count the preflight is about to make.
-        budget: new RetainedBudget(destroyRetained),
-      });
-
-      // Held here as well as in `deprovisionSecrets`: whichever copy runs deletes only what was typed, for this
-      // environment alone, and the shared token only once no other environment runs a manager (#591).
-      const confined = await confineTeardown({
-        kit: "@pithy-sh/secrets",
-        target: environment,
-        declared,
-        runs: (other) => deprovisioner.hasManager(other),
-        deprovisioner,
-        rules: {
-          countRetained: "read",
-          hasManager: "read",
-          deleteManager: "environment",
-          deleteMasterKey: args.keys ? "environment" : "refused",
-          deleteDatabase: "environment",
-          deleteManagerToken: "last",
-        },
-      });
-      const result = await deprovisionSecrets(
-        confined,
-        { environment, declared },
-        { deleteKeys: args.keys, destroyRetained },
-      );
-
-      if (args.json) {
         process.stdout.write(
-          `${formatJsonLine({
-            command: "secrets deprovision",
-            env: result.environment,
-            keysDeleted: args.keys,
-            managerTokenDeleted: result.managerTokenDeleted,
-          })}\n`,
+          result.managerTokenDeleted
+            ? "Manager token removed. No environment runs a manager.\n"
+            : "Manager token kept. Another environment still runs a manager.\n",
         );
-        return;
-      }
-      process.stdout.write(
-        `${result.environment}: manager and database removed${args.keys ? ", and the master key" : ""}.\n`,
-      );
-      process.stdout.write(
-        result.managerTokenDeleted
-          ? "Manager token removed. No environment runs a manager.\n"
-          : "Manager token kept. Another environment still runs a manager.\n",
-      );
-      process.stdout.write(`${formatDone()}\n`);
-    }),
-});
+        process.stdout.write(`${formatDone()}\n`);
+      }),
+  }),
+  { ...MANAGED, payload: SecretsDeprovisionPayload, mutates: true, idempotent: true },
+);
 
 export default defineCommand({
   meta: { name: "secrets", description: "Manage encrypted secrets" },

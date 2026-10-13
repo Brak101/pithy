@@ -2,23 +2,30 @@
 // SPDX-License-Identifier: MIT
 
 import type { Capability } from "@pithy-sh/core/src/capability/capability";
-import { ValidationError } from "@pithy-sh/core/src/error/pithyError";
+import { type Caller, callerOf } from "@pithy-sh/core/src/cli/command";
+import { PreconditionFailedError, ValidationError } from "@pithy-sh/core/src/error/pithyError";
 import type { FeatureIdentity } from "@pithy-sh/core/src/naming/feature";
-import { environmentScope, featureScope } from "@pithy-sh/core/src/naming/provisionScope";
+import { environmentScope, featureScope, type ProvisionScope } from "@pithy-sh/core/src/naming/provisionScope";
 import type { SecretDispatcher, SecretProbe } from "@pithy-sh/secrets/src/cli/dispatch";
 import { isProvisionableSecret, type SecretRegistry } from "@pithy-sh/secrets/src/registry";
 import { defineCommand } from "citty";
+import { z } from "zod";
 import { type CliAuditEmit, createCliAudit } from "../audit/cliAudit";
-import { mintReportLines, storeSecretMinter } from "../capabilities/mintSecrets";
+import { ManifestFault } from "../capabilities/manifests";
+import { MintedSecret, mintReportLines, storeSecretMinter } from "../capabilities/mintSecrets";
 import { buildSecretDispatcher } from "../capabilities/secretsDispatcher";
 import { CloudflareSecretsProvisioner } from "../capabilities/secretsProvisioner";
 import { cloudflareFeatureIndexes } from "../capabilities/vectorProvisioner";
 import { cloudflareClients, cloudflareWorkflows } from "../cloudflare/clients";
 import { type CloudflareAccountSelection, cloudflareAccountConfirmation, cloudflareEnv } from "../cloudflare/config";
 import { accountWorkersSubdomain } from "../cloudflare/workersSubdomain";
+import { withContract } from "../contract/commandContract";
+import { EVENTS_ARG, EVENTS_NEED_JSON, eventsOption, eventsRecord } from "../contract/events";
 import { featureOwnedIds } from "../feature/hosts";
 import { branchIdentity } from "../feature/identity";
+import { FeatureResource } from "../feature/manifest";
 import { provisionFeature } from "../feature/provision";
+import { DRY_RUN_ARG, type Plan, PlanKey, planText } from "../plan/plan";
 import { resolveWorkersFor } from "../project/composeFor";
 import {
   administersItself,
@@ -28,10 +35,11 @@ import {
   projectCloudflareAccount,
   requireProjectName,
 } from "../project/config";
-import { deployKitWorkers, summarizeKitDeploy } from "../project/deployKit";
+import { deployKitWorkers, KitWorkerDeploy, summarizeKitDeploy } from "../project/deployKit";
 import { requireManagedEnvironment } from "../project/environment";
 import { projectCapabilities, type ResolvedWorker } from "../project/workerScope";
 import { assertProvisionConfirmed, provisionConfirmPhrase } from "../provision/confirm";
+import { plannedFeatureHosts, planProvision } from "../provision/dryRun";
 import {
   type ProvisionedDecline,
   type ProvisionedResource,
@@ -50,10 +58,14 @@ import {
   type FeatureIndexes,
   type ResourceProvisioners,
 } from "../provision/resources";
-import { secretsStoreBindings, workerSecretRegistry } from "../provision/secretBindings";
+import { type MintStoreSecret, secretsStoreBindings, workerSecretRegistry } from "../provision/secretBindings";
 import { storeEntryRemedy } from "../provision/secretEntryRemedy";
 import { cloudflareSecretsStore, type SecretsStore } from "../provision/store";
-import { formatDone, formatJsonLine, withErrorReporting } from "../terminal/output";
+import { provisionNextEntry } from "../provision/undeployed";
+import { canceled } from "../terminal/exitClass";
+import { mayPrompt } from "../terminal/inputMode";
+import { NextKey, type NextStep } from "../terminal/nextSteps";
+import { eventsProgress, formatDone, formatJsonLine, withErrorReporting } from "../terminal/output";
 import { commandProgress } from "../terminal/progress";
 
 /**
@@ -202,13 +214,14 @@ async function buildAudit(
 }
 
 /** The interactive confirm prompt for a production environment. Names what is about to happen first. */
-function confirmPrompt(env: string): () => Promise<string> {
+export function confirmPrompt(env: string): () => Promise<string> {
   return async () => {
     const { isCancel, text } = await import("@clack/prompts");
     const answer = await text({
       message: `This creates Cloudflare resources in ${env}. Type "${provisionConfirmPhrase(env)}" to confirm:`,
     });
-    return isCancel(answer) ? "" : answer;
+    if (isCancel(answer)) canceled();
+    return answer;
   };
 }
 
@@ -219,7 +232,7 @@ async function requireProvisioners(
 ): Promise<ResourceProvisioners> {
   const provisioners = await buildProvisioners(account);
   if (provisioners) return provisioners;
-  throw new ValidationError({
+  throw new PreconditionFailedError({
     message: "Cloudflare credentials are missing.",
     action: `Set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN to provision ${target}.`,
   });
@@ -247,6 +260,28 @@ export interface ProvisionRunOptions {
   seed: boolean;
   /** `--json`. */
   json: boolean;
+  /** The caller's own run, the one input a line naming it again is built from (#711). */
+  caller?: Caller<"provision">;
+  /** `--events`: with `--json`, a progress record per step before the report (#697). */
+  events?: boolean;
+  /** `--dry-run`: plan the run, and create, write and migrate nothing. */
+  dryRun?: boolean;
+}
+
+/**
+ * A Worker's `secrets_store_secrets` entries, over one store, minting through `mint` — the seam both the run
+ * and its plan hand `provisionEnvironment`, so the two bind the same secrets by the same rule.
+ */
+function storeBindings(store: SecretsStore, scope: ProvisionScope, mint: MintStoreSecret) {
+  return async (workerCapabilities: Capability[]) =>
+    secretsStoreBindings({
+      // A Worker composing no secrets capability declares no secrets, and gets no stanza.
+      registry: workerSecretRegistry(workerCapabilities) ?? {},
+      scope,
+      storeId: store.storeId,
+      exists: (name) => store.exists(name),
+      mint,
+    });
 }
 
 /**
@@ -273,16 +308,19 @@ function resourceLine(resource: ProvisionedResource): string {
  * was here was the whole vocabulary, named and filed under provisioning — which is exactly why `pithy
  * deploy` never inherited it and printed nothing for minutes. What is left here is the only part that is
  * genuinely about provisioning: a resource has a name, and it was created or it already existed.
+ *
+ * **Under `--json --events` it is a record per resource instead (#697)**: the start carries the binding and
+ * kind, the settle the row `resources` will list, beside the line a person would have read.
  */
-export function provisionProgress(options: { json: boolean }): ProvisionProgress | undefined {
-  const progress = commandProgress(options);
+export function provisionProgress(options: { json: boolean; events?: boolean }): ProvisionProgress | undefined {
+  const progress = options.json && options.events ? eventsProgress("provision") : commandProgress(options);
   if (!progress) return undefined;
   return (event) =>
     // `▸ <name>...` before the find, then the settled line the summary used to hold until the end.
     progress(
       event.phase === "start"
-        ? { phase: "start", what: event.name }
-        : { phase: "settled", line: resourceLine(event.resource) },
+        ? { phase: "start", what: event.name, data: { binding: event.binding, kind: event.kind } }
+        : { phase: "settled", line: resourceLine(event.resource), data: { resource: event.resource } },
     );
 }
 
@@ -425,6 +463,13 @@ export function writeReport(
      * Defaulted off, because `--json` streams nothing and neither does any caller that passes no sink.
      */
     streamed?: boolean;
+    /**
+     * The plan, under `--dry-run` (#697). The report beside it is the run's as it would be; the plan is what
+     * would change, and the text output is the plan alone.
+     */
+    plan?: Plan;
+    /** What the run left required (#697): `pithy deploy`, when a Worker it names is not deployed. JSON only. */
+    next?: NextStep[];
   },
 ): void {
   if (options.json) {
@@ -434,8 +479,19 @@ export function writeReport(
         ...report,
         pendingSecrets: options.pending.names,
         pendingSecretsRemedy: options.pending.remedy,
+        dryRun: options.plan !== undefined,
+        // Absent from the line when there is none: `JSON.stringify` drops an undefined member.
+        plan: options.plan,
+        next: options.next,
       })}\n`,
     );
+    return;
+  }
+  if (options.plan !== undefined) {
+    for (const line of manifestFaultLines(report.manifestFaults)) process.stderr.write(`${line}\n`);
+    for (const line of planText(options.plan)) process.stdout.write(`${line}\n`);
+    for (const line of pendingSecretLines(options.pending)) process.stdout.write(`${line}\n`);
+    process.stdout.write("Dry run. Nothing written.\n");
     return;
   }
   if (!options.streamed) {
@@ -547,21 +603,76 @@ async function provisionDeclared(
   // that nothing else in the CLI would ever look for again. It is also what closes `--env feature`:
   // that name is a legal stanza key and an illegal declaration, so no project can admit it.
   const environment = requireManagedEnvironment(env, loadProjectEnvironments(config));
-  const interactive = !options.json && Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
+  const interactive = mayPrompt(options.json);
   const project = requireProjectName(config);
   // The scope carries both the names and the stanza. There is no second argument to disagree with.
   const scope = environmentScope(project, environment);
   // Resolved once, read by the plan and by the run — so the two cannot name different Workers.
   const resolved = workerSetOnce(projectDir, scope.stanza);
   const workers = async (): Promise<ProvisionWorker[]> => provisionWorkers(await resolved());
+  // Read from the root config this command already loaded, never from the shape of what it composes:
+  // composing the control plane makes a Worker administrable by anybody, and only the project can say
+  // that the client is itself (#616). Read once, for the run and for its plan.
+  const declared = { administersItself: administersItself(config) };
+  if (options.dryRun) {
+    // Before the confirmation, as `pithy seed --dry-run` is: a plan creates nothing, so there is nothing to agree to.
+    // Not before the credentials: the run refuses without them before it creates anything, and a dry run makes
+    // every refusal the run makes before it plans (`docs/CLI.md` §1.2). A plan the run would refuse is a
+    // promise nobody can keep.
+    const account = loadProjectCloudflare(config) ?? null;
+    const provisioners = await requireProvisioners(account, environment);
+    const capabilities = projectCapabilities(await resolved());
+    const { report, plan } = await planProvision({
+      projectDir,
+      project,
+      env: scope.stanza,
+      account,
+      provisioners,
+      store: await buildStore(account),
+      seed: options.seed,
+      ...(config.seed?.productionEnvironments !== undefined
+        ? { productionEnvironments: config.seed.productionEnvironments }
+        : {}),
+      run: async (seams) =>
+        provisionEnvironment({
+          projectDir: seams.projectDir,
+          scope,
+          capabilities,
+          provisioners: seams.provisioners,
+          resolveWorkers: async () => seams.workers(await workers()),
+          ...(seams.store
+            ? {
+                secretBindings: storeBindings(
+                  seams.store,
+                  scope,
+                  storeSecretMinter({ store: seams.store, environment: scope.stanza, audit: seams.audit }),
+                ),
+              }
+            : {}),
+          seedData: options.seed,
+          ...declared,
+          migrate: seams.migrate,
+          seed: seams.seed,
+          audit: seams.audit,
+        }),
+    });
+    writeReport(report, {
+      json: options.json,
+      seeded: options.seed,
+      pending: deferredSecrets(capabilities, mode),
+      registry: workerSecretRegistry(capabilities) ?? {},
+      plan,
+    });
+    return;
+  }
   const progress = provisionProgress(options);
   await assertProvisionConfirmed({
     env: environment,
     yes: options.yes,
     json: options.json,
-    // The plan, before anyone agrees to it and before the first Cloudflare call (#515). Under `--json`
-    // there is no sink, so nothing is resolved for it and nothing is printed.
-    ...(progress
+    // The plan, before anyone agrees to it and before the first Cloudflare call (#515). It is prose, so under
+    // `--json` nothing is resolved for it and nothing is printed — `--events` included, whose stdout is records.
+    ...(!options.json
       ? {
           announce: async () => {
             const plan = await provisionPlan({
@@ -599,20 +710,16 @@ async function provisionDeclared(
     ...(progress ? { onProgress: progress } : {}),
     ...(store
       ? {
-          secretBindings: async (workerCapabilities) =>
-            secretsStoreBindings({
-              // A Worker composing no secrets capability declares no secrets, and gets no stanza.
-              registry: workerSecretRegistry(workerCapabilities) ?? {},
-              scope,
-              storeId: store.storeId,
-              exists: (name) => store.exists(name),
-              // A declared secret whose value is arbitrary is created here rather than printed as
-              // homework (#321). Absence is checked first, so an existing value is never replaced.
-              // Remembered for this process's seed step, which runs only under `--seed` (#660). What is
-              // created here goes into a store the CLI cannot read back, so a fixture that must seal
-              // something under one of these values has this run and no other.
-              mint: storeSecretMinter({ store, environment: scope.stanza, audit, minted }),
-            }),
+          secretBindings: storeBindings(
+            store,
+            scope,
+            // A declared secret whose value is arbitrary is created here rather than printed as
+            // homework (#321). Absence is checked first, so an existing value is never replaced.
+            // Remembered for this process's seed step, which runs only under `--seed` (#660). What is
+            // created here goes into a store the CLI cannot read back, so a fixture that must seal
+            // something under one of these values has this run and no other.
+            storeSecretMinter({ store, environment: scope.stanza, audit, minted }),
+          ),
         }
       : {}),
     // Off unless asked. A declared environment already holds real rows; seeding one is `pithy seed`'s
@@ -621,10 +728,7 @@ async function provisionDeclared(
     // The read side of the record the minter above fills. Empty on a re-run, and empty when this project
     // reaches no Secrets Store at all — both of which are answers rather than faults (#660).
     mintedThisRun: minted,
-    // Read from the root config this command already loaded, never from the shape of what it composes:
-    // composing the control plane makes a Worker administrable by anybody, and only the project can say
-    // that the client is itself (#616).
-    administersItself: administersItself(config),
+    ...declared,
     audit,
   });
   writeReport(report, {
@@ -632,7 +736,8 @@ async function provisionDeclared(
     seeded: options.seed,
     pending: deferredSecrets(capabilities, mode),
     registry: workerSecretRegistry(capabilities) ?? {},
-    streamed: progress !== undefined,
+    streamed: progress !== undefined && !options.json,
+    ...(await provisionNextEntry(report, { json: options.json, account })),
   });
 }
 
@@ -656,10 +761,52 @@ async function provisionBranch(
   const scope = featureScope(identity);
   const resolved = workerSetOnce(projectDir, scope.stanza);
   const workers = async (): Promise<ProvisionWorker[]> => provisionWorkers(await resolved());
+  if (options.dryRun) {
+    const account = await projectCloudflareAccount(projectDir);
+    // The run's own refusal, in the run's words, before anything is planned (`docs/CLI.md` §1.2).
+    const provisioners = await requireProvisioners(account, "a feature environment");
+    const store = await buildStore(account);
+    const { report, plan } = await planProvision({
+      projectDir,
+      project: identity.project,
+      env: scope.stanza,
+      account,
+      provisioners,
+      store,
+      // A feature is always seeded, as the run always seeds it.
+      seed: true,
+      run: async (seams) =>
+        provisionFeature({
+          ...(options.caller === undefined ? {} : { caller: options.caller }),
+          projectDir: seams.projectDir,
+          capabilities,
+          ...(seams.store ? { store: seams.store } : {}),
+          identity,
+          provisioners: seams.provisioners,
+          administersItself: selfAdministering,
+          resolveWorkers: async () => seams.workers(await workers()),
+          // A read — the address each generated stanza is stamped with.
+          workersSubdomain: accountWorkersSubdomain(account),
+          migrate: seams.migrate,
+          seed: seams.seed,
+          audit: seams.audit,
+        }),
+    });
+    const hosts = plannedFeatureHosts(identity, capabilities, { store: store !== null });
+    writeReport(report, {
+      json: options.json,
+      seeded: true,
+      pending: featurePendingSecrets(deferredSecrets(capabilities, mode), report),
+      registry: workerSecretRegistry(capabilities) ?? {},
+      plan: { ...plan, resources: [...plan.resources, ...hosts.resources], notes: [...hosts.notes, ...plan.notes] },
+    });
+    return;
+  }
   const progress = provisionProgress(options);
   // No confirmation gate here — a feature environment is created per pull request, so there is no prompt
-  // to hang the plan off. It goes where the confirmation's would: before the first Cloudflare call.
-  if (progress) {
+  // to hang the plan off. It goes where the confirmation's would: before the first Cloudflare call. Prose,
+  // so never under `--json`, `--events` included.
+  if (!options.json) {
     const plan = await provisionPlan({
       projectDir,
       project: identity.project,
@@ -676,6 +823,7 @@ async function provisionBranch(
   const infrastructure = store ? await featureSecretsInfrastructure(account, identity, audit) : null;
   const indexes = await featureIndexSeam(projectDir, account, identity.project);
   const report = await provisionFeature({
+    ...(options.caller === undefined ? {} : { caller: options.caller }),
     projectDir,
     capabilities,
     ...(store ? { store } : {}),
@@ -710,7 +858,8 @@ async function provisionBranch(
     seeded: true,
     pending: featurePendingSecrets(deferredSecrets(capabilities, mode), report),
     registry: workerSecretRegistry(capabilities) ?? {},
-    streamed: progress !== undefined,
+    streamed: progress !== undefined && !options.json,
+    ...(await provisionNextEntry(report, { json: options.json, account })),
   });
 }
 
@@ -729,31 +878,212 @@ export async function runProvision(options: ProvisionRunOptions): Promise<void> 
   return provisionDeclared(projectDir, mode, options);
 }
 
-export default defineCommand({
-  meta: {
-    name: "provision",
-    description: "Create an environment's own Cloudflare resources, wire them into each Worker, then migrate",
+const Worker = z.string().describe("The Worker's own deploy name — its `wrangler.jsonc` `name`.");
+
+/** One resource, as `resources` lists it and as an `--events` record settles it. */
+const ProvisionedResourceRow = FeatureResource.extend({
+  created: z.boolean().describe("Whether this run created it; `false` when an existing one was adopted."),
+}).describe("One resource.");
+
+/**
+ * `pithy provision --json --events`: one record per step, before the report closes the stream (#697). A
+ * resource starts with its `binding` and `kind` and settles with its row as `resource`; a feature's kit
+ * Worker settles with its row as `kit`; a migration or a seed set starts with only `what`.
+ */
+const ProvisionEvents = eventsRecord("provision", {
+  start: {
+    binding: z.string().describe("The binding the resource backs."),
+    kind: FeatureResource.shape.kind,
   },
-  args: {
-    env: { type: "string", description: "The declared environment to provision" },
-    feature: { type: "boolean", default: false, description: "Provision this branch's own environment instead" },
-    yes: { type: "boolean", default: false, description: "Confirm that this creates real Cloudflare resources" },
-    confirm: {
-      type: "string",
-      description: 'Unlock a production environment non-interactively: "yes, i really want to provision <env>"',
-    },
-    seed: { type: "boolean", default: false, description: "With --env: also load seed fixtures once the schema is up" },
-    json: { type: "boolean", default: false, description: "Machine-readable output" },
+  settled: {
+    resource: ProvisionedResourceRow.describe("The resource that settled, as `resources` lists it."),
+    kit: KitWorkerDeploy.describe("`--feature`: the kit Worker that settled, as `hosts` lists it."),
   },
-  run: ({ args }) =>
-    withErrorReporting(args.json, () =>
-      runProvision({
-        env: args.env,
-        feature: args.feature,
-        yes: args.yes,
-        confirm: args.confirm,
-        seed: args.seed,
-        json: args.json,
-      }),
-    ),
 });
+
+/** `pithy provision --json`, for both modes. `docs/commands/provision.md`. */
+const ProvisionPayload = z
+  .object({
+    command: z.literal("provision").describe('`"provision"`. The same for both modes.'),
+    env: z.string().describe("The environment provisioned — a declared name, or `feature`."),
+    resources: z.array(ProvisionedResourceRow).describe("Every resource, in provision order."),
+    workers: z
+      .array(
+        z
+          .object({
+            worker: Worker,
+            name: z.string().describe("The scoped script name written into the environment's stanza."),
+          })
+          .describe("One Worker."),
+      )
+      .describe("Each Worker and the script name it deploys under in this environment."),
+    services: z
+      .array(
+        z
+          .object({
+            binding: z.string().describe("The binding name."),
+            service: z.string().describe("The script the binding was retargeted at."),
+          })
+          .describe("One service binding."),
+      )
+      .describe("Each `service` binding and the Worker it now targets."),
+    secretBindings: z
+      .array(
+        z
+          .object({
+            secret: z.string().describe("The secret's registry key."),
+            binding: z.string().describe("The Worker binding it is read through."),
+            entry: z.string().describe("The Secrets Store entry it resolves to in this environment."),
+            bound: z.boolean().describe("Whether the entry exists and the binding was written."),
+            minted: z.boolean().describe("Whether this run created the value."),
+          })
+          .describe("One `cf-secrets-store` secret."),
+      )
+      .describe("Every `cf-secrets-store` secret this environment declares."),
+    declined: z
+      .array(
+        z
+          .looseObject({
+            state: z.enum(["read", "invalid"]).describe("Whether that Worker's declaration parsed."),
+            worker: Worker,
+            problem: z.string().optional().describe("`invalid` only: what is wrong with the declaration."),
+            declines: z
+              .array(
+                z
+                  .looseObject({
+                    state: z
+                      .enum(["honored", "required", "undeclinable", "unrecognized"])
+                      .describe("Only `honored` left something out."),
+                    name: z.string().describe("The binding name, as written."),
+                    reason: z.string().describe("The adopter's own reason, verbatim."),
+                  })
+                  .describe("One declaration entry, resolved."),
+              )
+              .optional()
+              .describe("`read` only: every entry in that Worker's declaration."),
+          })
+          .describe("One Worker's `declinedBindings`."),
+      )
+      .describe("One entry per Worker whose `declinedBindings` has something to say."),
+    manifestFaults: z.array(ManifestFault).describe("Installed packages whose manifest is present and unusable."),
+    configs: z
+      .array(
+        z
+          .object({
+            worker: Worker,
+            path: z.string().describe("The file written, relative to the project root."),
+            ids: z.number().int().describe("How many binding ids landed in it."),
+          })
+          .describe("One file the ids were written into."),
+      )
+      .describe("Where the ids were written, one entry per Worker."),
+    committed: z.boolean().describe("Whether those files are committed: `true` for `--env`, `false` for `--feature`."),
+    featureSecrets: z
+      .array(MintedSecret)
+      .optional()
+      .describe("`--feature` with a Secrets Store only: each `d1` secret the feature's own manager accounted for."),
+    hosts: z
+      .array(KitWorkerDeploy)
+      .optional()
+      .describe("`--feature` only: every kit Worker the feature stood up for itself."),
+    routesDropped: z
+      .array(
+        z
+          .object({
+            worker: Worker,
+            routes: z.array(z.string().describe("A route pattern.")).describe("The patterns given up."),
+          })
+          .describe("One Worker's dropped routes."),
+      )
+      .optional()
+      .describe("`--feature` only, and only when there were any: route patterns the feature stanza gave up."),
+    bindingsDropped: z
+      .array(
+        z
+          .object({
+            worker: Worker,
+            bindings: z.array(z.string().describe("A binding.")).describe("The bindings given up."),
+          })
+          .describe("One Worker's dropped bindings."),
+      )
+      .optional()
+      .describe("`--feature` only, and only when there were any: bindings naming a script this project does not own."),
+    pendingSecrets: z
+      .array(z.string().describe("A secret's name."))
+      .describe("The `d1` secrets this run declares and did not create."),
+    pendingSecretsRemedy: z
+      .string()
+      .nullable()
+      .describe(
+        "What does create them: the command, or — for `pithy secrets provision`, which runs against every environment, production included — a person's decision said as one sentence.",
+      ),
+    dryRun: z
+      .boolean()
+      .describe(
+        "Whether this was `--dry-run`. Nothing was created, written or migrated when it is `true`, and a resource the run would create carries a placeholder `id`.",
+      ),
+    plan: PlanKey,
+    next: NextKey,
+  })
+  .describe("What `pithy provision` created, adopted and wrote, or under `--dry-run` would.");
+
+export default withContract(
+  defineCommand({
+    meta: {
+      name: "provision",
+      description: "Create an environment's own Cloudflare resources, wire them into each Worker, then migrate",
+    },
+    args: {
+      env: { type: "string", description: "The declared environment to provision" },
+      feature: { type: "boolean", default: false, description: "Provision this branch's own environment instead" },
+      yes: { type: "boolean", default: false, description: "Confirm that this creates real Cloudflare resources" },
+      confirm: {
+        type: "string",
+        description: 'Unlock a production environment non-interactively: "yes, i really want to provision <env>"',
+      },
+      seed: {
+        type: "boolean",
+        default: false,
+        description: "With --env: also load seed fixtures once the schema is up",
+      },
+      "dry-run": DRY_RUN_ARG,
+      json: { type: "boolean", default: false, description: "Machine-readable output" },
+      events: EVENTS_ARG,
+    },
+    run: ({ args }) =>
+      withErrorReporting(
+        args.json,
+        () =>
+          runProvision({
+            caller: callerOf("provision", args),
+            env: args.env,
+            feature: args.feature,
+            yes: args.yes,
+            confirm: args.confirm,
+            seed: args.seed,
+            json: args.json,
+            events: args.json && args.events,
+            dryRun: args["dry-run"],
+          }),
+        eventsOption("provision", args),
+      ),
+  }),
+  {
+    output: "document",
+    schemaVersion: 1,
+    payload: ProvisionPayload,
+    events: ProvisionEvents,
+    mutates: true,
+    // Adopting: a resource of the right name is taken up rather than duplicated.
+    idempotent: true,
+    needsNetwork: true,
+    flagGroups: [
+      {
+        kind: "exactlyOne",
+        flags: ["--env", "--feature"],
+        rule: "Pass either --env or --feature: exactly one says which environment to provision.",
+      },
+      EVENTS_NEED_JSON,
+    ],
+  },
+);

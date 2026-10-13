@@ -3,6 +3,7 @@
 
 import { join } from "node:path";
 import type { D1Database } from "@cloudflare/workers-types";
+import { commandName } from "@pithy-sh/core/src/cli/command";
 import { type ControlPlaneAuditAction, ControlPlaneAuditActions } from "@pithy-sh/core/src/controlPlane/audit/actions";
 import { ControlPlaneConnection, type RegisteredKey } from "@pithy-sh/core/src/controlPlane/data/connection";
 import { activeKeys, appendKey as appendRegisteredKey } from "@pithy-sh/core/src/controlPlane/data/keyLifecycle";
@@ -15,7 +16,7 @@ import {
   ControlPlaneKeyConflictError,
   ControlPlaneNotConnectedError,
 } from "@pithy-sh/core/src/controlPlane/error/errors";
-import { messageOf, ValidationError } from "@pithy-sh/core/src/error/pithyError";
+import { messageOf, PreconditionFailedError } from "@pithy-sh/core/src/error/pithyError";
 import type { CliAuditEmit, CliAuditEvent } from "../audit/cliAudit";
 import { type CloudflareAccountSelection, cloudflareCredentials } from "../cloudflare/config";
 import { discoverWorkers } from "../project/workers";
@@ -168,7 +169,7 @@ function refuseWhileSomethingCanSign(connection: ControlPlaneConnection, now: Da
   if (live.length === 0) return;
   throw new ControlPlaneKeyConflictError({
     message: "That connection already has a live key.",
-    action: `Register the successor through the worker: POST ${connection.workerUrl}${connection.basePath}/keys, signed with ${live[0]?.keyId}. That is what pithy dashboard rotate does.`,
+    action: `Register the successor through the worker: POST ${connection.workerUrl}${connection.basePath}/keys, signed with ${live[0]?.keyId}. That is what ${commandName("dashboard rotate")} does.`,
     detail,
   });
 }
@@ -511,7 +512,8 @@ export async function openConnectionRegistry(options: OpenConnectionRegistryOpti
   // `detail`. `detail` is stripped at the display boundary and always will be; an operator staring at
   // "add the DB binding" on a project that has one needs to be told which Worker said what.
   const why = refusals.length === 0 ? "No workers under apps/." : `Skipped: ${refusals.join("; ")}.`;
-  throw new ValidationError({
+  // The project's state, not the call's: no Worker answers for the app database. Exit 3 (#697).
+  throw new PreconditionFailedError({
     message: "No worker resolves the DB binding for this environment.",
     action: `${why} Add the DB d1_databases binding to a worker's wrangler.jsonc, or pass --worker to name one.`,
     detail: `env ${options.env}; ${refusals.length === 0 ? "no workers under apps/" : refusals.join("; ")}`,

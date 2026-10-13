@@ -1,7 +1,20 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import {
+  chmod,
+  copyFile,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  symlink,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,8 +28,10 @@ import { defaultRemoveSteps } from "../capabilities/remove";
 import { readSource, sourcePaths } from "../ci/sourceFiles";
 import { generateDevVars } from "../devSecrets/generate";
 import { writeSeedArtifact } from "../seed/prepare";
+import { GIT_NO_MAINTENANCE, scratchGitEnv } from "../test-utils/tempRepo";
 import { scaffoldFiles } from "../ui/scaffold";
 import {
+  copyTemplate,
   ensureEmptyTarget,
   ensureScaffoldable,
   ensureScaffoldPath,
@@ -1126,6 +1141,10 @@ describe("the gate on the gate", () => {
       probes: "access",
       why: "Asks which lockfile is beside the project, and a lockfile reached through a link is still that project's lockfile — following is the right answer, and the probe decides nothing but which package manager to spawn. It writes to one path and it is not one this probe answered about: `declareOnWorker` writes `apps/<worker>/package.json` (#480), through `writeFileAtomic`, having read that same path with `readOptionalFile` rather than probing it.",
     },
+    "cli/src/plan/shadow.ts": {
+      probes: "stat",
+      why: "Asks what a link out of the project leads to, to copy the project into a private directory for a dry run. Following is the question: a link to a file becomes a regular copy of that file, because the real run writes through it, and any other stays a link that leads nowhere. It writes only inside its own temporary directory, at the path `lstat` already found to be a link, never where the link leads.",
+    },
     "cli/src/capabilities/remove.ts": {
       probes: "stat",
       why: "Asks whether `node_modules/<pkg>` is installed. Nothing is written there, and following is the right answer — a shared-store package manager links that path.",
@@ -1278,6 +1297,10 @@ describe("the gate on the gate", () => {
       "Removes the worktree directory that `teardownWorktree` has just had git forget, at `<root>/.worktrees/<issue>-<slug>` composed by `featureNames` from the main checkout root — never a path an adopter named. It cannot go through `removeScaffoldPath`: that primitive is for a path inside a project being scaffolded, and this is the project directory itself, already unregistered and guarded on `hasLiveDevSession` so a running `pithy dev` keeps its files.",
     "cli/src/capabilities/eject.ts":
       "Discards the fork it is about to re-copy under `--force`, on the exact path `ensureScaffoldPath(projectDir, dest)` cleared on the line above and `pathExists` then confirmed with an `lstat`. The gate is there; only the `rm` is local.",
+    "cli/src/migrations/localStateCopy.ts":
+      "Removes the copy of the local D1 store a `pithy migrate --dry-run` read, on the path `mkdtemp` under `os.tmpdir()` handed back — never a path an adopter named and never one inside a project. The copy exists so that opening Miniflare cannot write to the project's own store, and it must leave nothing behind.",
+    "cli/src/plan/shadow.ts":
+      "Removes the private copy a dry run made its writes in, on the path `mkdtemp` under `os.tmpdir()` handed back and `realpath` resolved — never a path an adopter named and never one inside a project. `removeScaffoldPath` guards a path inside a project being scaffolded, and this is the opposite: a directory this module created, owns outright, and must leave nothing of.",
   };
 
   test("no module runs its own recursive delete on a path it composed", async () => {
@@ -1705,7 +1728,11 @@ describe("a symlink above the file being written", () => {
     await symlink(outside, join(project, "apps"));
 
     await expect(
-      scaffoldFiles({ workerDir, files: { "index.html": "<!doctype html>\n", "src/client.tsx": "theirs\n" } }),
+      scaffoldFiles({
+        workerDir,
+        framework: "react",
+        files: { "index.html": "<!doctype html>\n", "src/client.tsx": "theirs\n" },
+      }),
     ).rejects.toThrow(PithyError);
 
     expect(await readdir(join(outside, "board"))).toEqual([]);
@@ -1715,9 +1742,9 @@ describe("a symlink above the file being written", () => {
     await mkdir(join(project, "apps"), { recursive: true });
     await symlink(join(outside, "board"), workerDir);
 
-    await expect(scaffoldFiles({ workerDir, files: { "index.html": "<!doctype html>\n" } })).rejects.toThrow(
-      PithyError,
-    );
+    await expect(
+      scaffoldFiles({ workerDir, framework: "react", files: { "index.html": "<!doctype html>\n" } }),
+    ).rejects.toThrow(PithyError);
 
     expect(await readdir(join(outside, "board"))).toEqual([]);
   });
@@ -1782,22 +1809,36 @@ describe("the template copy", () => {
   const STARTER = resolve(dirname(fileURLToPath(import.meta.url)), "../../../../templates/starter");
 
   test("carries no file the template's working tree merely happens to hold", async () => {
-    const planted = join(STARTER, ".dev.vars");
-    const scratch = join(STARTER, "apps", "api", "notes.local.md");
-    await writeFile(planted, "CLOUDFLARE_API_TOKEN=a-maintainers-real-token\n");
-    await writeFile(scratch, "half-written thought\n");
-    try {
-      await scaffoldProject({ targetDir: dir, appName: "leaky", worker: "board" });
-
-      // No `.dev.vars` at all — least of all the maintainer's. `init` writes none (#154), and the
-      // allowlist is what stops the planted one being copied in the first place.
-      expect(await pathExists(join(dir, ".dev.vars"))).toBe(false);
-      // Ignored is not the rule — untracked is. An exclusion filter has to predict the next artifact.
-      expect(await pathExists(join(dir, "apps", "board", "notes.local.md"))).toBe(false);
-    } finally {
-      await rm(planted, { force: true });
-      await rm(scratch, { force: true });
+    // **A committed copy of the starter, never the starter itself (#711).** The two files used to be planted
+    // in `templates/starter`, where `fileModes.test.ts`, `sourceFiles.test.ts` and the prose census, reading
+    // the tree from a worker beside this one, could find them and then find them gone. The copy is the
+    // starter's committed files in a repository of its own, which is all the allowlist reads.
+    const starter = join(dir, "starter");
+    const committed = committedFiles(STARTER) ?? [];
+    expect(committed.length).toBeGreaterThan(10);
+    for (const path of committed) {
+      await mkdir(dirname(join(starter, path)), { recursive: true });
+      await copyFile(join(STARTER, path), join(starter, path));
     }
+    const git = (...args: string[]) =>
+      execFileSync("git", [...GIT_NO_MAINTENANCE, ...args], { cwd: starter, env: scratchGitEnv() });
+    git("init", "-q");
+    git("add", "-A");
+    // Ignored, as the repository's own `.gitignore` ignores it — and merely untracked, which nothing ignores.
+    await writeFile(join(starter, ".git", "info", "exclude"), ".dev.vars\n");
+    await writeFile(join(starter, ".dev.vars"), "CLOUDFLARE_API_TOKEN=a-maintainers-real-token\n");
+    await writeFile(join(starter, "apps", "api", "notes.local.md"), "half-written thought\n");
+
+    const target = join(dir, "leaky");
+    await copyTemplate(target, { dir: starter, vendored: false });
+
+    // No `.dev.vars` at all — least of all the maintainer's. `init` writes none (#154), and the
+    // allowlist is what stops the planted one being copied in the first place.
+    expect(await pathExists(join(target, ".dev.vars"))).toBe(false);
+    // Ignored is not the rule — untracked is. An exclusion filter has to predict the next artifact.
+    expect(await pathExists(join(target, "apps", "api", "notes.local.md"))).toBe(false);
+    // And what is committed is copied, so the two absences are the filter's and not an empty copy's.
+    for (const path of committed) expect(await pathExists(join(target, path)), path).toBe(true);
   });
 
   test("carries every file it has committed — the allowlist is the index, not a hand-kept list", async () => {
