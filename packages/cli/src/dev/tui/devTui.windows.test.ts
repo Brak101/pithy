@@ -58,8 +58,15 @@ const SIZES = [50, 120, 60, 100];
 const DRAG_STEP = 4;
 const DRAG_INTERVAL_MS = 25;
 
-/** Long enough for a drag to settle and for the spinner to repaint the footer a few times at the new size. */
+/** A pause after each drag, well past the repaint's 150 ms debounce, before the marker is asked for. */
 const SETTLE_MS = 1_000;
+
+/**
+ * How long a marker and the footer drawn under it may take to reach the screen. A ceiling, not a sleep:
+ * the wait ends the moment the screen shows both, and a runner under load gets the time it needs. Past
+ * it, the assertions read whatever is there.
+ */
+const SCREEN_CEILING_MS = 10_000;
 
 const HARNESS = devTuiHarness({
   keys: true,
@@ -110,6 +117,27 @@ beforeAll(async () => {
   }
   await rest(SETTLE_MS);
 
+  // What the screen shows: the last ROWS lines of the buffer, after everything sent has been parsed.
+  const screen = async (): Promise<string[]> => {
+    await new Promise<void>((resolve) => terminal.write("", resolve));
+    const buffer = terminal.buffer.active;
+    return Array.from(
+      { length: buffer.length },
+      (_, index) => buffer.getLine(index)?.translateToString(true) ?? "",
+    ).slice(-ROWS);
+  };
+  // Settled, for one size: its marker is on screen with a whole footer under it — a header, the `api` row
+  // and the rule that closes it, in that order. Not "exactly one footer": that is the claim under test,
+  // and a wait that required it would turn a stacked screen into a timeout instead of a failure that
+  // shows it.
+  const settled = (lines: string[], marker: string) => {
+    const at = lines.map((line) => line.includes(marker)).lastIndexOf(true);
+    if (at === -1) return false;
+    const header = lines.findIndex((line, index) => index > at && HEADER.test(line));
+    const api = lines.findIndex((line, index) => index > header && /api\s+app\s+8787\s+ready/.test(line));
+    return header !== -1 && api !== -1 && lines.some((line, index) => index > api && RULE.test(line));
+  };
+
   const resize = (columns: number) => {
     session.resize(columns, ROWS);
     terminal.resize(columns, ROWS);
@@ -125,7 +153,8 @@ beforeAll(async () => {
     columns = target;
     await rest(SETTLE_MS);
     session.write("1");
-    await rest(SETTLE_MS);
+    const until = Date.now() + SCREEN_CEILING_MS;
+    while (!settled(await screen(), `MARK-${target}`) && Date.now() < until) await rest(100);
   }
 
   // Everything the terminal holds, scrollback and screen, flushed through the emulator's parser first.

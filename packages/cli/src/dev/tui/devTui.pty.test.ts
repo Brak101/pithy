@@ -203,10 +203,15 @@ describe.runIf(RUNNABLE)("the live footer on a real terminal", () => {
   });
 
   test("after the last repaint the screen holds one roster header", () => {
-    // Cut at the last repaint: everything after it is drawn on a clean screen, and every frame since has
-    // been erased by Ink's own count, which a byte stream never makes stale.
-    const after = transcript.slice(transcript.lastIndexOf(scrollScreenAway(ROWS)));
-    const frame = after.slice(after.lastIndexOf("\x1b[2K\x1b[1A")).replace(ANSI, "");
+    // Cut at the last repaint, which is the scroll-away: everything after it is drawn on a clean screen.
+    // The repaint itself paints with no erase in front of it — there is nothing left to erase — so the
+    // final frame starts at the last erase *after* the cut if Ink has redrawn since, and at the cut if it
+    // has not. A repaint that never fired is a failure here, not an empty cut.
+    const repaint = transcript.lastIndexOf(scrollScreenAway(ROWS));
+    expect(repaint, "no repaint after the resize").toBeGreaterThan(-1);
+    const after = transcript.slice(repaint);
+    const erase = after.lastIndexOf("\x1b[2K\x1b[1A");
+    const frame = (erase === -1 ? after : after.slice(erase)).replace(ANSI, "");
     expect([...frame.matchAll(/^\s+worker\s+kind/gm)]).toHaveLength(1);
   });
 });
