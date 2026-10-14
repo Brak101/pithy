@@ -80,6 +80,10 @@ And it is not hosted, by us or by anyone, because a hosted server would hold the
 
 **Hide what a role withholds; it is defensible to show what a *tier* withholds.** A tier lock says *you could have this by paying*, which is informative. A role lock would say *this exists*, which is disclosure.
 
+**And the route declarations are already a tool list.** `describeRoute` ships on every route as of `#740`, and a `RouteSpec` carries exactly what a tool definition needs: a **`summary`** — *"one sentence, in the brand voice"*, which is the description an agent chooses on — an optional longer **`description`** for *"anything a client author must know that the schemas do not say"*, the **`verification`** strategy, the **`scopes`** a caller's credential must carry beyond being verified, and the **`responses`** by status. The input schema comes from the same route's `validate(...)`. `openApiDocument()` reads both off the composed app, `pithy contract` writes each Worker's `openapi.json`, and the kit publishes `docs/openapi.generated.json` — OpenAPI 3.1.0, 150 paths, checked in CI.
+
+So the tool list derives from declarations rather than from anything written twice, and **the scope is declared beside the route rather than inferred** — which is the same property the control-plane manifest has, arrived at from the other side.
+
 **A tool inherits its route's power. That is the whole mapping, and there is nothing else to maintain.** A route that gains a power is a tool that moves on the same commit; a role that gains a power is an agent that sees more with no deploy.
 
 ### 4.2 Tools defined by data, not by code
@@ -296,4 +300,3 @@ Stated so a reader can tell a decision from a gap.
 - Neither MCP server exists. The CLI's `mcp/` directory writes client configuration for an external server and contains no server.
 - The OIDC credential kind of §6.2 is not registrable; the verifier exists, the trust does not.
 - The data-defined tools of §4.2 presuppose an analytical capability that is not built.
-- Deriving tools from an adopter's own routes presupposes a published contract for them.
