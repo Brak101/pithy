@@ -9,7 +9,7 @@ Two audiences. **Setup** is done once, by the person who owns the npm organizati
 A release is started by hand. There is no push trigger — `.github/workflows/release.yml` runs on `workflow_dispatch` only, the same deliberateness `ci.yml` applies to `main`.
 
 ```
-snapshot -> changeset version -> build records -> publish -> tag & push -> report
+snapshot -> changeset version -> build -> restamp kit contract -> build records -> publish -> tag & push -> move release -> report
 ```
 
 The order matters and is not rearrangeable. `changeset version` **consumes and deletes** the changeset files, and the release notes live nowhere else until it has written the CHANGELOGs; the new versions do not exist until it has run. So the release records are collected around it — never reconstructed afterwards.
@@ -53,6 +53,8 @@ GITHUB_TOKEN=$(gh auth token) bun run release:local              # publish it
 The dry run versions the packages, builds them, packs each one through the same gate CI runs, prints one line per package, and then **puts the tree back exactly as it was** — manifests, changesets, generated changelogs and all. (`dist/` is gitignored, so the build it just made stays; that is what the real run publishes.) The real run prints the same plan and stops for a typed `yes` before it publishes anything.
 
 **The build is after the version bump, and that order is load-bearing.** Both halves of the bump are build inputs — Changesets rewrites every `package.json`, and the root `version` script chains `stampVersions.ts`, which rewrites each capability's `src/version.generated.ts`. Built before them, `dist/version.generated.js` reports the version this release *replaces* to every customer reading `GET /control-plane/manifest`. `verify-published` refuses a tarball whose stamp disagrees with the version being published, which is how the order is held rather than remembered — see `#575`.
+
+The same stamp sets every Claude Code plugin's `plugin.json` version to `@pithy-sh/cli`'s, and the kit's OpenAPI document, `docs/openapi.generated.json`, is regenerated straight after the build with `bun run kit-contract`. Its `info.version` is the CLI's, and it is composed from every package's `dist`, so it runs after the build and lands in the version commit. Every pull request already keeps the routes in it current; at release it only ever moves the version.
 
 It refuses to start on a checkout that is not ready, and reports every reason at once: not on `main`, anything uncommitted, behind `origin/main`, nobody logged in to npm, no `GITHUB_TOKEN`, no changesets. A dry run is held to less, because it publishes nothing — it needs only a clean tree, a token, and something to release.
 
@@ -135,7 +137,7 @@ gh workflow run release.yml -f dry_run=true    # see what would ship
 gh workflow run release.yml                    # ship it
 ```
 
-That is the whole loop. The job runs the full gates (Biome, license headers, docs catalog, CLI pack, typecheck, tests, build), versions, publishes, tags, pushes the version commit to `main`, and reports the release.
+That is the whole loop. The job runs the full gates (Biome, license headers, docs catalog, CLI pack, typecheck, tests, build), versions, publishes, tags, pushes the version commit to `main`, moves `release` to it, and reports the release.
 
 Anything already on the registry is skipped, so a re-run publishes only what is missing — in principle. In practice a plain re-run cannot reach that step: `changeset version` runs first and exits 1 with no changesets to apply, which is exactly what a completed release leaves behind. Nothing has needed the recovery yet; when something does, the workflow will need a way to skip versioning and publish alone.
 
@@ -144,6 +146,14 @@ Anything already on the registry is skipped, so a re-run publishes only what is 
 That combination is convincing and wrong, and it has now produced four separate conclusions that a publish failed when it had not. The job's own report is the more reliable signal. If the registry disagrees with it, wait several minutes and ask again before concluding anything — and before re-publishing anything, which is the one action that cannot be taken back.
 
 A release with no changesets **fails** rather than passing quietly — `@changesets/cli` 3.0.0 exits 1 with nothing to apply. A release that released nothing should say so.
+
+## The `release` branch, and the plugin
+
+The `pithy` Claude Code plugin installs from `pithy-sh/pithy#release`, never from `main`. `main` runs ahead of npm between releases, so a plugin read from it would name commands the installed `pithy` does not have yet. So `release` moves in one step of the workflow, on a real release only, after the publish and the push to `main`: a plugin anyone can install is always one whose CLI is already on npm. It is a plain push, never forced. `release` only ever follows `main` forward, so a push that is not a fast-forward fails rather than overwriting. The plugin's version is the CLI's, stamped by the `version` script, and Claude Code keeps a user's cached copy until that string moves, so the plugin updates once per release and never between.
+
+Three consequences. **The branch does not exist until the first workflow release creates it**, and until then `/plugin marketplace add pithy-sh/pithy#release` has nothing to read. **`bun run release:local` never moves it**: the workflow is the one thing that does. **A failure at that step comes after the publish and the push**: the packages are on npm and `main` is current, and only the plugin is a release behind.
+
+**Two things are open, and both need one answer.** Nothing yet stops anyone with write access from pushing `release` by hand: a ruleset that admits only the workflow needs an identity GitHub accepts as a ruleset bypass, and it refuses GitHub Actions itself. And `main`'s ruleset requires a pull request with only admins past it, so the workflow's push of the version commit to `main` is expected to be refused — the step before this one, and so this one with it. Until that identity is chosen, a release publishes to npm and stops at the push.
 
 ## The version path to 1.0.0
 
