@@ -264,7 +264,13 @@ Three fields, on the **connection** rather than the credential, so they hold for
 
 **It belongs on the adopter's side**, since they perform the review, on their own trail, possibly without any dashboard open. **It is editable and the edit is audited**, because an agent's job changes and a label nobody may correct is a label that rots. **It is untrusted input**, written by a customer and rendered elsewhere, and is validated at the boundary like anything else that crosses one.
 
-**There is already a human in the loop at the right moment.** Registration runs a device-code flow — a short code, a browser, an approval — which is where a principal is captured and a purpose typed. The field is missing; the moment is not.
+**The principal is named, not derived, and that is a finding rather than a preference.** A device-code registration does put a human in a browser — but the approval happens at the management client, and nothing about it comes back: `ConnectToken` carries a bearer and an expiry, `IssuedConnection` carries the connection, the key, the public JWK, the issuer and the scopes, and neither carries identity. The client knows who approved and does not send it.
+
+**Nor is the CLI's own actor a person on the recommended setup.** `resolveActor`'s `actorId` is *"a user email, a token name"*: a user token resolves through `GET /user` to an email, and an **account-owned token resolves to the token's name** — and account-owned is the kind this kit prefers and `pithy token mint` produces. A token name cannot leave an organization, so a governance rule built on it would not work.
+
+**The root cause is the credential model, not the wire.** A registration is authorized by holding a Cloudflare account credential rather than by a person's session, so there is no person in the path to derive.
+
+**So the principal is given — `--authorized-by <email>` — pre-filled from a derivation where one exists, and the registration is refused when nothing names a person.** An email string rather than a reference into the organization model, because an adopter's user table holds their customers and the operator registering a connection is their staff. It works identically on all three registration paths, which is why it was chosen over sending the approving user, which would answer only one of them. **It becomes derived once a browser sign-in to Cloudflare exists**, and `--authorized-by` demotes to the fallback for a non-interactive caller.
 
 ---
 
@@ -296,7 +302,8 @@ Three fields, on the **connection** rather than the credential, so they hold for
 
 Stated so a reader can tell a decision from a gap.
 
-- The agent fields of §7, and the actor kind, are not implemented. A connection records neither.
+- The agent fields of §7, and the actor kind, are not implemented. A connection records none of them.
+- No Cloudflare browser sign-in exists, so §7's principal is given rather than derived. `pithy-sh/pithy#759` is the fix; `#721` ships before it.
 - Neither MCP server exists. The CLI's `mcp/` directory writes client configuration for an external server and contains no server.
 - The OIDC credential kind of §6.2 is not registrable; the verifier exists, the trust does not.
 - The data-defined tools of §4.2 presuppose an analytical capability that is not built.
