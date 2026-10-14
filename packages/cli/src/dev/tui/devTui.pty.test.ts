@@ -63,6 +63,27 @@ const RUNNABLE = BUN !== null && hasScript();
 const LINES = 300;
 const LONG = `[api] Error: ${"segment/".repeat(45)}end`;
 
+/**
+ * The resize phase: grow and shrink the live terminal mid-run, writing a marker into each settled
+ * size. `stty` on the harness's own tty arrives as SIGWINCH — the event a window manager sends.
+ * On Linux the byte stream and the screen agree, so the footer repaints land clean and the
+ * assertions below are regression guards; the ConPTY artifact they describe for the Windows job
+ * (#702) is on the record in `docs/ACCEPTED-LIMITS.md` and #736.
+ */
+const RESIZE_PHASE = `
+const { execFileSync } = await import("node:child_process");
+const size = (rows: number, cols: number) => execFileSync("stty", ["rows", String(rows), "cols", String(cols)], { stdio: "inherit" });
+const rest = (ms: number) => new Promise((r) => setTimeout(r, ms));
+size(20, 60);
+await rest(400);
+store.line("NARROW-MARK", "api");
+await rest(400);
+size(40, 120);
+await rest(400);
+store.line("WIDE-MARK", "api");
+await rest(400);
+`;
+
 const HARNESS = `
 import { createDevStore } from ${JSON.stringify(join(CLI_SRC, "dev", "tui", "store.ts"))};
 import { startTui } from ${JSON.stringify(join(CLI_SRC, "dev", "tui", "app.tsx"))};
@@ -109,6 +130,7 @@ while (Date.now() < deadline) {
   await new Promise((r) => setTimeout(r, 100));
 }
 await new Promise((r) => setTimeout(r, 400));
+${RESIZE_PHASE}
 store.event({ event: "exited", worker: "support", code: 1 });
 await new Promise((r) => setTimeout(r, 300));
 await tui.stop();
@@ -175,5 +197,22 @@ describe.runIf(RUNNABLE)("the live footer on a real terminal", () => {
     // `api` became ready at the same instant it spawned and stays at its own elapsed; a session clock
     // would have climbed past a second while the 300 lines were committed.
     expect(plain()).toMatch(/api\s+app\s+8787\s+ready\s+0\.0s/);
+  });
+
+  test("a mid-run resize leaves one roster header, in order, on the settled screen", () => {
+    // The resize case of the record: the harness shrank and grew the live terminal twice and wrote a
+    // marker at each size. On a byte-stream pty — Linux, CI — the erase arithmetic ink runs is honest
+    // arithmetic: the final full repaint carries exactly one header and the screen reads as authored.
+    // The same case on a ConPTY terminal stacks stale headers, which is the record of
+    // docs/ACCEPTED-LIMITS.md and #736, and why #702's Windows job is the precondition for fixing it
+    // from CI rather than from a screenshot. Cut at the last live-region erase: every full repaint
+    // begins with ink's row-step erase, and everything after it is the final screen.
+    const frame = transcript.slice(transcript.lastIndexOf("\x1b[2K\x1b[1A")).replace(ANSI, "");
+    expect([...frame.matchAll(/^\s+worker\s+kind/gm)]).toHaveLength(1);
+    expect(frame).toContain("api");
+    // The markers written at each settled size landed, once each, in size order.
+    expect(transcript.match(/NARROW-MARK/g)).toHaveLength(1);
+    expect(transcript.match(/WIDE-MARK/g)).toHaveLength(1);
+    expect(transcript.indexOf("NARROW-MARK")).toBeLessThan(transcript.indexOf("WIDE-MARK"));
   });
 });
