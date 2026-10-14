@@ -132,6 +132,17 @@ export function scrollScreenAway(rows: number): string {
 }
 
 /**
+ * Whether Ink believes it is running in CI, by the rule Ink uses (`is-in-ci`): `CI` or
+ * `CONTINUOUS_INTEGRATION` present and neither `0` nor `false`. Ink then renders non-interactively —
+ * no live frame, no `resize` listener — even on a TTY.
+ */
+function inkSeesCi(): boolean {
+  return ["CI", "CONTINUOUS_INTEGRATION"].some(
+    (key) => key in process.env && process.env[key] !== "0" && process.env[key] !== "false",
+  );
+}
+
+/**
  * **Redraw the footer on a clean screen once a resize settles (#736).**
  *
  * Ink repaints the footer by moving the cursor up the number of rows it drew last time and erasing them.
@@ -154,8 +165,10 @@ function useRepaintOnResize(): void {
   const { stdout } = useStdout();
   const { suspendTerminal } = useApp();
   useEffect(() => {
-    // Ink subscribes to `resize` only on an interactive terminal, and so does this.
-    if (!stdout?.isTTY) return;
+    // Ink subscribes to `resize` only on an interactive terminal, and so does this. Ink's test is its own
+    // and not `choose.ts`'s: a TTY, outside what `is-in-ci` calls CI. Where Ink draws no live frame, a
+    // repaint has nothing to redraw and would only scroll the stream off the screen.
+    if (!stdout?.isTTY || inkSeesCi()) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let repainting = false;
     const repaint = () => {

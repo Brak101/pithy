@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { type IPty, spawn } from "@lydell/node-pty";
 import headless from "@xterm/headless";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { devTuiHarness } from "../../test-utils/devTuiHarness";
+import { devTuiHarness, harnessEnv } from "../../test-utils/devTuiHarness";
 import { requireWindows } from "../../test-utils/windows";
 
 requireWindows();
@@ -90,7 +90,7 @@ beforeAll(async () => {
     cols: COLUMNS,
     rows: ROWS,
     cwd: workspace,
-    env: { ...process.env, NO_COLOR: "1" },
+    env: { ...harnessEnv(), NO_COLOR: "1" },
     useConptyDll: true,
   });
   pty = session;

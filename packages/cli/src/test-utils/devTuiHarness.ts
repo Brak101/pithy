@@ -17,6 +17,23 @@ import { join, resolve } from "node:path";
 const CLI_SRC = resolve(import.meta.dirname, "..");
 
 /**
+ * The environment a harness runs in: this one, less the variables that tell Ink it is in CI.
+ *
+ * Ink renders non-interactively under `CI` or `CONTINUOUS_INTEGRATION` even on a TTY — no live frame, no
+ * `resize` listener — and every CI runner sets one. These tests stand in for a developer's terminal, where
+ * neither is set, and `pithy dev` itself never mounts the footer in CI (`choose.ts`). Inherited, the
+ * variable turned the Windows job's footer off and left the pty test measuring a footer nobody sees.
+ */
+export function harnessEnv(): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(process.env).filter(
+      (entry): entry is [string, string] =>
+        entry[1] !== undefined && entry[0] !== "CI" && entry[0] !== "CONTINUOUS_INTEGRATION",
+    ),
+  );
+}
+
+/**
  * Source for a harness that mounts the footer and then runs `script`.
  *
  * `store` and `tui` are in scope for `script`. `onDigit` and `onQuit` are function-expression source, for

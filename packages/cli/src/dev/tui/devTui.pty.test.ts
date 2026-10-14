@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { devTuiHarness } from "../../test-utils/devTuiHarness";
+import { devTuiHarness, harnessEnv } from "../../test-utils/devTuiHarness";
 import { scrollScreenAway } from "./app";
 
 /**
@@ -140,7 +140,7 @@ beforeAll(() => {
   // **`stty` first.** A pty whose stdout is a pipe starts 0x0, and a zero-column terminal wraps every
   // line after one character — which would make claim 2 below unfalsifiable rather than true.
   const command = `stty rows ${ROWS} cols 80; ${BUN as string} ${harness}`;
-  execFileSync("script", ["-qec", command, out], { stdio: "ignore", timeout: 120_000 });
+  execFileSync("script", ["-qec", command, out], { stdio: "ignore", timeout: 120_000, env: harnessEnv() });
   transcript = readFileSync(out, "utf8").replace(/\r\n/g, "\n");
 }, 140_000);
 
