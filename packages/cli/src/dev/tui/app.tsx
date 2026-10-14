@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
-import { Box, render, Static, Text, useApp, useInput, useStdout } from "ink";
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { appendFileSync } from "node:fs";
+import { Box, render, Static, Text, useApp, useCursor, useInput, useStdout } from "ink";
+import { useEffect, useReducer, useRef, useState, useSyncExternalStore } from "react";
 import { dim } from "../../terminal/style";
 import { stripAnsi } from "../logging";
 import { ticking } from "./choose";
@@ -111,24 +112,38 @@ function applies(needs: "always" | "worker" | "ready-app" | "started", row: Mark
 /** §9: width from the terminal, falling back to 80 when it will not say. */
 const FALLBACK_COLUMNS = 80;
 
-/**
- * How long a resize has to stay still before the footer is redrawn on a clean screen. A window drag
- * arrives as dozens of `resize` events; this is what makes it one repaint rather than one per event.
- */
-const RESIZE_SETTLE_MS = 150;
+/** Ink's cursor intent for the live region: its first row, its first column. */
+const TOP_LEFT = { x: 0, y: 0 };
+
+/** The longest a resize waits for the render that restates the anchor. It is one commit; this is the ceiling. */
+const COMMIT_WAIT_MS = 250;
+
+/** Erase from the cursor to the end of the screen. Never `\x1b[2J`, which reaches above it. */
+const ERASE_BELOW = "\x1b[J";
+
+/** Show the cursor. Ink writes it with every frame once a cursor position is set; `framesUnwrapped` drops it. */
+const SHOW_CURSOR = "\x1b[?25h";
+
+/** Autowrap off, and back on. Exported: the pty test counts it as the frame signature. */
+export const NO_WRAP = "\x1b[?7l";
+const WRAP = "\x1b[?7h";
+
+/** Ask the terminal where the cursor is; the answer arrives on stdin as `ESC[<row>;<col>R`. Measurement only. */
+const CURSOR_QUERY = "\x1b[6n";
 
 /**
- * **Scroll the screen into scrollback, then put the cursor top-left.**
- *
- * One newline per row, written from the cursor: the rows below it are blank, so the first newlines only
- * walk the cursor to the bottom and the rest scroll every row above it — the committed stream and
- * whatever a stale erase left behind — up off the screen, each exactly once. Not `\x1b[2J`: what an
- * erase-display does to the rows it clears is the terminal's choice, and the choices differ: some scroll
- * them into scrollback, and xterm.js discards them, which took the newest committed lines with them in
- * the measurement on #736. A newline at the bottom row scrolls on every terminal there is. Never `\x1b[3J` either: scrollback is where the committed stream lives.
+ * #736's trace rig: with `PITHY_TUI_TRACE=<file>` set, every write to the terminal, every resize event,
+ * and the terminal's own cursor answers are appended to that file. Unset, the string is `undefined` and
+ * every trace call is a no-op.
  */
-export function scrollScreenAway(rows: number): string {
-  return `${"\n".repeat(rows)}\x1b[H`;
+const TRACE_FILE = process.env.PITHY_TUI_TRACE;
+
+function trace(what: string): void {
+  if (TRACE_FILE) appendFileSync(TRACE_FILE, `${String(process.hrtime.bigint() / 1000n).padStart(12, "0")} ${what}\n`);
+}
+
+function traceVisible(s: string): string {
+  return JSON.stringify(s.length > 140 ? `${s.slice(0, 70)}…[${s.length}]…${s.slice(-60)}` : s);
 }
 
 /**
@@ -143,54 +158,100 @@ function inkSeesCi(): boolean {
 }
 
 /**
- * **Redraw the footer on a clean screen once a resize settles (#736).**
+ * **Keep the cursor on the live region's first cell, and erase from there on every resize (#736).**
  *
  * Ink repaints the footer by moving the cursor up the number of rows it drew last time and erasing them.
  * A terminal that rewraps on resize — ConPTY does, and so does any terminal that reflows — moves those
- * rows under the cursor, so the count goes stale and the erase lands on the wrong rows. On a drag, every
- * spinner-tick repaint left the last frame's rule and header behind, stacking up the screen. Ink clears
- * on its own only when the window narrows, and with the same stale count.
+ * rows, so the count goes stale and the erase lands on the wrong ones: on a drag, a stale rule and header
+ * stacked up above the roster at every repaint. Three repairs on #741 tried to make the count right. The
+ * terminal never says what it is.
  *
- * Nothing in the byte stream says where the rows went, so this stops asking. Once the size settles it
- * hands the terminal over through `suspendTerminal` — Ink's public way to drop its last frame and draw the
- * next one in full — scrolls the screen away, and Ink paints the footer fresh from the top-left, with
- * nothing to erase. Ink's own erase on the way into the suspension still runs on the stale count; it
- * lands above the cursor, and the scroll carries it off with everything else.
+ * It does say one thing, without being asked: where the cursor is. A terminal that reflows carries the
+ * cursor with the cell under it. So the cursor rests on the live region's first cell — Ink's own
+ * `useCursor`, at `TOP_LEFT` — and the region's start is wherever the terminal put the cursor. Ink's erase then
+ * starts from that cell, goes down the frame and back up to it, and cannot reach above it: the committed
+ * stream is out of reach of any count, stale or not.
  *
- * The scroll is the only new writer: one per settled size, none per event, none per spinner tick. The
- * committed stream is not replayed — it is in scrollback, once, where the terminal keeps it. What a drag
- * left behind before it settled goes up there with it; `docs/ACCEPTED-LIMITS.md` has that half.
+ * What a stale count can still miss is below the anchor, so every resize erases that too. Before Ink's own
+ * `resize` handler runs, this hands the terminal over through `suspendTerminal` — Ink's public way to drop
+ * its last frame — and erases from the anchor to the end of the screen, with no count at all. Ink then
+ * paints the footer fresh from the same cell, where the stream ended. Nothing moves, nothing is pushed
+ * into scrollback, and nothing is erased that Ink did not draw. One erase per resize event, the same
+ * cadence as the repaint Ink already does for each.
+ *
+ * `anchor` states the cursor intent again, at once: Ink returns the cursor to the anchor only on a frame
+ * that follows a stated intent, and the repaint after a suspension, like the one Ink's own `resize` handler
+ * makes, follows no commit. Left to the next render, a drag's next event finds the cursor at the foot of the
+ * frame and its erase reaches nothing — one stale footer per step.
  */
-function useRepaintOnResize(): void {
+function useEraseOnResize(anchor: () => Promise<void>): void {
   const { stdout } = useStdout();
   const { suspendTerminal } = useApp();
+  // The latest closure, so the subscription below is made once and not on every render.
+  const latest = useRef(anchor);
+  latest.current = anchor;
   useEffect(() => {
     // Ink subscribes to `resize` only on an interactive terminal, and so does this. Ink's test is its own
-    // and not `choose.ts`'s: a TTY, outside what `is-in-ci` calls CI. Where Ink draws no live frame, a
-    // repaint has nothing to redraw and would only scroll the stream off the screen.
+    // and not `choose.ts`'s: a TTY, outside what `is-in-ci` calls CI.
     if (!stdout?.isTTY || inkSeesCi()) return;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let repainting = false;
-    const repaint = () => {
-      // A drag that resumes while the last repaint is still in flight gets its own once it settles.
-      if (repainting) return void settle();
-      repainting = true;
-      void suspendTerminal(() => {
-        stdout.write(scrollScreenAway(stdout.rows));
-      }).finally(() => {
-        repainting = false;
-      });
+    const erase = () => {
+      // `suspendTerminal` refuses a second suspension while one is open; a resize that arrives inside one is
+      // already being answered by it.
+      trace(`resize ${stdout.columns}x${stdout.rows}`);
+      stdout.write(ERASE_BELOW);
+      if (TRACE_FILE) stdout.write(CURSOR_QUERY);
+      suspendTerminal(() => latest.current()).catch(() => {});
     };
-    const settle = () => {
-      clearTimeout(timer);
-      timer = setTimeout(repaint, RESIZE_SETTLE_MS);
+    // First, so the erase lands before Ink's own handler repaints.
+    stdout.prependListener("resize", erase);
+    const reportCpr = (data: Buffer | string): void => {
+      // The escape is built at runtime: Biome bans control characters in regex literals, and the
+      // formatter expands a `new RegExp` string right back into one.
+      const answer = new RegExp(`${"\x1b"}\\[(\\d+);(\\d+)R`).exec(String(data));
+      if (answer) trace(`cursor ${answer[1]}x${answer[2]}`);
     };
-    stdout.on("resize", settle);
+    if (TRACE_FILE) process.stdin.on("data", reportCpr);
     return () => {
-      clearTimeout(timer);
-      stdout.off("resize", settle);
+      stdout.off("resize", erase);
+      if (TRACE_FILE) process.stdin.off("data", reportCpr);
     };
   }, [stdout, suspendTerminal]);
+}
+
+/**
+ * Ink's stdout, with every frame written unwrapped and without the cursor Ink shows after it.
+ *
+ * **The cursor.** Ink shows it wherever a cursor position is set — the feature exists for an input caret
+ * — and the anchor is not one: it would be a block blinking on the roster's top rule.
+ *
+ * **The wrap.** During a drag Ink draws at the width it last heard about, and the terminal is already
+ * narrower. A frame line wider than the terminal wraps as it is written, the frame takes a row more than
+ * Ink counted, and Ink's return to the anchor lands a row short of it: measured on ConPTY, one stale rule
+ * above the roster per step of the drag. With autowrap off (`\x1b[?7l`) a too-wide line is clipped at
+ * the margin, so a frame of N lines is N rows on every terminal, whatever the race. It also keeps a
+ * full-width rule from being marked as wrapped onto the header under it, which is how a terminal that
+ * reflows ran the two together. Autowrap is back on before the write ends, so the committed stream —
+ * written separately — still soft-wraps exactly as a plain run does.
+ *
+ * A frame is the one write of Ink's that ends by showing the cursor: Ink puts the cursor back on the
+ * anchor and shows it as the last thing it writes for a frame, and nothing else it writes does.
+ */
+function framesUnwrapped(stream: NodeJS.WriteStream): NodeJS.WriteStream {
+  const write = stream.write as (...args: unknown[]) => boolean;
+  return new Proxy(stream, {
+    get(target, key) {
+      if (key === "write") {
+        return (chunk: unknown, ...rest: unknown[]) => {
+          if (typeof chunk === "string")
+            trace(`${chunk.endsWith(SHOW_CURSOR) ? "frame" : "write"} ${traceVisible(chunk)}`);
+          if (typeof chunk !== "string" || !chunk.endsWith(SHOW_CURSOR)) return write.call(target, chunk, ...rest);
+          return write.call(target, NO_WRAP + chunk.replaceAll(SHOW_CURSOR, "") + WRAP, ...rest);
+        };
+      }
+      const value: unknown = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
 }
 
 /**
@@ -256,6 +317,11 @@ export function DevTui(props: {
   onDigit: (digit: string) => void;
   onQuit: () => void;
   onInterrupt: () => void;
+  /**
+   * Whether the cursor rests on the live region's first cell. True while the session runs; false on the
+   * way out, so the shell's prompt lands under the last frame rather than on top of it.
+   */
+  anchored?: boolean;
 }): React.ReactElement {
   const state = useSyncExternalStore(props.store.subscribe, props.store.state);
   const selectedRow = state.session.workers[state.selected];
@@ -268,7 +334,25 @@ export function DevTui(props: {
   const enabled = new Map<string, boolean>(KEY_BAR.map((k) => [k.key, applies(k.needs, selectedRow)]));
   const { stdout } = useStdout();
   const [now, setNow] = useState(() => new Date());
-  useRepaintOnResize();
+  const { setCursorPosition } = useCursor();
+  setCursorPosition(props.anchored === false ? undefined : TOP_LEFT);
+  const [, reanchor] = useReducer((renders: number) => renders + 1, 0);
+  const committed = useRef<(() => void) | undefined>(undefined);
+  useEffect(() => {
+    committed.current?.();
+  });
+  useEraseOnResize(
+    () =>
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, COMMIT_WAIT_MS);
+        committed.current = () => {
+          clearTimeout(timer);
+          committed.current = undefined;
+          resolve();
+        };
+        reanchor();
+      }),
+  );
 
   // **The tick runs only while something is still coming up.** A command left open all day should not be
   // redrawing a clock into somebody's battery, so once every worker has arrived the footer is static
@@ -465,8 +549,9 @@ export function startTui(options: {
   onQuit: () => void;
   onInterrupt: () => void;
 }): TuiHandle {
-  const instance = render(
+  const tree = (anchored: boolean) => (
     <DevTui
+      anchored={anchored}
       store={options.store}
       keys={options.keys}
       onRestart={options.onRestart}
@@ -477,14 +562,21 @@ export function startTui(options: {
       onDigit={options.onDigit}
       onQuit={options.onQuit}
       onInterrupt={options.onInterrupt}
-    />,
-    { exitOnCtrlC: false, patchConsole: false },
+    />
   );
+  const instance = render(tree(true), {
+    stdout: framesUnwrapped(process.stdout),
+    exitOnCtrlC: false,
+    patchConsole: false,
+  });
   return {
     store: options.store,
     stop: async () => {
+      // Off the anchor first: the last frame stays where it is and the cursor goes under it.
+      instance.rerender(tree(false));
       instance.unmount();
       await instance.waitUntilExit();
+      process.stdout.write(SHOW_CURSOR);
     },
   };
 }

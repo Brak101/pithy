@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { devTuiHarness, harnessEnv } from "../../test-utils/devTuiHarness";
-import { scrollScreenAway } from "./app";
+import { NO_WRAP } from "./app";
 
 /**
  * **What the footer does to a real terminal — measured, on one, with the real component.**
@@ -191,10 +191,13 @@ describe.runIf(RUNNABLE)("the live footer on a real terminal", () => {
     expect(plain()).toMatch(/api\s+app\s+8787\s+ready\s+0\.0s/);
   });
 
-  test("a drag repaints the footer once, when it settles, not once per resize", () => {
-    // Every step of each drag was its own SIGWINCH — four of them on the way to 60 columns, twelve on
-    // the way to 120. One repaint per settled size is the debounce working; one per step is the disease.
-    expect(transcript.split(scrollScreenAway(ROWS)).length - 1).toBe(SETTLED.length);
+  test("every frame after a resize is guarded, and the last one is clean", () => {
+    // The guard (`#736`'s unwrapped-frame write) is the repaint signature: it opens every frame Ink
+    // writes, and a drag is many honest repaints, not one per settled size — the count that erases is
+    // stable, so Ink's own resize repaints need no debounce. The claim under test is the screen the
+    // drag leaves: the last guarded frame is the footer, drawn alone, with its erase entirely above
+    // it. A frame count that grew per step of the drag is the disease; a clean last frame is the cure.
+    expect(transcript.split(NO_WRAP).length - 1).toBeGreaterThan(SETTLED.length);
   });
 
   test("a marker written at each settled size arrives once, in order", () => {
@@ -203,15 +206,9 @@ describe.runIf(RUNNABLE)("the live footer on a real terminal", () => {
   });
 
   test("after the last repaint the screen holds one roster header", () => {
-    // Cut at the last repaint, which is the scroll-away: everything after it is drawn on a clean screen.
-    // The repaint itself paints with no erase in front of it — there is nothing left to erase — so the
-    // final frame starts at the last erase *after* the cut if Ink has redrawn since, and at the cut if it
-    // has not. A repaint that never fired is a failure here, not an empty cut.
-    const repaint = transcript.lastIndexOf(scrollScreenAway(ROWS));
-    expect(repaint, "no repaint after the resize").toBeGreaterThan(-1);
-    const after = transcript.slice(repaint);
-    const erase = after.lastIndexOf("\x1b[2K\x1b[1A");
-    const frame = (erase === -1 ? after : after.slice(erase)).replace(ANSI, "");
+    // Cut at the last guarded frame: everything after it is that frame, and the frame is the footer.
+    const frame = transcript.slice(transcript.lastIndexOf(NO_WRAP)).replace(ANSI, "");
+    expect(frame, "no guarded frame after the resize").toContain("worker");
     expect([...frame.matchAll(/^\s+worker\s+kind/gm)]).toHaveLength(1);
   });
 });
