@@ -3,7 +3,7 @@
 
 import { appendFileSync } from "node:fs";
 import { Box, render, Static, Text, useApp, useCursor, useInput, useStdout } from "ink";
-import { useEffect, useReducer, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useReducer, useState, useSyncExternalStore } from "react";
 import { dim } from "../../terminal/style";
 import { stripAnsi } from "../logging";
 import { ticking } from "./choose";
@@ -115,9 +115,6 @@ const FALLBACK_COLUMNS = 80;
 /** Ink's cursor intent for the live region: its first row, its first column. */
 const TOP_LEFT = { x: 0, y: 0 };
 
-/** The longest a resize waits for the render that restates the anchor. It is one commit; this is the ceiling. */
-const COMMIT_WAIT_MS = 250;
-
 /** Erase from the cursor to the end of the screen. Never `\x1b[2J`, which reaches above it. */
 const ERASE_BELOW = "\x1b[J";
 
@@ -168,39 +165,33 @@ function inkSeesCi(): boolean {
  *
  * It does say one thing, without being asked: where the cursor is. A terminal that reflows carries the
  * cursor with the cell under it. So the cursor rests on the live region's first cell — Ink's own
- * `useCursor`, at `TOP_LEFT` — and the region's start is wherever the terminal put the cursor. Ink's erase then
- * starts from that cell, goes down the frame and back up to it, and cannot reach above it: the committed
- * stream is out of reach of any count, stale or not.
+ * `useCursor`, at `TOP_LEFT` — and the region's start is wherever the terminal put the cursor. Ink's erase
+ * then starts from that cell, goes down the frame and back up to it, and cannot reach above it: the
+ * committed stream is out of reach of any count, stale or not.
  *
- * What a stale count can still miss is below the anchor, so every resize erases that too. Before Ink's own
- * `resize` handler runs, this hands the terminal over through `suspendTerminal` — Ink's public way to drop
- * its last frame — and erases from the anchor to the end of the screen, with no count at all. Ink then
- * paints the footer fresh from the same cell, where the stream ended. Nothing moves, nothing is pushed
- * into scrollback, and nothing is erased that Ink did not draw. One erase per resize event, the same
- * cadence as the repaint Ink already does for each.
- *
- * `anchor` states the cursor intent again, at once: Ink returns the cursor to the anchor only on a frame
- * that follows a stated intent, and the repaint after a suspension, like the one Ink's own `resize` handler
- * makes, follows no commit. Left to the next render, a drag's next event finds the cursor at the foot of the
- * frame and its erase reaches nothing — one stale footer per step.
+ * What a stale count can still miss is below the anchor, so every resize erases that too. This hands the
+ * terminal over through `suspendTerminal` — Ink's public way to drop its last frame — erases from the
+ * anchor to the end of the screen, with no count at all, and restates the anchor so the repaint that
+ * follows the suspension carries the cursor back to it. Nothing moves, nothing is pushed into scrollback,
+ * and nothing is erased that Ink did not draw. One erase per resize event, the same cadence as the
+ * repaint Ink already does for each.
  */
-function useEraseOnResize(anchor: () => Promise<void>): void {
+function useEraseOnResize(reanchor: () => void): void {
   const { stdout } = useStdout();
   const { suspendTerminal } = useApp();
-  // The latest closure, so the subscription below is made once and not on every render.
-  const latest = useRef(anchor);
-  latest.current = anchor;
   useEffect(() => {
     // Ink subscribes to `resize` only on an interactive terminal, and so does this. Ink's test is its own
     // and not `choose.ts`'s: a TTY, outside what `is-in-ci` calls CI.
     if (!stdout?.isTTY || inkSeesCi()) return;
     const erase = () => {
-      // `suspendTerminal` refuses a second suspension while one is open; a resize that arrives inside one is
-      // already being answered by it.
+      // `suspendTerminal` refuses a second suspension while one is open; a resize that arrives inside one
+      // is already being answered by it.
       trace(`resize ${stdout.columns}x${stdout.rows}`);
-      stdout.write(ERASE_BELOW);
-      if (TRACE_FILE) stdout.write(CURSOR_QUERY);
-      suspendTerminal(() => latest.current()).catch(() => {});
+      suspendTerminal(() => {
+        stdout.write(ERASE_BELOW);
+        if (TRACE_FILE) stdout.write(CURSOR_QUERY);
+        reanchor();
+      }).catch(() => {});
     };
     // First, so the erase lands before Ink's own handler repaints.
     stdout.prependListener("resize", erase);
@@ -215,7 +206,7 @@ function useEraseOnResize(anchor: () => Promise<void>): void {
       stdout.off("resize", erase);
       if (TRACE_FILE) process.stdin.off("data", reportCpr);
     };
-  }, [stdout, suspendTerminal]);
+  }, [stdout, suspendTerminal, reanchor]);
 }
 
 /**
@@ -337,22 +328,7 @@ export function DevTui(props: {
   const { setCursorPosition } = useCursor();
   setCursorPosition(props.anchored === false ? undefined : TOP_LEFT);
   const [, reanchor] = useReducer((renders: number) => renders + 1, 0);
-  const committed = useRef<(() => void) | undefined>(undefined);
-  useEffect(() => {
-    committed.current?.();
-  });
-  useEraseOnResize(
-    () =>
-      new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, COMMIT_WAIT_MS);
-        committed.current = () => {
-          clearTimeout(timer);
-          committed.current = undefined;
-          resolve();
-        };
-        reanchor();
-      }),
-  );
+  useEraseOnResize(reanchor);
 
   // **The tick runs only while something is still coming up.** A command left open all day should not be
   // redrawing a clock into somebody's battery, so once every worker has arrived the footer is static
