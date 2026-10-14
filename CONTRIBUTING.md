@@ -52,7 +52,7 @@ The pull request template asks for each of these. Link the issue your change clo
 
 The rule is a repository ruleset, committed at `.github/rulesets/main.json` and applied from it. `packages/cli/src/ci/mainRuleset.test.ts` holds that file, and the `CI` job it requires, to the rule. It does not read GitHub, so the live ruleset can drift from the file; `/vet` compares the two before every merge it performs.
 
-Repository admins bypass it — all of it, force push and deletion included. That is how `/ship` commits to `main`, and merges its own pull requests with `--admin`, while the team is solo.
+Repository admins bypass it — all of it, force push and deletion included. That is how `/ship` commits to `main`, and merges its own pull requests with `--admin`, while the team is solo. The release workflow's deploy key bypasses it too, which is how a release pushes its version commit; `docs/RELEASING.md` §6 has the key, and why it must stay the only write-enabled one.
 
 To change the rule, edit the file, then apply it. `gh api repos/pithy-sh/pithy/rulesets` lists the id; with no `main` ruleset listed, create it instead:
 
@@ -163,16 +163,18 @@ bun packages/cli/src/docs/writeCatalog.ts --check   # what CI runs
 
 It is committed, so a consumer that neither is this repository nor installs it can read it with no build step — and committed means it can go stale, which is what the `--check` in CI's verify job is for. A stale export does not fail the site's check; it makes every page pass against a kit that has moved.
 
-### The kit's OpenAPI document
+### The kit's contract documents
 
-`docs/openapi.generated.json` is every route every capability ships, as OpenAPI 3.1, for a reader with no build step — the docs site, a client generator in another language. It is composed from each package's `dist`, so write it after a build.
+`docs/openapi.generated.json` is every route every capability ships, as OpenAPI 3.1, for a reader with no build step — the docs site, a client generator in another language. `docs/asyncapi.generated.json` is every socket, as AsyncAPI 3.0: each frame each side sends, and the built-in games' `action` and `view` schemas. Both are composed from each package's `dist`, so write them after a build. One command writes both, and one check holds both.
 
 ```bash
-bun run build && bun run kit-contract                    # rewrite it
+bun run build && bun run kit-contract                    # rewrite both
 bun packages/cli/src/openapi/writeKitDocument.ts --check   # what CI runs
 ```
 
 **Adding or changing a route moves it, so a route change regenerates it in the same commit.** And a route is not finished until the document can say something true about it: `describeRoute({ summary, verification, responses })` first on the route line, each success response a Zod object in the capability's `src/http/responses.ts`, every request part read through `validate(target, Schema)`, and every field `.describe()`d. The capability's `routeContract.test.ts` fails on a route or a field that is not, and `CLAUDE.md` §HTTP states the rule.
+
+**A socket is the same, with frames for routes.** A capability that serves one declares it on `Capability.sockets`, with a described Zod schema for every frame it sends and accepts, and parses every incoming frame with that schema. A frame change regenerates `docs/asyncapi.generated.json` in the same commit, and how a frame may change at all is [`docs/SOCKETS.md`](docs/SOCKETS.md).
 
 ### The shipped declarations
 

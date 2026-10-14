@@ -4,16 +4,19 @@
 import { env } from "cloudflare:test";
 import type { PithyHonoEnv } from "@pithy-sh/core/src/capability/capability";
 import { pithyErrorHandler } from "@pithy-sh/core/src/error/http";
+import { ErrorBody } from "@pithy-sh/core/src/error/wire";
 import { createMigrationRegistry } from "@pithy-sh/core/src/migrations/registry";
 import { runMigrations } from "@pithy-sh/core/src/migrations/runner";
 import { Hono } from "hono";
 import type { MigrationProvider } from "kysely/migration";
 import { beforeEach, describe, expect, test } from "vitest";
-import type { z } from "zod";
+import { z } from "zod";
 import { MULTIPLAYER_MIGRATION_ORDER } from "../capability";
 import { MultiplayerConfig, type MultiplayerConfigInput, validateGames } from "../config/config";
 import "../game/builtins";
+import { type GameModel, registerGameModel } from "../game/model";
 import { multiplayer_0001_results } from "../migrations/0001_results";
+import { ServerFrame } from "../session/frames";
 import { SessionResult, SessionView } from "./responses";
 import { registerMultiplayerRoutes } from "./routes";
 
@@ -88,6 +91,18 @@ const CONFIG: MultiplayerConfigInput = {
   ],
 };
 
+/** A table that does nothing, so a test can join, leave and close it with no ledger composed. */
+const QUIET_TABLE: GameModel = {
+  kind: "test-route-table",
+  config: z.object({}).describe("No rules."),
+  state: z.object({}).describe("No state."),
+  init: () => ({}),
+  apply: (_ctx, state) => ({ state }),
+  isComplete: () => false,
+  resolve: () => ({ outcome: { scores: {}, winnerUserId: null, draw: false } }),
+  redact: () => ({}),
+};
+
 const req = (
   app: Hono<PithyHonoEnv>,
   method: string,
@@ -157,6 +172,62 @@ describe("multiplayer routes", () => {
     expect((await req(app, "GET", `/multiplayer/sessions/${id}/result`, { user: "alice" })).status).toBe(404);
   });
 
+  test("a session reads only for its members: the view for a current one, the result for anyone who played", async () => {
+    const app = makeApp(CONFIG);
+    const created = await req(app, "POST", "/multiplayer/games/battle", { user: "alice" });
+    const id = (await created.json<SessionView>()).sessionId;
+    await req(app, "POST", `/multiplayer/sessions/${id}/join`, { user: "bob" });
+
+    expect((await req(app, "GET", `/multiplayer/sessions/${id}`, { user: "alice" })).status).toBe(200);
+    const view = await req(app, "GET", `/multiplayer/sessions/${id}`, { user: "mallory" });
+    expect(view.status).toBe(403);
+    expect((await view.json<{ error: { code: string } }>()).error.code).toBe("multiplayer/not_a_member");
+
+    await req(app, "POST", `/multiplayer/sessions/${id}/action`, {
+      user: "alice",
+      body: { offense: ["fire"], defense: ["guard-ice"] },
+    });
+    await req(app, "POST", `/multiplayer/sessions/${id}/action`, {
+      user: "bob",
+      body: { offense: ["ice"], defense: ["guard-fire"] },
+    });
+
+    expect((await req(app, "GET", `/multiplayer/sessions/${id}/result`, { user: "bob" })).status).toBe(200);
+    const result = await req(app, "GET", `/multiplayer/sessions/${id}/result`, { user: "mallory" });
+    expect(result.status).toBe(403);
+    expect((await result.json<{ error: { code: string } }>()).error.code).toBe("multiplayer/not_a_member");
+  });
+
+  test("the result 403s a non-member before it says whether the session has ended", async () => {
+    const app = makeApp(CONFIG);
+    const created = await req(app, "POST", "/multiplayer/games/battle", { user: "alice" });
+    const id = (await created.json<SessionView>()).sessionId;
+    expect((await req(app, "GET", `/multiplayer/sessions/${id}/result`, { user: "mallory" })).status).toBe(403);
+  });
+
+  test("a player who left a table reads how it ended, never the live view; a stranger can't leave it", async () => {
+    registerGameModel(QUIET_TABLE);
+    const app = makeApp({ games: [{ key: "quiet", kind: "test-route-table", mode: "table", players: 4, rules: {} }] });
+    const created = await req(app, "POST", "/multiplayer/games/quiet", { user: "alice" });
+    const id = (await created.json<SessionView>()).sessionId;
+    await req(app, "POST", `/multiplayer/sessions/${id}/join`, { user: "bob" });
+
+    const stranger = await req(app, "POST", `/multiplayer/sessions/${id}/leave`, { user: "mallory" });
+    expect(stranger.status).toBe(403);
+    expect((await stranger.json<{ error: { code: string } }>()).error.code).toBe("multiplayer/not_a_member");
+
+    expect((await req(app, "POST", `/multiplayer/sessions/${id}/leave`, { user: "bob" })).status).toBe(200);
+    // A retried leave from the player who just left stays idempotent.
+    expect((await req(app, "POST", `/multiplayer/sessions/${id}/leave`, { user: "bob" })).status).toBe(200);
+    expect((await req(app, "GET", `/multiplayer/sessions/${id}`, { user: "bob" })).status).toBe(403);
+
+    await req(app, "POST", `/multiplayer/sessions/${id}/close`, { user: "alice" });
+    const result = await req(app, "GET", `/multiplayer/sessions/${id}/result`, { user: "bob" });
+    expect(result.status).toBe(200);
+    expect((await conforming(result, SessionResult)).players).toEqual(["alice"]);
+    expect((await req(app, "GET", `/multiplayer/sessions/${id}/result`, { user: "mallory" })).status).toBe(403);
+  });
+
   test("a malformed game key is the validator's 400; a well-shaped unknown key keeps its 404", async () => {
     const app = makeApp(CONFIG);
     // `MultiplayerGameParams` bounds the segment to the kebab-case shape config already enforces, so an
@@ -187,20 +258,60 @@ describe("multiplayer routes", () => {
     expect((await req(app, "POST", `/multiplayer/sessions/${"a".repeat(129)}/join`)).status).toBe(401);
   });
 
-  test("a body-less action is judged by the game's model, not by a body validator", async () => {
-    // No multiplayer route declares a json schema: the action payload belongs to the game's model, so a
-    // body-less action still reaches it and the model is what refuses it. Pinned as-is, unchanged by the
-    // validator migration — today the `battle` model throws a raw ZodError inside the DO, which crosses the
-    // RPC boundary unrevived and surfaces as a 500. A json validator would turn this into a 400 and would
-    // also 400 every game whose action legitimately takes no payload, which is why there isn't one.
+  test("a malformed action is the game's own 400, judged by its declared action schema", async () => {
+    // No multiplayer route declares a json schema: the action belongs to the game's model. The `battle` model
+    // declares its `action`, so the session parses the body with it — a body-less action and a misshapen one
+    // are both `validation/invalid_input`, from the session rather than a body validator, and only once the
+    // caller has been judged a member of an active session.
     const app = makeApp(CONFIG);
     const created = await req(app, "POST", "/multiplayer/games/battle", { user: "alice" });
     const id = (await created.json<SessionView>()).sessionId;
     await req(app, "POST", `/multiplayer/sessions/${id}/join`, { user: "bob" });
 
-    const res = await req(app, "POST", `/multiplayer/sessions/${id}/action`, { user: "alice" });
-    expect(res.status).toBe(500);
-    expect((await res.json<{ error: { code: string } }>()).error.code).not.toBe("validation/invalid_input");
+    const bodyless = await req(app, "POST", `/multiplayer/sessions/${id}/action`, { user: "alice" });
+    expect(bodyless.status).toBe(400);
+    const bodylessError = await bodyless.json<{ error: { code: string; action?: string } }>();
+    expect(bodylessError.error.code).toBe("validation/invalid_input");
+    expect(Object.hasOwn(bodylessError.error, "action")).toBe(false);
+
+    const misshapen = await req(app, "POST", `/multiplayer/sessions/${id}/action`, {
+      user: "alice",
+      body: { offense: "fire" },
+    });
+    expect(misshapen.status).toBe(400);
+    expect((await misshapen.json<{ error: { code: string } }>()).error.code).toBe("validation/invalid_input");
+
+    // A non-member still gets the 403 whatever they send — the action schema runs after the membership check.
+    const outsider = await req(app, "POST", `/multiplayer/sessions/${id}/action`, { user: "mallory" });
+    expect(outsider.status).toBe(403);
+  });
+
+  test("a model that declares no action schema still receives the body untouched, a missing one as no payload", async () => {
+    const received: unknown[] = [];
+    const echo: GameModel = {
+      kind: "test-route-echo",
+      config: z.object({}).describe("No rules."),
+      state: z.object({}).describe("No state."),
+      init: () => ({}),
+      apply: (_ctx, state, _player, action) => {
+        received.push(action);
+        return { state };
+      },
+      isComplete: () => false,
+      resolve: () => ({ outcome: { scores: {}, winnerUserId: null, draw: true } }),
+      redact: () => ({}),
+    };
+    registerGameModel(echo);
+    const app = makeApp({ games: [{ key: "echo", kind: "test-route-echo", rules: {} }] });
+    const created = await req(app, "POST", "/multiplayer/games/echo", { user: "alice" });
+    const id = (await created.json<SessionView>()).sessionId;
+    await req(app, "POST", `/multiplayer/sessions/${id}/join`, { user: "bob" });
+
+    expect((await req(app, "POST", `/multiplayer/sessions/${id}/action`, { user: "alice" })).status).toBe(200);
+    expect(
+      (await req(app, "POST", `/multiplayer/sessions/${id}/action`, { user: "alice", body: { anything: [1] } })).status,
+    ).toBe(200);
+    expect(received).toEqual([undefined, { anything: [1] }]);
   });
 
   test("the socket route forwards an authenticated upgrade to the DO and gets a 101", async () => {
@@ -227,5 +338,74 @@ describe("multiplayer routes", () => {
       env,
     );
     expect(res.status).toBe(403);
+  });
+
+  test("the socket route answers a v1 offer with v1 on the 101, and the frames are v1", async () => {
+    const app = makeApp(CONFIG);
+    const created = await req(app, "POST", "/multiplayer/games/battle", { user: "alice" });
+    const id = (await created.json<SessionView>()).sessionId;
+    const res = await app.request(
+      `http://x/multiplayer/sessions/${id}/socket`,
+      {
+        method: "GET",
+        headers: { "x-user": "alice", upgrade: "websocket", "Sec-WebSocket-Protocol": "pithy.multiplayer.v1" },
+      },
+      env,
+    );
+    expect(res.status).toBe(101);
+    expect(res.headers.get("Sec-WebSocket-Protocol")).toBe("pithy.multiplayer.v1");
+    const socket = res.webSocket;
+    if (!socket) throw new Error("no socket");
+    const first = new Promise<string>((resolve) =>
+      socket.addEventListener("message", (event) => resolve(event.data as string), { once: true }),
+    );
+    socket.accept();
+    const frame: unknown = JSON.parse(await first);
+    expect(ServerFrame.parse(frame)).toEqual(frame);
+    expect((frame as { type: string }).type).toBe("state");
+  });
+
+  test("the socket route keeps an unversioned client on the bare view, with no protocol answered", async () => {
+    const app = makeApp(CONFIG);
+    const created = await req(app, "POST", "/multiplayer/games/battle", { user: "alice" });
+    const id = (await created.json<SessionView>()).sessionId;
+    const res = await app.request(
+      `http://x/multiplayer/sessions/${id}/socket`,
+      { method: "GET", headers: { "x-user": "alice", upgrade: "websocket" } },
+      env,
+    );
+    expect(res.status).toBe(101);
+    expect(res.headers.get("Sec-WebSocket-Protocol")).toBeNull();
+    const socket = res.webSocket;
+    if (!socket) throw new Error("no socket");
+    const first = new Promise<string>((resolve) =>
+      socket.addEventListener("message", (event) => resolve(event.data as string), { once: true }),
+    );
+    socket.accept();
+    const frame: unknown = JSON.parse(await first);
+    expect(SessionView.parse(frame)).toEqual(frame);
+    expect(Object.hasOwn(frame as object, "type")).toBe(false);
+  });
+
+  test("the socket route refuses an offer it does not serve with a 400, before the session is reached", async () => {
+    const app = makeApp(CONFIG);
+    const created = await req(app, "POST", "/multiplayer/games/battle", { user: "alice" });
+    const id = (await created.json<SessionView>()).sessionId;
+    const res = await app.request(
+      `http://x/multiplayer/sessions/${id}/socket`,
+      { method: "GET", headers: { "x-user": "alice", upgrade: "websocket", "Sec-WebSocket-Protocol": "graphql-ws" } },
+      env,
+    );
+    expect(res.status).toBe(400);
+    expect(res.webSocket).toBeNull();
+    const body = await conforming(res, ErrorBody);
+    expect(body.error.code).toBe("validation/invalid_input");
+    // Still a 401 first for a caller nobody verified, whatever they offered.
+    const anonymous = await app.request(
+      `http://x/multiplayer/sessions/${id}/socket`,
+      { method: "GET", headers: { upgrade: "websocket", "Sec-WebSocket-Protocol": "graphql-ws" } },
+      env,
+    );
+    expect(anonymous.status).toBe(401);
   });
 });

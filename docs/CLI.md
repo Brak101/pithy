@@ -47,7 +47,7 @@ The binary is always `pithy`. The alias system (Section 3) ships a shorter short
 | `pithy env [--worker <name>]` | Report each Worker's deployment environments (`dev`/`staging`/`prod`), their bindings, resolved ids, and dashboard links — read-only, switches nothing |
 | `pithy dashboard <connect\|rotate\|revoke-key\|disconnect\|status>` | Register, rotate, revoke, and inspect a management client's access to this project — project-wide and **per environment**, never per Worker. `connect` resolves the Worker's address and the seam's base path from the project (it prints both and where they came from; `--worker-url` overrides, and `--worker <name>` is required when a project has several Workers), runs a browser device-code flow, writes the trusted public key into your own D1, and reports connected only once a signed ping round-trips; `--public-key` registers a key you generated yourself, with no dashboard involved. `revoke-key` pulls one leaked key and leaves the connection standing; `disconnect` removes the lot. Both are local, immediate, and need nothing from the client. See `docs/CONTROL-PLANE.md` |
 | `pithy deploy` | Deploy to Cloudflare Workers. A Worker carrying a UI builds it first — its manifest's `ui.build`, then `wrangler deploy` (see [`commands/ui.md`](commands/ui.md)) |
-| `pithy contract [--worker <name>] [--out <dir>] [--env <name>]` | Write each Worker's OpenAPI document, read off the app it composes: every route's parameters, body, responses and verification, with every field's description. A client in any language generates its calls from it (see [`commands/contract.md`](commands/contract.md)) |
+| `pithy contract [--worker <name>] [--out <dir>] [--env <name>]` | Write each Worker's OpenAPI document, read off the app it composes: every route's parameters, body, responses and verification, with every field's description. A Worker that serves a socket gets an AsyncAPI document beside it, with every frame. A client in any language generates its calls from them (see [`commands/contract.md`](commands/contract.md)) |
 | `pithy upgrade [--worker <name>]` | Reconcile package-served capabilities with current manifests, per Worker — **skips ejected capabilities** (a forked, local-import capability is never reconciled) |
 | `pithy alias` | Install or remove the shell shortcut (see Section 3) |
 | `pithy docs <connect\|disconnect\|status>` | Point your AI coding agent at the Pithy documentation server — writes the `pithy` MCP entry into whichever of ten clients this machine has (Claude Code, Cursor, VS Code, Codex, Zed, Goose, …), merging into each tool's own file and leaving every other server in it alone. `--scope project` commits it for the team, `--scope user` follows you; a file it cannot parse is refused with the snippet to paste, never rewritten. No credential is written or read — the client runs the OAuth flow (see [`commands/docs.md`](commands/docs.md)) |
@@ -128,6 +128,12 @@ Under `--json` each of them carries `dryRun`, and under `--dry-run` a `plan` bes
 
 A follow-up the run could not establish — an account it could not ask, a ledger that would not read — is not named. Nor is a step only a person may take: provisioning a production environment needs its `--confirm` phrase, so `add` names no step for one, as no error's `fix` does (§3.3). `pithy doctor` carries the same idea the other way round: each check that fails its exit is one `failures` entry with a `fix` command, or `fix: null` where the remedy is an edit or a person's, and every finding in its blocks carries the same `fix`, the ones that never gate included — a deployed environment's pending migrations name `pithy migrate --env <env>`, an unbound secret names `pithy secrets provision` (§5.6).
 
+**What a run found worth offering, and did not require, is `offers`.** Same shape as `next` — `offers: [{ command, why }]`, each `command` whole and runnable as written — and a different promise: an agent asks the person before it runs one, and runs a `next` without asking. Two keys rather than one, because a list an agent has to judge item by item is the thing `next` exists to never be. It is absent unless the run established the fact behind it, never an empty list, and carried by no `--dry-run` and no failed run, exactly as `next` is. `packages/cli/src/contract/offerKeys.test.ts` holds every payload to the one shape and names each command that may carry it.
+
+| Command | `offers` names | When |
+|---|---|---|
+| `deploy` | `pithy dashboard connect --env <env> --worker <name>`, once per Worker that composes the control-plane seam, any one of which connects the project | A named environment, neither `dev` nor a feature environment, deployed with no failure, has no dashboard connection — read from the registry `pithy dashboard status` reads. A registry that would not read offers nothing |
+
 **Every `--json` payload names the version of its shape, as `schemaVersion`.** An integer per command, from `1`, carried on every line a command writes — `doctor`'s report and each record of a stream included — and published by `pithy schema` as each command's `schemaVersion`. It is bumped only by a change that breaks a parser: a key removed, or a key whose type changed, a value added to a fixed set among them. An added key does not bump it, so a parser keys its expectations on the number and ignores keys it does not know. The formatter stamps it, so no command can write a line without it, and `packages/cli/src/contract/payloadShapes.test.ts` fails a payload that loses or retypes a key while its number stays put.
 
 **`--json` formats for whoever is reading it.** A script, a CI job or an agent gets exactly the compact line it has always parsed; a person at a terminal gets that same document indented two spaces, with restrained syntax color. Nothing about the payload changes, so both round-trip through `JSON.parse` to the same value.
@@ -178,7 +184,7 @@ One page per command, under [`docs/commands/`](commands/). Every page carries th
 |---|---|
 | `pithy add` | [`commands/add.md`](commands/add.md) — Install a capability into a Worker |
 | `pithy alias` | [`commands/alias.md`](commands/alias.md) — Install or remove the `p.` shortcut |
-| `pithy contract` | [`commands/contract.md`](commands/contract.md) — Write each Worker's OpenAPI document |
+| `pithy contract` | [`commands/contract.md`](commands/contract.md) — Write each Worker's OpenAPI and AsyncAPI documents |
 | `pithy dashboard` | [`commands/dashboard.md`](commands/dashboard.md) — Register and revoke a management client's access |
 | `pithy deploy` | [`commands/deploy.md`](commands/deploy.md) — Deploy to Cloudflare Workers |
 | `pithy dev` | [`commands/dev.md`](commands/dev.md) — Run every Worker the project composes locally under one supervisor |
@@ -677,7 +683,7 @@ Project name: [my-pithy-app]
 
 Default values shown in brackets. `Y/n` means default yes; `y/N` means default no.
 
-**A prompt that can be answered from the account, is.** `pithy init` and `pithy worker add` ask where a Worker will answer, per environment, and offer the account's real Cloudflare zones rather than a free-text field — so a typo fails at `init` with a list of what exists, instead of at `deploy` with a Cloudflare error to decode. Where the account cannot be reached — no credentials, a token without `Zone:Read`, an offline laptop — the prompt says so in one line and falls back to free text. Scaffolding has never required the network, and this does not change that.
+**A prompt that can be answered from the account, is.** `pithy init` and `pithy worker add` ask where a Worker will answer, per environment, and offer the account's real Cloudflare zones rather than a free-text field — so a typo fails at `init` with a list of what exists, instead of at `deploy` with a Cloudflare error to decode. Where the account cannot be reached — no credentials, a token without `Zone:Read`, an offline laptop, credentials for another account than the project pins — the prompt says so in one line and falls back to free text. Scaffolding has never required the network, and this does not change that.
 
 **Every one of these is skippable.** A project without a domain yet is legitimate, and most are on the first day; an empty answer writes no `domains` block at all, and adding one later is a config edit plus a deploy, never a rescaffold. A non-interactive run asks nothing and declares nothing — `domains` goes in `pithy.config.ts` directly, which is exactly what the prompt writes.
 
@@ -862,7 +868,7 @@ COMMANDS
      worker    Manage the project's Workers under apps/ (the dev/deploy registry)
          ui    Scaffold and wire a front end served by one of the project's Workers
     upgrade    Reconcile each worker's installed capabilities with its pithy.config.ts and wrangler.jsonc
-   contract    Write each worker's OpenAPI document
+   contract    Write each worker's OpenAPI and AsyncAPI documents
 
   Develop
         dev    Run every worker locally under one supervisor

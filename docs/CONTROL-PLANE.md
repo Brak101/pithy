@@ -4,6 +4,8 @@ _The reader's version of this page is [pithy.sh/docs/capabilities/control-plane]
 
 How a management client reaches into your Worker, without Pithy operating a data plane.
 
+**An AI agent reaching a Pithy application is a case of its own**, and [`AGENT-ACCESS.md`](AGENT-ACCESS.md) is the model for it: which kinds of agent reach this seam and which do not, how a connection records who authorized it, and why an agent authorized as a *user of the app* does not come through here at all.
+
 ---
 
 ## 1. Two things are called "control plane". This is the other one.

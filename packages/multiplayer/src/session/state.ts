@@ -17,6 +17,14 @@ export function isTerminal(phase: SessionPhase): boolean {
 }
 
 /**
+ * Everyone who ever joined the session: its record, plus its current members. The members are folded in
+ * because a session created before the record existed has none, and its members are the most it can say.
+ */
+export function everJoined(meta: Pick<SessionMeta, "members" | "joined">): string[] {
+  return [...new Set([...(meta.joined ?? []), ...meta.members])];
+}
+
+/**
  * A snapshot of a game's resolved config, taken at session creation and stored in the DO. The session
  * resolves against this snapshot and never reads live app config again, so a later config edit cannot
  * change a session already in flight. `rules` is the model-specific block, kept opaque here (the game's
@@ -52,6 +60,12 @@ export const SessionMeta = z
     members: z
       .array(z.string())
       .describe("The authenticated user ids of the players, in join order. Never client-asserted."),
+    joined: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Every user id that ever joined, in first-join order, kept when a player leaves. Absent on a session created before it was recorded; read it through `everJoined`.",
+      ),
     createdAt: z.number().int().describe("When the session was created, ms-epoch."),
     deadline: z
       .number()
@@ -66,3 +80,23 @@ export const SessionMeta = z
   })
   .describe("A session's authoritative metadata, persisted in Durable Object storage.");
 export type SessionMeta = z.infer<typeof SessionMeta>;
+
+/**
+ * What a session socket carries across hibernation, in its attachment: who it belongs to, and the
+ * subprotocol it negotiated at the upgrade, so every later frame renders for that version. Tiny, well under
+ * the 16,384-byte attachment ceiling. Read back through this schema, never cast.
+ */
+export const SocketAttachment = z
+  .object({
+    userId: z.string().describe("The authenticated user id the upgrade was forwarded with."),
+    sessionId: z.string().describe("The session the socket is on."),
+    protocol: z
+      .string()
+      .nullable()
+      .default(null)
+      .describe(
+        "The subprotocol negotiated at the upgrade, or null for an unversioned client. A socket accepted before versions existed has none, and reads as null.",
+      ),
+  })
+  .describe("A session socket's hibernation-safe attachment.");
+export type SocketAttachment = z.output<typeof SocketAttachment>;

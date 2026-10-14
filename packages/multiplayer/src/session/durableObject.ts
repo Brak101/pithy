@@ -4,7 +4,14 @@
 import { DurableObject } from "cloudflare:workers";
 import type { D1Database } from "@cloudflare/workers-types";
 import { clientError } from "@pithy-sh/core/src/error/client";
-import { InternalError, messageOf, PithyError, ValidationError } from "@pithy-sh/core/src/error/pithyError";
+import {
+  fromZodError,
+  InternalError,
+  messageOf,
+  PithyError,
+  ValidationError,
+} from "@pithy-sh/core/src/error/pithyError";
+import { negotiateSubprotocol, SUBPROTOCOL_HEADER } from "@pithy-sh/core/src/http/subprotocol";
 import type { Logger } from "@pithy-sh/core/src/logger/logger";
 import { createWorkerLogger } from "@pithy-sh/core/src/logger/worker";
 import type { MultiplayerResult } from "../data/result";
@@ -21,9 +28,10 @@ import {
 import { applyLedgerEffects } from "../game/effects";
 import { type GameContext, type GameModel, resolveModel } from "../game/model";
 import { createRngState, type RandomSource, randomSource } from "../game/random";
+import { ClientFrame, encodeErrorFrame, encodeStateFrame, MULTIPLAYER_SOCKET_VERSIONS } from "./frames";
 import { multiplayerPeers } from "./peers";
 import { RPC_ERROR_PREFIX, USER_HEADER } from "./protocol";
-import { type GameSnapshot, isTerminal, SessionMeta } from "./state";
+import { everJoined, type GameSnapshot, isTerminal, SessionMeta, SocketAttachment } from "./state";
 import type { SessionOutcome, SessionView } from "./view";
 
 /** The Worker env a session DO reads — the app `DB` database it writes its terminal result to. */
@@ -46,12 +54,6 @@ function publishFailure(error: unknown): PithyError {
   return new InternalError({ message: "The leaderboard publish failed.", detail: messageOf(error) }, { cause: error });
 }
 
-/** A message a client sends over the WebSocket — take an action, or ask for the current state. */
-interface ClientMessage {
-  type: "action" | "state";
-  payload?: unknown;
-}
-
 /**
  * One error, as a frame on a player's socket. Every error the socket sends is built here, and the payload
  * goes through core's `clientError` — the same projection the HTTP codec encodes through, because a socket
@@ -62,7 +64,13 @@ interface ClientMessage {
  * there is no second definition of what a client may read (#344).
  */
 function errorFrame(error: PithyError): string {
-  return JSON.stringify({ type: "error", error: clientError(error.payload) });
+  return encodeErrorFrame(clientError(error.payload));
+}
+
+/** A socket's attachment, read through its schema; null for a socket that carries none or a corrupt one. */
+function attachmentOf(ws: WebSocket): SocketAttachment | null {
+  const parsed = SocketAttachment.safeParse(ws.deserializeAttachment());
+  return parsed.success ? parsed.data : null;
 }
 
 /**
@@ -163,6 +171,46 @@ export class MultiplayerSession extends DurableObject<MultiplayerSessionEnv> {
     };
   }
 
+  /**
+   * The session's metadata, for a caller it admits — and a `not_a_member` 403 for anyone else, judged before
+   * anything else about the session is said. The view, an action and a close admit a current member; the
+   * result and a leave, with `former`, admit anyone who ever joined. Every RPC and socket frame that names a
+   * player goes through here, so a session answers one way however it is asked. The socket upgrade judges
+   * the same roster in `fetch`, where the answer is a plain response rather than a thrown error.
+   */
+  private async memberMeta(userId: string, verb: string, options: { former?: boolean } = {}): Promise<SessionMeta> {
+    const meta = await this.loadMeta();
+    if (!meta) throw new MultiplayerSessionNotFoundError({ detail: `${verb}: session ${this.sessionId} not found.` });
+    const admitted = options.former ? everJoined(meta) : meta.members;
+    if (!admitted.includes(userId)) {
+      throw new MultiplayerNotAMemberError({
+        action: options.former
+          ? "Only a player who joined this session can do this."
+          : "Only a current member of this session can do this.",
+        detail: `${verb}: ${userId} is not ${options.former ? "a player in" : "a member of"} ${this.sessionId}.`,
+      });
+    }
+    return meta;
+  }
+
+  /**
+   * What a player who already left is answered with: the session's identity and phase, and nothing live.
+   * A repeated leave stays idempotent without becoming a way to watch a table the player has left.
+   * The outcome stays null even once the session has ended: a former player reads how it ended from `/result`.
+   */
+  private departedView(meta: SessionMeta): SessionView {
+    return {
+      sessionId: meta.sessionId,
+      gameKey: meta.game.key,
+      kind: meta.game.kind,
+      phase: meta.phase,
+      players: [],
+      outcome: null,
+      state: null,
+      fairness: { seedHash: meta.rng.seedHash, seed: null },
+    };
+  }
+
   // --- RPC surface: the authenticated Hono handler calls these, passing the AuthContext user id ---
 
   /**
@@ -204,14 +252,21 @@ export class MultiplayerSession extends DurableObject<MultiplayerSessionEnv> {
     return this.guard(() => this.applyClose(userId));
   }
 
-  /** The redacted view for the authenticated player (RPC entry). */
+  /** The redacted view for the authenticated player, who must be a current member (RPC entry). */
   async view(userId: string): Promise<SessionView> {
-    return this.guard(() => this.snapshot(userId));
+    return this.guard(() => this.applyView(userId));
   }
 
-  /** The durable result once the session is terminal, or null while it is still live. */
-  async result(): Promise<MultiplayerResult | null> {
-    return (await resultStore(multiplayerDatabase(this.env.DB)).get(this.sessionId)) ?? null;
+  /**
+   * The durable result once the session is terminal, or null while it is still live (RPC entry). Read only
+   * by someone who ever joined: the result row names the members at the end, so a player who left a table
+   * is admitted by the session's own record instead.
+   */
+  async result(userId: string): Promise<MultiplayerResult | null> {
+    return this.guard(async () => {
+      await this.memberMeta(userId, "Result", { former: true });
+      return (await resultStore(multiplayerDatabase(this.env.DB)).get(this.sessionId)) ?? null;
+    });
   }
 
   /**
@@ -222,8 +277,14 @@ export class MultiplayerSession extends DurableObject<MultiplayerSessionEnv> {
   connectedUserIds(): string[] {
     return this.ctx
       .getWebSockets()
-      .map((ws) => (ws.deserializeAttachment() as { userId?: string } | null)?.userId)
+      .map((ws) => attachmentOf(ws)?.userId)
       .filter((id): id is string => Boolean(id));
+  }
+
+  /** The live view, for a current member only. */
+  private async applyView(userId: string): Promise<SessionView> {
+    await this.memberMeta(userId, "View");
+    return this.snapshot(userId);
   }
 
   /** Create the session. Called once, by the authenticated creator, who becomes its first member. */
@@ -237,6 +298,7 @@ export class MultiplayerSession extends DurableObject<MultiplayerSessionEnv> {
       // A table opens for play immediately (the creator takes the first seat); a match waits for its roster.
       phase: game.mode === "table" ? "active" : "open",
       members: [creatorUserId],
+      joined: [creatorUserId],
       createdAt: Date.now(),
       deadline: null,
       // Mint the provably-fair seed now and commit its hash, before any player can act.
@@ -272,6 +334,7 @@ export class MultiplayerSession extends DurableObject<MultiplayerSessionEnv> {
     }
 
     meta.members.push(userId);
+    meta.joined = everJoined(meta);
     if (meta.game.mode === "table") {
       // A table is already active; the player takes an open seat and the model deals them in.
       const model = this.model(meta);
@@ -307,11 +370,7 @@ export class MultiplayerSession extends DurableObject<MultiplayerSessionEnv> {
    * complete, the session resolves.
    */
   private async applyAction(userId: string, payload: unknown): Promise<SessionView> {
-    const meta = await this.loadMeta();
-    if (!meta) throw new MultiplayerSessionNotFoundError({ detail: `Action: session ${this.sessionId} not found.` });
-    if (!meta.members.includes(userId)) {
-      throw new MultiplayerNotAMemberError({ detail: `Action: ${userId} is not a member of ${this.sessionId}.` });
-    }
+    const meta = await this.memberMeta(userId, "Action");
     if (meta.phase !== "active") {
       const reason = meta.phase === "open" ? "still waiting for players" : `over (${meta.phase})`;
       throw new MultiplayerInvalidTransitionError({
@@ -323,6 +382,20 @@ export class MultiplayerSession extends DurableObject<MultiplayerSessionEnv> {
     const model = this.model(meta);
     const { ctx, rng } = this.makeContext(meta, model);
     const state = await this.loadModelState(model);
+    // A model that declares its action's shape has every action checked against it first, so a malformed one
+    // is the caller's `validation/invalid_input` — judged after membership and phase, like a validator after
+    // its guards. The check is a gate and nothing more: `apply` gets the payload as it was sent, never the
+    // parsed output. Every `apply` parses its own input, and a schema with a transform produces an output
+    // that is not valid input again, so handing it the output would refuse a legal move.
+    if (model.action) {
+      const parsed = model.action.safeParse(payload);
+      if (!parsed.success) {
+        throw fromZodError(parsed.error, {
+          message: "That action is not one this game accepts.",
+          detail: `Action: ${userId} sent a malformed ${meta.game.kind} action to ${this.sessionId}.`,
+        });
+      }
+    }
     const { state: next, effects } = model.apply(ctx, state, userId, payload);
 
     // Settle the action's ledger effects (a bet's hold) BEFORE committing the new state: a hold the player
@@ -347,19 +420,23 @@ export class MultiplayerSession extends DurableObject<MultiplayerSessionEnv> {
 
   /**
    * Leave a table seat (table mode only). The model settles the leaver out (releasing their open holds via
-   * effects); when the last player leaves, the table closes. Idempotent for a non-member.
+   * effects) and their sockets close; when the last player leaves, the table closes. A player who already
+   * left gets the departed view, never the live one, and anyone who never joined a `not_a_member` 403.
    */
   private async applyLeave(userId: string): Promise<SessionView> {
-    const meta = await this.loadMeta();
-    if (!meta) throw new MultiplayerSessionNotFoundError({ detail: `Leave: session ${this.sessionId} not found.` });
+    const meta = await this.memberMeta(userId, "Leave", { former: true });
     if (meta.game.mode !== "table") {
       throw new MultiplayerInvalidTransitionError({
         message: "You can only leave a table.",
         detail: `Leave on a ${meta.game.mode} session.`,
       });
     }
-    if (isTerminal(meta.phase) || !meta.members.includes(userId)) return this.snapshot(userId);
+    if (!meta.members.includes(userId)) return this.departedView(meta);
+    if (isTerminal(meta.phase)) return this.snapshot(userId);
 
+    // Record everyone before the leaver drops out of `members`: a session from before the record existed
+    // has none, and this is the last moment it can still name them.
+    meta.joined = everJoined(meta);
     meta.members = meta.members.filter((member) => member !== userId);
     const model = this.model(meta);
     const { ctx, rng } = this.makeContext(meta, model); // ctx.players already excludes the leaver
@@ -382,22 +459,26 @@ export class MultiplayerSession extends DurableObject<MultiplayerSessionEnv> {
     } else {
       await this.ctx.storage.put(META_KEY, meta);
     }
+    // The leaver is no longer a member, so their sockets go with the seat; broadcast skips them regardless.
+    for (const ws of this.ctx.getWebSockets(userId)) {
+      try {
+        ws.close(1000, "You left the table.");
+      } catch {
+        // Already closing — ignore.
+      }
+    }
     await this.broadcast();
     return this.snapshot(userId);
   }
 
   /** Close a table (table mode only), ending the session. Idempotent once terminal. */
   private async applyClose(userId: string): Promise<SessionView> {
-    const meta = await this.loadMeta();
-    if (!meta) throw new MultiplayerSessionNotFoundError({ detail: `Close: session ${this.sessionId} not found.` });
+    const meta = await this.memberMeta(userId, "Close");
     if (meta.game.mode !== "table") {
       throw new MultiplayerInvalidTransitionError({
         message: "You can only close a table.",
         detail: `Close on a ${meta.game.mode} session.`,
       });
-    }
-    if (!meta.members.includes(userId)) {
-      throw new MultiplayerNotAMemberError({ detail: `Close: ${userId} is not at table ${this.sessionId}.` });
     }
     if (isTerminal(meta.phase)) return this.snapshot(userId);
     await this.commitTerminal(meta, {
@@ -528,12 +609,23 @@ export class MultiplayerSession extends DurableObject<MultiplayerSessionEnv> {
   /**
    * Accept a member's WebSocket via the Hibernation API. The upgrade is forwarded by the authenticated Hono
    * handler, which sets {@link USER_HEADER} to the AuthContext user id — the DO trusts that server-set header
-   * and never a client-supplied id. The identity is stashed with `serializeAttachment` so it survives
-   * hibernation.
+   * and never a client-supplied id. The identity and the negotiated subprotocol are stashed with
+   * `serializeAttachment` so they survive hibernation.
+   *
+   * The subprotocol is negotiated before anything else is judged: an offer this socket does not serve is a
+   * 400 with the ordinary JSON error body, and a chosen one is echoed on the 101 — a browser drops a socket
+   * whose answer does not name a protocol it offered.
    */
   override async fetch(request: Request): Promise<Response> {
     if (request.headers.get("upgrade") !== "websocket") {
       return new Response("Expected a WebSocket upgrade.", { status: 426 });
+    }
+    let protocol: string | null;
+    try {
+      protocol = negotiateSubprotocol(request.headers.get(SUBPROTOCOL_HEADER), MULTIPLAYER_SOCKET_VERSIONS);
+    } catch (error) {
+      if (!(error instanceof PithyError)) throw error;
+      return Response.json({ error: clientError(error.payload) }, { status: error.payload.status });
     }
     const userId = request.headers.get(USER_HEADER);
     if (!userId) return new Response("Missing authenticated user.", { status: 401 });
@@ -546,33 +638,60 @@ export class MultiplayerSession extends DurableObject<MultiplayerSessionEnv> {
     const [client, server] = [pair[0], pair[1]];
     // Hibernation API — never `server.accept()`, which would pin the object in memory.
     this.ctx.acceptWebSocket(server, [userId]);
-    // Tiny attachment, well under the 16,384-byte ceiling — the reconnection/resume identity.
-    server.serializeAttachment({ userId, sessionId: this.sessionId });
-    server.send(JSON.stringify(await this.snapshot(userId)));
-    return new Response(null, { status: 101, webSocket: client });
+    // Tiny attachment, well under the 16,384-byte ceiling — the reconnection/resume identity and its version.
+    server.serializeAttachment({ userId, sessionId: this.sessionId, protocol } satisfies SocketAttachment);
+    server.send(encodeStateFrame(await this.snapshot(userId), protocol));
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+      ...(protocol === null ? {} : { headers: { [SUBPROTOCOL_HEADER]: protocol } }),
+    });
   }
 
+  /**
+   * One frame from a member, parsed with {@link ClientFrame}. Anything that is not JSON is answered with a
+   * `validation/invalid_input` error frame on every version, and the socket stays open. A frame that is JSON
+   * but not one {@link ClientFrame} accepts depends on the version: a `pithy.multiplayer.v1` socket gets the
+   * same error frame, and an unversioned one hears nothing, exactly as before versions existed.
+   */
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    const attachment = ws.deserializeAttachment() as { userId?: string } | null;
-    const userId = attachment?.userId;
-    if (!userId) {
+    const attachment = attachmentOf(ws);
+    if (!attachment) {
       ws.send(errorFrame(new MultiplayerNotAMemberError({ message: "Unidentified socket." })));
       return;
     }
-    let parsed: ClientMessage;
+    const { userId, protocol } = attachment;
+    let raw: unknown;
     try {
-      parsed = JSON.parse(typeof message === "string" ? message : new TextDecoder().decode(message)) as ClientMessage;
+      raw = JSON.parse(typeof message === "string" ? message : new TextDecoder().decode(message));
     } catch (error) {
       ws.send(errorFrame(new ValidationError({ message: "Message must be JSON.", detail: messageOf(error) })));
       return;
     }
+    const parsed = ClientFrame.safeParse(raw);
+    if (!parsed.success) {
+      // The unversioned protocol ignored a frame whose `type` it did not know, or that had none, and a client
+      // written against it may lean on that. `ClientFrame` refuses nothing else: an `action` frame's payload
+      // is any value and its other keys are dropped, so this is that case and only that one.
+      if (protocol === null) return;
+      ws.send(
+        errorFrame(
+          fromZodError(parsed.error, {
+            message: "That frame is not one this socket accepts.",
+            detail: `Socket frame from ${userId} on ${this.sessionId} failed ClientFrame.`,
+          }),
+        ),
+      );
+      return;
+    }
+    const frame = parsed.data;
 
     try {
-      if (parsed.type === "action") {
+      if (frame.type === "action") {
         // Call the internal method directly — no RPC boundary here, so it throws a real PithyError.
-        await this.applyAction(userId, parsed.payload);
-      } else if (parsed.type === "state") {
-        ws.send(JSON.stringify(await this.snapshot(userId)));
+        await this.applyAction(userId, frame.payload);
+      } else {
+        ws.send(encodeStateFrame(await this.applyView(userId), protocol));
       }
     } catch (error) {
       ws.send(
@@ -595,15 +714,19 @@ export class MultiplayerSession extends DurableObject<MultiplayerSessionEnv> {
     }
   }
 
-  /** Push each connected member their own redacted view — after any state change. */
+  /**
+   * Push each connected member their own redacted view — after any state change. A socket whose user is no
+   * longer a member gets nothing: leaving closes it, and this holds even when the close did not land.
+   */
   private async broadcast(): Promise<void> {
     const sockets = this.ctx.getWebSockets();
     if (sockets.length === 0) return;
+    const members = (await this.loadMeta())?.members ?? [];
     for (const ws of sockets) {
-      const attachment = ws.deserializeAttachment() as { userId?: string } | null;
-      if (!attachment?.userId) continue;
+      const attachment = attachmentOf(ws);
+      if (!attachment || !members.includes(attachment.userId)) continue;
       try {
-        ws.send(JSON.stringify(await this.snapshot(attachment.userId)));
+        ws.send(encodeStateFrame(await this.snapshot(attachment.userId), attachment.protocol));
       } catch {
         // A dead socket — skip it; the next message or reconnect will resync.
       }
