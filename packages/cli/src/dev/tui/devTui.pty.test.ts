@@ -4,8 +4,10 @@
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { devTuiHarness, harnessEnv } from "../../test-utils/devTuiHarness";
+import { scrollScreenAway } from "./app";
 
 /**
  * **What the footer does to a real terminal — measured, on one, with the real component.**
@@ -26,6 +28,13 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
  *    output is still there afterwards, which is the whole reason this shape was chosen over a full-screen
  *    app.
  * 4. **The last frame is left behind**, so a session that has stopped still says how it ended.
+ * 5. **A resize repaints the footer once it settles, and only then** (#736). The harness drags its own
+ *    terminal narrower and wider with `stty`, which arrives as SIGWINCH exactly as a window manager's
+ *    does, and the footer is redrawn on a clean screen once per settled size — not once per event, and
+ *    without an erase-display. A byte stream does not rewrap, so this cannot see the stale headers a
+ *    rewrapping terminal stacked up; `devTui.windows.test.ts` reads those off a real ConPTY. What this
+ *    holds is the half a byte stream can: how often the repaint fires, and that it leaves the stream
+ *    whole.
  *
  * A pty is required and a fake will not do, for the reason `capabilities/secretPrompt.pty.test.ts` gives
  * about `password()`: this behavior is the *terminal's* and Ink's, not ours. `script(1)` allocates it,
@@ -33,9 +42,6 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
  * written to a temp file rather than shipped in `src/`, because every non-test `src/*.ts` is a published
  * entry of `@pithy-sh/cli`.
  */
-
-/** `packages/cli/src/dev/tui` → the package's own sources, which the harness imports by absolute path. */
-const CLI_SRC = resolve(import.meta.dirname, "..", "..");
 
 /** Where `bun` is, or `null` — the harness imports `.ts`/`.tsx` deep paths, which only Bun runs. */
 function bunPath(): string | null {
@@ -63,32 +69,38 @@ const RUNNABLE = BUN !== null && hasScript();
 const LINES = 300;
 const LONG = `[api] Error: ${"segment/".repeat(45)}end`;
 
-const HARNESS = `
-import { createDevStore } from ${JSON.stringify(join(CLI_SRC, "dev", "tui", "store.ts"))};
-import { startTui } from ${JSON.stringify(join(CLI_SRC, "dev", "tui", "app.tsx"))};
+/** The terminal's height, which the resize phase never changes: a drag here is a change of width. */
+const ROWS = 24;
 
-const store = createDevStore();
-const at = new Date();
-store.event({ event: "spawned", worker: "api", kind: "app", port: 8787, at });
-store.event({ event: "spawned", worker: "support", kind: "host", port: 8790, at });
-store.event({ event: "ready", worker: "api", at });
-store.event({ event: "login", email: "ada@example.com" });
+/** The widths the resize phase settles at — narrower than the start, then wider. */
+const SETTLED = [60, 120];
 
-const noop = () => {};
-const tui = await startTui({
-  store,
+/**
+ * The resize phase: a drag to each settled width, a step of a few columns at a time as a window manager
+ * sends them, then a pause long enough for the footer to settle and a marker written at that size.
+ */
+const RESIZE_PHASE = `
+const { execFileSync } = await import("node:child_process");
+const rest = (ms) => new Promise((r) => setTimeout(r, ms));
+const width = (cols) => execFileSync("stty", ["cols", String(cols)], { stdio: "inherit" });
+let cols = 80;
+for (const target of ${JSON.stringify(SETTLED)}) {
+  const step = target > cols ? 5 : -5;
+  for (cols += step; step > 0 ? cols < target : cols > target; cols += step) {
+    width(cols);
+    await rest(20);
+  }
+  cols = target;
+  width(cols);
+  await rest(600);
+  store.line("MARK-" + process.stdout.columns, "api");
+  await rest(400);
+}
+`;
+
+const HARNESS = devTuiHarness({
   keys: false,
-  onRestart: noop,
-  onOpen: noop,
-  onLogin: noop,
-  onDigit: noop,
-  onQuit: noop,
-  onInterrupt: noop,
-});
-
-// Worker output is hidden by default (the roster is the point of the footer), and what this file
-// measures is what reaches a real terminal — so it asks for the lot.
-store.showAll(true);
+  script: `
 store.line(${JSON.stringify(LONG)}, "api");
 for (let i = 0; i < ${LINES}; i++) store.line("L" + i, "api");
 /**
@@ -109,10 +121,12 @@ while (Date.now() < deadline) {
   await new Promise((r) => setTimeout(r, 100));
 }
 await new Promise((r) => setTimeout(r, 400));
+${RESIZE_PHASE}
 store.event({ event: "exited", worker: "support", code: 1 });
 await new Promise((r) => setTimeout(r, 300));
 await tui.stop();
-`;
+`,
+});
 
 let workspace: string;
 let transcript: string;
@@ -125,8 +139,8 @@ beforeAll(() => {
   writeFileSync(harness, HARNESS);
   // **`stty` first.** A pty whose stdout is a pipe starts 0x0, and a zero-column terminal wraps every
   // line after one character — which would make claim 2 below unfalsifiable rather than true.
-  const command = `stty rows 24 cols 80; ${BUN as string} ${harness}`;
-  execFileSync("script", ["-qec", command, out], { stdio: "ignore", timeout: 120_000 });
+  const command = `stty rows ${ROWS} cols 80; ${BUN as string} ${harness}`;
+  execFileSync("script", ["-qec", command, out], { stdio: "ignore", timeout: 120_000, env: harnessEnv() });
   transcript = readFileSync(out, "utf8").replace(/\r\n/g, "\n");
 }, 140_000);
 
@@ -175,5 +189,29 @@ describe.runIf(RUNNABLE)("the live footer on a real terminal", () => {
     // `api` became ready at the same instant it spawned and stays at its own elapsed; a session clock
     // would have climbed past a second while the 300 lines were committed.
     expect(plain()).toMatch(/api\s+app\s+8787\s+ready\s+0\.0s/);
+  });
+
+  test("a drag repaints the footer once, when it settles, not once per resize", () => {
+    // Every step of each drag was its own SIGWINCH — four of them on the way to 60 columns, twelve on
+    // the way to 120. One repaint per settled size is the debounce working; one per step is the disease.
+    expect(transcript.split(scrollScreenAway(ROWS)).length - 1).toBe(SETTLED.length);
+  });
+
+  test("a marker written at each settled size arrives once, in order", () => {
+    const markers = [...plain().matchAll(/MARK-(\d+)/g)].map((m) => Number(m[1]));
+    expect(markers).toEqual(SETTLED);
+  });
+
+  test("after the last repaint the screen holds one roster header", () => {
+    // Cut at the last repaint, which is the scroll-away: everything after it is drawn on a clean screen.
+    // The repaint itself paints with no erase in front of it — there is nothing left to erase — so the
+    // final frame starts at the last erase *after* the cut if Ink has redrawn since, and at the cut if it
+    // has not. A repaint that never fired is a failure here, not an empty cut.
+    const repaint = transcript.lastIndexOf(scrollScreenAway(ROWS));
+    expect(repaint, "no repaint after the resize").toBeGreaterThan(-1);
+    const after = transcript.slice(repaint);
+    const erase = after.lastIndexOf("\x1b[2K\x1b[1A");
+    const frame = (erase === -1 ? after : after.slice(erase)).replace(ANSI, "");
+    expect([...frame.matchAll(/^\s+worker\s+kind/gm)]).toHaveLength(1);
   });
 });

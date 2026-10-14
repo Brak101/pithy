@@ -60,6 +60,7 @@
     "react": "^19.2.8"
   },
   "devDependencies": {
+    "@lydell/node-pty": "1.2.0-beta.15",
     "@pithy-sh/audit": "workspace:*",
     "@pithy-sh/auth": "workspace:*",
     "@pithy-sh/i18n": "workspace:*",
@@ -80,6 +81,7 @@
     "@types/node": "^22.15.0",
     "@types/react": "^19.2.18",
     "@vitest/coverage-v8": "^4.1.0",
+    "@xterm/headless": "6.0.0",
     "ink-testing-library": "4.0.0",
     "kysely": "^0.29.0",
     "rolldown": "^1.2.4",

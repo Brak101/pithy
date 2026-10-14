@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
-import { Box, render, Static, Text, useInput, useStdout } from "ink";
+import { Box, render, Static, Text, useApp, useInput, useStdout } from "ink";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { dim } from "../../terminal/style";
 import { stripAnsi } from "../logging";
@@ -112,6 +112,88 @@ function applies(needs: "always" | "worker" | "ready-app" | "started", row: Mark
 const FALLBACK_COLUMNS = 80;
 
 /**
+ * How long a resize has to stay still before the footer is redrawn on a clean screen. A window drag
+ * arrives as dozens of `resize` events; this is what makes it one repaint rather than one per event.
+ */
+const RESIZE_SETTLE_MS = 150;
+
+/**
+ * **Scroll the screen into scrollback, then put the cursor top-left.**
+ *
+ * One newline per row, written from the cursor: the rows below it are blank, so the first newlines only
+ * walk the cursor to the bottom and the rest scroll every row above it — the committed stream and
+ * whatever a stale erase left behind — up off the screen, each exactly once. Not `\x1b[2J`: what an
+ * erase-display does to the rows it clears is the terminal's choice, and the choices differ: some scroll
+ * them into scrollback, and xterm.js discards them, which took the newest committed lines with them in
+ * the measurement on #736. A newline at the bottom row scrolls on every terminal there is. Never `\x1b[3J` either: scrollback is where the committed stream lives.
+ */
+export function scrollScreenAway(rows: number): string {
+  return `${"\n".repeat(rows)}\x1b[H`;
+}
+
+/**
+ * Whether Ink believes it is running in CI, by the rule Ink uses (`is-in-ci`): `CI` or
+ * `CONTINUOUS_INTEGRATION` present and neither `0` nor `false`. Ink then renders non-interactively —
+ * no live frame, no `resize` listener — even on a TTY.
+ */
+function inkSeesCi(): boolean {
+  return ["CI", "CONTINUOUS_INTEGRATION"].some(
+    (key) => key in process.env && process.env[key] !== "0" && process.env[key] !== "false",
+  );
+}
+
+/**
+ * **Redraw the footer on a clean screen once a resize settles (#736).**
+ *
+ * Ink repaints the footer by moving the cursor up the number of rows it drew last time and erasing them.
+ * A terminal that rewraps on resize — ConPTY does, and so does any terminal that reflows — moves those
+ * rows under the cursor, so the count goes stale and the erase lands on the wrong rows. On a drag, every
+ * spinner-tick repaint left the last frame's rule and header behind, stacking up the screen. Ink clears
+ * on its own only when the window narrows, and with the same stale count.
+ *
+ * Nothing in the byte stream says where the rows went, so this stops asking. Once the size settles it
+ * hands the terminal over through `suspendTerminal` — Ink's public way to drop its last frame and draw the
+ * next one in full — scrolls the screen away, and Ink paints the footer fresh from the top-left, with
+ * nothing to erase. Ink's own erase on the way into the suspension still runs on the stale count; it
+ * lands above the cursor, and the scroll carries it off with everything else.
+ *
+ * The scroll is the only new writer: one per settled size, none per event, none per spinner tick. The
+ * committed stream is not replayed — it is in scrollback, once, where the terminal keeps it. What a drag
+ * left behind before it settled goes up there with it; `docs/ACCEPTED-LIMITS.md` has that half.
+ */
+function useRepaintOnResize(): void {
+  const { stdout } = useStdout();
+  const { suspendTerminal } = useApp();
+  useEffect(() => {
+    // Ink subscribes to `resize` only on an interactive terminal, and so does this. Ink's test is its own
+    // and not `choose.ts`'s: a TTY, outside what `is-in-ci` calls CI. Where Ink draws no live frame, a
+    // repaint has nothing to redraw and would only scroll the stream off the screen.
+    if (!stdout?.isTTY || inkSeesCi()) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let repainting = false;
+    const repaint = () => {
+      // A drag that resumes while the last repaint is still in flight gets its own once it settles.
+      if (repainting) return void settle();
+      repainting = true;
+      void suspendTerminal(() => {
+        stdout.write(scrollScreenAway(stdout.rows));
+      }).finally(() => {
+        repainting = false;
+      });
+    };
+    const settle = () => {
+      clearTimeout(timer);
+      timer = setTimeout(repaint, RESIZE_SETTLE_MS);
+    };
+    stdout.on("resize", settle);
+    return () => {
+      clearTimeout(timer);
+      stdout.off("resize", settle);
+    };
+  }, [stdout, suspendTerminal]);
+}
+
+/**
  * One committed line, sized so Ink does not rewrap it.
  *
  * **This `<Box>` is the whole reason the stream stays byte-identical to a plain run.** Ink measures a
@@ -186,6 +268,7 @@ export function DevTui(props: {
   const enabled = new Map<string, boolean>(KEY_BAR.map((k) => [k.key, applies(k.needs, selectedRow)]));
   const { stdout } = useStdout();
   const [now, setNow] = useState(() => new Date());
+  useRepaintOnResize();
 
   // **The tick runs only while something is still coming up.** A command left open all day should not be
   // redrawing a clock into somebody's battery, so once every worker has arrived the footer is static
@@ -348,7 +431,8 @@ export interface TuiHandle {
  * **Deliberately thin, and deliberately not unit-tested.** Every decision with behavior behind it is
  * either tested above (`DevTui`) or is a property only a real terminal can settle, which
  * `devTui.pty.test.ts` settles: that committed lines survive in scrollback, that the final frame is left
- * behind rather than erased, and that a long line is not split.
+ * behind rather than erased, that a long line is not split, and that a resize repaints once it settles.
+ * `devTui.windows.test.ts` settles the resize on a real ConPTY, the terminal that rewraps.
  *
  * Ink is imported statically here and this whole module is reached through `await import` instead, which
  * is the same guarantee one level up and one fewer moving part: `ci/lazyHeavyImports.test.ts` walks the
