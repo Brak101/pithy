@@ -22,7 +22,7 @@ Read this section first. Every other decision here follows from it, and the two 
 | Authorized by | Control-plane **scopes** on a connection | **Powers**, through the user's role |
 | Creates a session? | No — [`CONTROL-PLANE.md` §10](CONTROL-PLANE.md) | Yes; it *is* a session |
 
-**The line is drawn by the architecture, not imposed on it.** An operator is not a user of the application, and modelling one as a user would place an administrator inside the tenancy it administers. The seam already refuses to do that: a control-plane call creates no user and no session. So an agent that acts *as somebody* authenticates as that somebody, and an agent that acts *on the system* does not authenticate as anybody at all.
+**The line is drawn by the architecture, not imposed on it.** An operator is not a user of the application, and modeling one as a user would place an administrator inside the tenancy it administers. The seam already refuses to do that: a control-plane call creates no user and no session. So an agent that acts *as somebody* authenticates as that somebody, and an agent that acts *on the system* does not authenticate as anybody at all.
 
 **Which kind a feature needs is a property of the feature, not of the customer.** A saved analytical query called by a customer's own agent is the second kind. An agent summarizing last night's audit events is the first. The same adopter may want both.
 
@@ -134,7 +134,7 @@ What is actually identifying is the **redirect URI**: it is where the token goes
 
 **A selective consent means the token carries the selection, and every tool call then checks it *in addition to* the role.** That is a second gate. It is defensible — *both gates apply, and one is never evidence for the other* is the pattern this whole product is built on — but it is a second authorization system to declare, describe and keep in step, and §4 argued for adding none.
 
-**At the capability level the cost is small enough to be worth paying**, which is the reason to choose that unit rather than either neighbour: the check is one comparison per call against the tool's own capability, there is nothing new to declare because a tool already knows which capability it came from, and it cannot drift from the route gates because it is not trying to restate them. A per-tool scope vocabulary would be a genuine second system; a per-capability one is a filter.
+**At the capability level the cost is small enough to be worth paying**, which is the reason to choose that unit rather than either neighbor: the check is one comparison per call against the tool's own capability, there is nothing new to declare because a tool already knows which capability it came from, and it cannot drift from the route gates because it is not trying to restate them. A per-tool scope vocabulary would be a genuine second system; a per-capability one is a filter.
 
 **What it must never become is the authority.** The role remains the ceiling. A client holding consent for a capability still cannot do anything inside it the user could not, and a test should hold that rather than a comment.
 
