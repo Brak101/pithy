@@ -220,14 +220,16 @@ describe.runIf(RUNNABLE)("the live footer on a real terminal", () => {
     // On main's bytes there is no guard at all — the single "frame" is the whole transcript, the
     // staircase is inside it, and the count below goes red. Red on the disease, green on the cure.
     const frames = transcript.split(NO_WRAP).map((frame) => frame.replace(ANSI, ""));
+    const header = /^\s+worker\s+kind/m;
     let carried: string | undefined;
     for (let i = frames.length - 1; i >= 0; i--) {
-      if (frames[i]?.includes("worker kind")) {
-        carried = frames[i];
+      const frame = frames[i];
+      if (frame && header.test(frame)) {
+        carried = frame;
         break;
       }
     }
-    expect(carried, "no guarded frame after the resize").toContain("worker kind");
+    expect(carried, "no guarded frame after the resize").toMatch(header);
     expect([...(carried ?? "").matchAll(/^\s+worker\s+kind/gm)]).toHaveLength(1);
   });
 });

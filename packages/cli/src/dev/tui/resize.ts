@@ -29,7 +29,9 @@ const CURSOR_QUERY = "\x1b[6n";
  * and the terminal's own cursor answers are appended to that file. Unset, the string is `undefined` and
  * every trace call is a no-op.
  */
-const TRACE_FILE = process.env.PITHY_TUI_TRACE;
+export const TUI_TRACE_ENV = "PITHY_TUI_TRACE";
+
+const TRACE_FILE = process.env[TUI_TRACE_ENV];
 
 export function trace(what: string): void {
   if (TRACE_FILE) appendFileSync(TRACE_FILE, `${String(process.hrtime.bigint() / 1000n).padStart(12, "0")} ${what}\n`);
