@@ -51,8 +51,8 @@ function bunPath(): string {
 const COLUMNS = 80;
 const ROWS = 24;
 
-/** Wide to narrow to wide, twice: both directions of the rewrap, at sizes the footer lays out differently. */
-const SIZES = [50, 120, 60, 100];
+/** Wide to narrow to wide, three times: both directions of the rewrap, at sizes the footer lays out differently. */
+const SIZES = [50, 120, 60, 100, 70, 110];
 
 /** A drag, not a jump: the window manager sends a resize per few pixels, a few dozen per drag. */
 const DRAG_STEP = 4;
@@ -83,6 +83,8 @@ const rest = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, 
 let workspace: string;
 let pty: IPty | undefined;
 let viewport: string[];
+let fullBuffer: string[];
+let blankGap: number;
 let markers: string[];
 let exitCode: number | undefined;
 
@@ -165,7 +167,15 @@ beforeAll(async () => {
     (_, index) => buffer.getLine(index)?.translateToString(true) ?? "",
   );
   viewport = lines.slice(-ROWS);
+  fullBuffer = lines;
   markers = lines.flatMap((line) => line.match(/MARK-\d+/g) ?? []);
+
+  // The blank rows a settled screen leaves under its newest marker: between the committed lines and the
+  // roster header, and below the footer. Scroll-away made room for each repaint by pushing the viewport
+  // with blank rows, so the live frame ends up sitting on a shelf of them; the in-place repaint erases
+  // and redraws on the same rows, leaving the footer on the bottom of the screen, under its lines.
+  const markerAt = viewport.map((line) => /MARK-\d+/.test(line)).lastIndexOf(true);
+  blankGap = viewport.slice(markerAt + 1).filter((line) => line.trim() === "").length;
 
   session.write("q");
   exitCode = await Promise.race([exited, rest(15_000).then(() => undefined)]);
@@ -184,6 +194,15 @@ afterAll(() => {
 const HEADER = /^\s*worker\s+kind\s/;
 /** The footer's rule: a run of box-drawing dashes, possibly cut short with an ellipsis at a narrower width. */
 const RULE = /^─{8,}/;
+
+/**
+ * Full-buffer ceilings for the #736 test below, measured on this harness with the shipped repaint: one
+ * header and two rules across all 217 lines the terminal holds after the six cycles. They are exact
+ * counts, not slack: a repaint that erases its frame in place cannot produce more, and the mechanism they
+ * guard against produces one pair per resize, not per cycle.
+ */
+const HEADER_CEILING = 1;
+const RULE_CEILING = 2;
 
 describe("the live footer on ConPTY, resized while it runs", () => {
   test("the settled screen holds exactly one roster header", () => {
@@ -206,6 +225,32 @@ describe("the live footer on ConPTY, resized while it runs", () => {
     const header = viewport.findIndex((line) => HEADER.test(line));
     expect(viewport[header + 1]).toMatch(/api\s+app\s+8787\s+ready/);
     expect(viewport[header + 2]).toMatch(/support\s+\S+\s+8790/);
+  });
+
+  test("the whole buffer, scrollback included, is not a staircase of retired footers (#736)", () => {
+    // The viewport checks above pin what a user sees; they do not pin how it got there. The mechanism this
+    // PR replaced (#744) scrolled each superseded frame into the scrollback instead of erasing it in place,
+    // so its viewport also showed one header and passed every check above, while its scrollback filled with
+    // 99 headers and 108 rules on the recorded drag (`C:/tmp/drag736.trace`, replayed in `sim736-replay.ts`).
+    // The shipped repaint scores 1 header and 2 rules across the whole buffer, here and in the replay. The
+    // ceilings are those measured counts, not hoped-for ones; a mechanism that retires a frame per resize
+    // grows the buffer with the number of cycles, so they bind here in a way a viewport-only count cannot.
+    expect(
+      fullBuffer.filter((line) => HEADER.test(line)),
+      fullBuffer.join("\n"),
+    ).toHaveLength(HEADER_CEILING);
+    expect(
+      fullBuffer.filter((line) => RULE.test(line)),
+      fullBuffer.join("\n"),
+    ).toHaveLength(RULE_CEILING);
+  });
+
+  test("the settled screen shows no blank gap from the newest marker down to the footer's rows", () => {
+    // Scroll-away cleared the viewport with blank rows to make room for the next repaint, so its settled
+    // footer sat on a shelf of them, away from the lines the session had committed. The in-place repaint
+    // erases the frame it drew and draws the new one on the same rows, so from the last marker down to the
+    // bottom of the screen there is the footer, not blank rows.
+    expect(blankGap).toBeLessThanOrEqual(2);
   });
 
   test("a marker committed at every settled size survives, in the order the sizes came", () => {
