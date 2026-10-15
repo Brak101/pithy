@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: MIT
 
 import { Box, render, Static, Text, useCursor, useInput, useStdout } from "ink";
-import { useEffect, useReducer, useState, useSyncExternalStore } from "react";
+import { useEffect, useReducer, useRef, useState, useSyncExternalStore } from "react";
 import { dim } from "../../terminal/style";
 import { stripAnsi } from "../logging";
 import { ticking } from "./choose";
 import { Footer, SPINNER_INTERVAL_MS } from "./footer";
 import { IdentityPicker } from "./identityPicker";
-import { TOP_LEFT, trace, useEraseOnResize } from "./resize";
+import { isResizeBurstOpen, TOP_LEFT, useEraseOnResize } from "./resize";
 import type { BarKey } from "./roster";
 import type { WorkerRow } from "./session";
 import type { CommittedLine, DevStore } from "./store";
@@ -119,12 +119,9 @@ const SHOW_CURSOR = "\x1b[?25h";
 export const NO_WRAP = "\x1b[?7l";
 const WRAP = "\x1b[?7h";
 
-function traceVisible(s: string): string {
-  return JSON.stringify(s.length > 140 ? `${s.slice(0, 70)}…[${s.length}]…${s.slice(-60)}` : s);
-}
-
 /**
- * Ink's stdout, with every frame written unwrapped and without the cursor Ink shows after it.
+ * Ink's stdout, with every frame written unwrapped and without the cursor Ink shows after it, and
+ * with every `resize` listener registered through it muted for the length of a resize burst.
  *
  * **The cursor.** Ink shows it wherever a cursor position is set — the feature exists for an input caret
  * — and the anchor is not one: it would be a block blinking on the roster's top rule.
@@ -138,19 +135,56 @@ function traceVisible(s: string): string {
  * reflows ran the two together. Autowrap is back on before the write ends, so the committed stream —
  * written separately — still soft-wraps exactly as a plain run does.
  *
- * A frame is the one write of Ink's that ends by showing the cursor: Ink puts the cursor back on the
- * anchor and shows it as the last thing it writes for a frame, and nothing else it writes does.
+ * A frame is the one write of Ink's that *carries* the cursor home: it ends by showing the cursor and
+ * is longer than the show alone. A bare `ESC[?25h` — what `beginSuspend`'s `log.done()` and the way out
+ * write — is not a frame and gets no guard wrapped around it.
+ *
+ * **The mute.** Node's `EventEmitter.emit` iterates a copy of the listener array, so a resize handler
+ * cannot silence Ink's from inside the same emit; `resize.ts` explains why Ink's mid-burst paint is the
+ * artifact. The seam that can reach it is subscription: every `resize` listener registered through this
+ * stream (Ink's included — Ink subscribes on the stream it was handed, which is this proxy) is wrapped
+ * so it steps aside while a burst is open, and un-wrapped on `off` by its original identity.
  */
-function framesUnwrapped(stream: NodeJS.WriteStream): NodeJS.WriteStream {
+type ResizeListener = (this: unknown, ...args: unknown[]) => void;
+
+function framesUnwrapped(stream: NodeJS.WriteStream, frame: { last: string }): NodeJS.WriteStream {
   const write = stream.write as (...args: unknown[]) => boolean;
+  // Original listener → the wrapper that stands in for it on the real stream, so `off` finds it.
+  const wrapped = new WeakMap<ResizeListener, ResizeListener>();
   return new Proxy(stream, {
     get(target, key) {
       if (key === "write") {
         return (chunk: unknown, ...rest: unknown[]) => {
-          if (typeof chunk === "string")
-            trace(`${chunk.endsWith(SHOW_CURSOR) ? "frame" : "write"} ${traceVisible(chunk)}`);
-          if (typeof chunk !== "string" || !chunk.endsWith(SHOW_CURSOR)) return write.call(target, chunk, ...rest);
-          return write.call(target, NO_WRAP + chunk.replaceAll(SHOW_CURSOR, "") + WRAP, ...rest);
+          if (typeof chunk !== "string" || chunk === SHOW_CURSOR || !chunk.endsWith(SHOW_CURSOR))
+            return write.call(target, chunk, ...rest);
+          // A frame: the only write that carries the cursor home. The string it wrote is recorded —
+          // it is the one real source for how tall the live region is (#760's finding 1: `render()`
+          // returns `{ rerender, unmount, ... }`; there is no `lastOutputHeight` on it to cast), and
+          // the resize rebuild in `resize.ts` counts rows of it at the new width.
+          const stripped = chunk.replaceAll(SHOW_CURSOR, "");
+          frame.last = stripped;
+          return write.call(target, NO_WRAP + stripped + WRAP, ...rest);
+        };
+      }
+      if (key === "on") {
+        return (event: string, listener: ResizeListener) => {
+          if (event !== "resize" || typeof listener !== "function") return target.on(event, listener);
+          const wrapper: ResizeListener = function (this: unknown, ...args: unknown[]) {
+            if (isResizeBurstOpen()) return undefined;
+            return listener.apply(this, args);
+          };
+          wrapped.set(listener, wrapper);
+          return target.on(event, wrapper);
+        };
+      }
+      if (key === "off") {
+        return (event: string, listener: ResizeListener) => {
+          const wrapper = event === "resize" ? wrapped.get(listener) : undefined;
+          if (wrapper) {
+            wrapped.delete(listener);
+            return target.off(event, wrapper);
+          }
+          return target.off(event, listener);
         };
       }
       const value: unknown = Reflect.get(target, key, target);
@@ -228,11 +262,12 @@ export function DevTui(props: {
    */
   anchored?: boolean;
   /**
-   * How tall the current live frame is, in rows. The resize rebuild (`resize.ts`) clears the viewport
-   * and restates the visible tail of the stream above it, and needs to know how many rows the footer
-   * itself will take. Ink counts those for every frame; `startTui` hands that count down.
+   * Where the last frame's string lives: `startTui`'s stdout proxy records every frame write into
+   * `.last`, and the resize rebuild (`resize.ts`) counts rows of that string at the new width. Read
+   * through a ref, so the 80 ms tick — which remounts no effect — cannot tear the resize handler
+   * down and back up (#760's nit 2 applies to the fallback the same way it applied to `frameRows`).
    */
-  frameRows?: () => number;
+  frame?: { last: string };
 }): React.ReactElement {
   const state = useSyncExternalStore(props.store.subscribe, props.store.state);
   const selectedRow = state.session.workers[state.selected];
@@ -248,7 +283,12 @@ export function DevTui(props: {
   const { setCursorPosition } = useCursor();
   setCursorPosition(props.anchored === false ? undefined : TOP_LEFT);
   const [, reanchor] = useReducer((renders: number) => renders + 1, 0);
-  useEraseOnResize(reanchor, props.store, props.frameRows ?? (() => state.session.workers.length + 4));
+  // The frame source is read through a ref: `startTui` hands the same object every render, and the
+  // fallback keeps a stable identity too, so the 80 ms tick never tears the resize effect down and
+  // back up (#760's nit 2 applied to the fallback exactly as it did to `frameRows`).
+  const frameRef = useRef<{ last: string }>(props.frame ?? { last: "" });
+  if (props.frame) frameRef.current = props.frame;
+  useEraseOnResize(reanchor, props.store, frameRef.current);
 
   // **The tick runs only while something is still coming up.** A command left open all day should not be
   // redrawing a clock into somebody's battery, so once every worker has arrived the footer is static
@@ -445,12 +485,15 @@ export function startTui(options: {
   onQuit: () => void;
   onInterrupt: () => void;
 }): TuiHandle {
+  // Where the last frame's string lives. The proxy below records every frame write into `.last`;
+  // `DevTui` hands it to the resize rebuild, which counts rows of it at the new width. One object,
+  // made here, stable for the life of the renderer — the write is the only source that knows how
+  // tall the live region is, and `render()`'s return value is not it (#760's finding 1).
+  const frame = { last: "" };
   const tree = (anchored: boolean) => (
     <DevTui
       anchored={anchored}
-      // Ink counts the live frame's rows for every frame it writes; the resize rebuild asks it rather
-      // than recomputing them, so the restatement lines up with what the footer actually drew.
-      frameRows={() => (instance as unknown as { lastOutputHeight: number }).lastOutputHeight}
+      frame={frame}
       store={options.store}
       keys={options.keys}
       onRestart={options.onRestart}
@@ -464,7 +507,7 @@ export function startTui(options: {
     />
   );
   const instance = render(tree(true), {
-    stdout: framesUnwrapped(process.stdout),
+    stdout: framesUnwrapped(process.stdout, frame),
     exitOnCtrlC: false,
     patchConsole: false,
   });
