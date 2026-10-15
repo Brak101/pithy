@@ -4,6 +4,7 @@
 import { appendFileSync } from "node:fs";
 import { useApp, useStdout } from "ink";
 import { useEffect } from "react";
+import { TUI_TRACE_ENV } from "./choose";
 import type { DevStore } from "./store";
 
 /** Ink's cursor intent for the live region: its first row, its first column. */
@@ -24,13 +25,7 @@ const DOWN = "\x1b[B";
 /** Ask the terminal where the cursor is; the answer arrives on stdin as `ESC[<row>;<col>R`. Measurement only. */
 const CURSOR_QUERY = "\x1b[6n";
 
-/**
- * #736's trace rig: with `PITHY_TUI_TRACE=<file>` set, every write to the terminal, every resize event,
- * and the terminal's own cursor answers are appended to that file. Unset, the string is `undefined` and
- * every trace call is a no-op.
- */
-export const TUI_TRACE_ENV = "PITHY_TUI_TRACE";
-
+/** #736's trace rig; the name and its documentation live in `choose.ts`, where the contract can reach them. */
 const TRACE_FILE = process.env[TUI_TRACE_ENV];
 
 export function trace(what: string): void {

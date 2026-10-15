@@ -3,8 +3,7 @@
 
 import type { CLOUDFLARE_ENV_KEYS } from "@pithy-sh/cloudflare/src/env/devVars";
 import { PITHY_OFFLINE_ENV } from "../cloudflare/config";
-import { NO_TUI_ENV } from "../dev/tui/choose";
-import { TUI_TRACE_ENV } from "../dev/tui/resize";
+import { NO_TUI_ENV, TUI_TRACE_ENV } from "../dev/tui/choose";
 import { NO_UPDATE_NOTIFIER_ENV } from "../notifier/notify";
 import { CONFIG_DIR_ENV } from "../notifier/state";
 import { NO_OPEN_ENV } from "../platform/browser";
