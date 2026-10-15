@@ -5,6 +5,7 @@ import { render } from "ink-testing-library";
 import { describe, expect, test, vi } from "vitest";
 import { stripAnsi } from "../logging";
 import { DevTui } from "./app";
+import { rowsAt } from "./resize";
 import { createDevStore } from "./store";
 
 /**
@@ -18,6 +19,27 @@ import { createDevStore } from "./store";
  */
 
 const at = (ms: number) => new Date(1_700_000_000_000 + ms);
+
+describe("rowsAt — the row count the resize rebuild budgets on", () => {
+  // #760's finding 1 was a row count that read `undefined` in production: the rebuild built its
+  // viewport from `NaN`, which sliced the *whole* stream back onto the screen. The count is real
+  // now — rows of the last frame string at the new width — and a count that is missing has to fail
+  // here, not in a full-buffer suite three commits later.
+  test("a line is at least one row, and a long line is one row per terminal width", () => {
+    expect(rowsAt("short\n", 80)).toBe(1);
+    // Finding 5's example: a 150-column wrangler line in a 60-column terminal is three rows.
+    expect(rowsAt("x".repeat(150), 60)).toBe(3);
+    expect(rowsAt(`${"y".repeat(60)}\n`, 60)).toBe(1);
+    expect(rowsAt(`${"y".repeat(61)}\n`, 60)).toBe(2);
+    expect(rowsAt("a\nb\nc", 80)).toBe(3);
+    // An empty string is zero rows, and a missing frame is an empty string — never NaN, never a
+    // count of the whole store. A lone newline is one blank row: the screen line it opens.
+    expect(rowsAt("", 80)).toBe(0);
+    expect(rowsAt("\n", 80)).toBe(1);
+    // Escape sequences occupy no columns.
+    expect(rowsAt("\x1b[2mshort\x1b[22m", 80)).toBe(1);
+  });
+});
 
 const withWorkers = () => {
   const store = createDevStore();

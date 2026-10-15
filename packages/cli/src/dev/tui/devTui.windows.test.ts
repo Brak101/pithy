@@ -18,8 +18,10 @@ requireWindows();
  *
  * Ink repaints the footer by erasing the rows it drew last time, counted from the cursor. ConPTY rewraps
  * its buffer on a resize, so the count goes stale and the erase lands on the wrong rows: on a drag, every
- * spinner-tick repaint left the previous roster's rule and header behind, stacking up the screen. The fix
- * redraws the footer from a clean viewport once the size settles (`useRepaintOnResize` in `app.tsx`).
+ * spinner-tick repaint left the previous roster's rule and header behind, stacking up the screen. The
+ * fix mutes Ink's resize paint for the length of a burst, erases from the footer's anchor on every
+ * event, and repaints once at the final geometry when the size settles (`resize.ts`, wired from
+ * `app.tsx`).
  *
  * The Linux pty test cannot see this. It reads the bytes the program wrote, and a byte stream does not
  * rewrap — only a terminal does. So this one runs where the rewrap happens: a real pseudoconsole, resized
@@ -253,11 +255,34 @@ describe("the live footer on ConPTY, resized while it runs", () => {
     expect(blankGap).toBeLessThanOrEqual(2);
   });
 
-  test("a marker committed at every settled size survives, in the order the sizes came", () => {
-    // ConPTY can repaint a line it already sent while it reflows, so a marker may appear more than once in
-    // the emulator's scrollback. What matters is that none was erased, and that the stream did not reorder.
-    const firstSeen = markers.filter((marker, index) => markers.indexOf(marker) === index);
-    expect(firstSeen).toEqual(SIZES.map((columns) => `MARK-${columns}`));
+  test("a marker committed at every settled size is on the buffer exactly once, in the order the sizes came", () => {
+    // Exact counts on the emulator's whole buffer (scrollback plus viewport) — what a reader scrolls.
+    // ConPTY re-emits reflowed lines into the *bytes*, which is why this suite reads the screen and not
+    // the transcript; on the screen, first-appearance deduping waved through the #760 rebuild's
+    // restatement, which put a second copy of each marker in the buffer itself. No restatement ships,
+    // so nothing earns a second copy.
+    expect(markers).toEqual(SIZES.map((columns) => `MARK-${columns}`));
+  });
+
+  test("every committed stream line is on the whole buffer, in order, with no fan of copies", () => {
+    // First appearances, top-down over scrollback plus viewport, must read L0..L39 in order: a
+    // destroyed line (main's stale erases) drops it, a reordered stream reorders the list. The count
+    // ceiling is the fan guard: finding 1's `slice(NaN)` restated the *whole* store at every rebuild,
+    // which puts a copy of every line per drag cycle into the buffer — six cycles, seven copies. The
+    // measured restatement reaches only the visible tail, and ConPTY's reflow re-emits can add one
+    // copy at the boundary, so the bound is three. Lines the tail never touched stay at one.
+    const counts = new Map<string, number>();
+    const firstAppearance: string[] = [];
+    for (const line of fullBuffer) {
+      for (const match of line.matchAll(/\bL\d+\b/g)) {
+        counts.set(match[0], (counts.get(match[0]) ?? 0) + 1);
+        if (!firstAppearance.includes(match[0])) firstAppearance.push(match[0]);
+      }
+    }
+    expect(firstAppearance).toEqual(Array.from({ length: 40 }, (_, index) => `L${index}`));
+    for (const [line, count] of counts) {
+      expect(count, `${line} appears ${count} times`).toBeLessThanOrEqual(3);
+    }
   });
 
   test("the keys still work after the repaints, and q ends the session", () => {
