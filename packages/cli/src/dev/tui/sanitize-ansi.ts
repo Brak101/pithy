@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Vadym Demedes <vadimdemedes@hey.com>
+// SPDX-FileCopyrightText: Sindre Sorhus <sindresorhus@gmail.com>
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
