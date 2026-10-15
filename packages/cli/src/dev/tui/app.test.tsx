@@ -22,7 +22,7 @@ const at = (ms: number) => new Date(1_700_000_000_000 + ms);
 
 describe("rowsAt — the row count the resize rebuild budgets on", () => {
   // The rebuild's budget is rows at the *new* width, and a count that reads `undefined` or `NaN`
-  // slices the whole store back onto the screen (PR #760 review, finding 1). The count is real, and
+  // slices the whole store back onto the screen. The count is real, and
   // a count that is missing has to fail here, not in a full-buffer suite three commits later.
   test("a line is at least one row, and a long line is one row per terminal width", () => {
     expect(rowsAt("short\n", 80)).toBe(1);
@@ -65,8 +65,8 @@ describe("rowsAt — the row count the resize rebuild budgets on", () => {
 describe("frameRows — a frame is one row per line, whatever the width", () => {
   test("an 80-column rule is one row at 60 columns, because the frame was written with autowrap off", () => {
     expect(frameRows("─".repeat(80))).toBe(1);
-    // Wrapping it again at the new width (rowsAt) is the overcount that shrank the budget by the
-    // frame's own height and lost the oldest visible lines (PR #760 review, finding 2).
+    // Wrapping it again at the new width (rowsAt) is the overcount that shrinks the budget by the
+    // frame's own height and loses the oldest visible lines.
     expect(rowsAt("─".repeat(80), 60)).toBe(2);
     expect(frameRows("worker  kind\n───\napi  app")).toBe(3);
     // A trailing newline opens no line of its own; the empty frame is no rows at all.
