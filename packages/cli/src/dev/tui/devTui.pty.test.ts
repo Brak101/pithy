@@ -206,9 +206,21 @@ describe.runIf(RUNNABLE)("the live footer on a real terminal", () => {
   });
 
   test("after the last repaint the screen holds one roster header", () => {
-    // Cut at the last guarded frame: everything after it is that frame, and the frame is the footer.
-    const frame = transcript.slice(transcript.lastIndexOf(NO_WRAP)).replace(ANSI, "");
-    expect(frame, "no guarded frame after the resize").toContain("worker");
-    expect([...frame.matchAll(/^\s+worker\s+kind/gm)]).toHaveLength(1);
+    // Cut at the last guarded frame that carries the roster. The last guard in the transcript can be
+    // teardown's: quitting erases the footer and writes an empty frame after it, and a cutter that
+    // takes the *final* guard then slices the exit, not the screen the drag left. One frame per
+    // split segment, honest by construction: each is what was written between two guards.
+    // On main's bytes there is no guard at all — the single "frame" is the whole transcript, the
+    // staircase is inside it, and the count below goes red. Red on the disease, green on the cure.
+    const frames = transcript.split(NO_WRAP).map((frame) => frame.replace(ANSI, ""));
+    let carried: string | undefined;
+    for (let i = frames.length - 1; i >= 0; i--) {
+      if (frames[i]?.includes("worker kind")) {
+        carried = frames[i];
+        break;
+      }
+    }
+    expect(carried, "no guarded frame after the resize").toContain("worker kind");
+    expect([...(carried ?? "").matchAll(/^\s+worker\s+kind/gm)]).toHaveLength(1);
   });
 });
