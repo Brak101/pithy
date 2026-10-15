@@ -31,10 +31,11 @@ import { NO_WRAP } from "./app";
  * 5. **A resize burst paints on its trailing edge only** (#736, #760). The harness drags its own
  *    terminal narrower and wider with `stty`, which arrives as SIGWINCH exactly as a window manager's
  *    does. Inside a burst Ink's own resize paint is muted (subscription-time, `app.tsx`/`resize.ts`)
- *    and each event erases from the anchor down, so the burst writes no frames at all; the settle
- *    paints once, at the final size — and a settle that ends a multi-event drag rebuilds the viewport,
- *    restating the visible tail of the stream in rows measured at the new width. A byte stream does
- *    not rewrap, so this cannot see the stale headers a rewrapping terminal stacked up —
+ *    and each event erases from the anchor down — the mute covers that paint alone: the 80 ms tick and
+ *    any line committed mid-drag still render frames through a burst (the bound below measures them).
+ *    The settle paints once, at the final size — and a settle that ends a multi-event drag rebuilds
+ *    the viewport, restating the visible tail of the stream in rows measured at the new width. A byte
+ *    stream does not rewrap, so this cannot see the stale headers a rewrapping terminal stacked up —
  *    `devTui.windows.test.ts` reads those off a real ConPTY. What this holds is the half a byte
  *    stream can: how often the repaint fires, and what a reader can scroll to — every committed line
  *    present, in order, and in the settled screen each appearing exactly once.

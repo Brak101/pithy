@@ -233,8 +233,9 @@ describe("the live footer on ConPTY, resized while it runs", () => {
     // The viewport checks above pin what a user sees; they do not pin how it got there. The mechanism this
     // PR replaced (#744) scrolled each superseded frame into the scrollback instead of erasing it in place,
     // so its viewport also showed one header and passed every check above, while its scrollback filled with
-    // 99 headers and 108 rules on the recorded drag (`C:/tmp/drag736.trace`, replayed in `sim736-replay.ts`).
-    // The shipped repaint scores 1 header and 2 rules across the whole buffer, here and in the replay. The
+    // 99 headers and 108 rules on the recorded drag (the trace and its replay are on the record in
+    // https://github.com/pithy-sh/pithy/pull/760#issuecomment-6195090993). The shipped repaint scores
+    // 1 header and 2 rules across the whole buffer, here and in that replay. The
     // ceilings are those measured counts, not hoped-for ones; a mechanism that retires a frame per resize
     // grows the buffer with the number of cycles, so they bind here in a way a viewport-only count cannot.
     expect(
@@ -258,16 +259,17 @@ describe("the live footer on ConPTY, resized while it runs", () => {
   test("a marker committed at every settled size is on the buffer exactly once, in the order the sizes came", () => {
     // Exact counts on the emulator's whole buffer (scrollback plus viewport) — what a reader scrolls.
     // ConPTY re-emits reflowed lines into the *bytes*, which is why this suite reads the screen and not
-    // the transcript; on the screen, first-appearance deduping waved through the #760 rebuild's
-    // restatement, which put a second copy of each marker in the buffer itself. No restatement ships,
-    // so nothing earns a second copy.
+    // the transcript. The rebuild restates the visible tail: the erase removes each line and the
+    // restatement writes it back, so a marker's first appearances on the buffer read in the order the
+    // sizes came, each exactly once. Copies beyond the first — repaints racing the erase can re-deliver
+    // a boundary line — are the fan bound's business, below.
     expect(markers).toEqual(SIZES.map((columns) => `MARK-${columns}`));
   });
 
   test("every committed stream line is on the whole buffer, in order, with no fan of copies", () => {
     // First appearances, top-down over scrollback plus viewport, must read L0..L39 in order: a
     // destroyed line (main's stale erases) drops it, a reordered stream reorders the list. The count
-    // ceiling is the fan guard: finding 1's `slice(NaN)` restated the *whole* store at every rebuild,
+    // ceiling is the fan guard: the `slice(NaN)` bug restated the *whole* store at every rebuild,
     // which puts a copy of every line per drag cycle into the buffer — six cycles, seven copies. The
     // measured restatement reaches only the visible tail, and ConPTY's reflow re-emits can add one
     // copy at the boundary, so the bound is three. Lines the tail never touched stay at one.
