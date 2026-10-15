@@ -158,9 +158,9 @@ function framesUnwrapped(stream: NodeJS.WriteStream, frame: { last: string }): N
           if (typeof chunk !== "string" || chunk === SHOW_CURSOR || !chunk.endsWith(SHOW_CURSOR))
             return write.call(target, chunk, ...rest);
           // A frame: the only write that carries the cursor home. The string it wrote is recorded —
-          // it is the one real source for how tall the live region is (#760's finding 1: `render()`
-          // returns `{ rerender, unmount, ... }`; there is no `lastOutputHeight` on it to cast), and
-          // the resize rebuild in `resize.ts` counts rows of it at the new width.
+          // it is the one real source for how tall the live region is (`render()` returns
+          // `{ rerender, unmount, ... }`, with no frame height on it to read), and the resize rebuild
+          // in `resize.ts` counts the rows of it at the new width.
           const stripped = chunk.replaceAll(SHOW_CURSOR, "");
           frame.last = stripped;
           return write.call(target, NO_WRAP + stripped + WRAP, ...rest);
@@ -263,9 +263,9 @@ export function DevTui(props: {
   anchored?: boolean;
   /**
    * Where the last frame's string lives: `startTui`'s stdout proxy records every frame write into
-   * `.last`, and the resize rebuild (`resize.ts`) counts rows of that string at the new width. Read
-   * through a ref, so the 80 ms tick — which remounts no effect — cannot tear the resize handler
-   * down and back up (#760's nit 2 applies to the fallback the same way it applied to `frameRows`).
+   * `.last`, and the resize rebuild (`resize.ts`) counts its lines — a frame is one row per line —
+   * when it budgets the restatement. Read through a ref, so the 80 ms tick — which remounts no
+   * effect — cannot tear the resize handler down and back up.
    */
   frame?: { last: string };
 }): React.ReactElement {
@@ -285,7 +285,7 @@ export function DevTui(props: {
   const [, reanchor] = useReducer((renders: number) => renders + 1, 0);
   // The frame source is read through a ref: `startTui` hands the same object every render, and the
   // fallback keeps a stable identity too, so the 80 ms tick never tears the resize effect down and
-  // back up (#760's nit 2 applied to the fallback exactly as it did to `frameRows`).
+  // back up.
   const frameRef = useRef<{ last: string }>(props.frame ?? { last: "" });
   if (props.frame) frameRef.current = props.frame;
   useEraseOnResize(reanchor, props.store, frameRef.current);
@@ -486,9 +486,9 @@ export function startTui(options: {
   onInterrupt: () => void;
 }): TuiHandle {
   // Where the last frame's string lives. The proxy below records every frame write into `.last`;
-  // `DevTui` hands it to the resize rebuild, which counts rows of it at the new width. One object,
-  // made here, stable for the life of the renderer — the write is the only source that knows how
-  // tall the live region is, and `render()`'s return value is not it (#760's finding 1).
+  // `DevTui` hands it to the resize rebuild, which counts its lines when it budgets the restatement.
+  // One object, made here, stable for the life of the renderer — the write is the only source that
+  // knows how tall the live region is, and `render()`'s return value is not it.
   const frame = { last: "" };
   const tree = (anchored: boolean) => (
     <DevTui
@@ -511,9 +511,16 @@ export function startTui(options: {
     exitOnCtrlC: false,
     patchConsole: false,
   });
+  // `commands/dev.ts` reaches `stop` twice on a double Ctrl-C: once from the interrupt handler and
+  // once from the shutdown's `finally`. Ink's `render()` return has no unmounted guard — a second
+  // `rerender` mounts a live tree (raw mode, the tick, a fresh resize listener) into the instance
+  // that has just died. The first caller tears down; the rest are no-ops.
+  let stopped = false;
   return {
     store: options.store,
     stop: async () => {
+      if (stopped) return;
+      stopped = true;
       // Off the anchor first: the last frame stays where it is and the cursor goes under it.
       instance.rerender(tree(false));
       instance.unmount();
