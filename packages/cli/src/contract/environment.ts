@@ -3,7 +3,7 @@
 
 import type { CLOUDFLARE_ENV_KEYS } from "@pithy-sh/cloudflare/src/env/devVars";
 import { PITHY_OFFLINE_ENV } from "../cloudflare/config";
-import { NO_TUI_ENV, TUI_TRACE_ENV } from "../dev/tui/choose";
+import { NO_TUI_ENV } from "../dev/tui/choose";
 import { NO_UPDATE_NOTIFIER_ENV } from "../notifier/notify";
 import { CONFIG_DIR_ENV } from "../notifier/state";
 import { NO_OPEN_ENV } from "../platform/browser";
@@ -63,11 +63,6 @@ export const ENVIRONMENT_VARIABLES: readonly EnvironmentVariable[] = [
   },
   { name: NO_OPEN_ENV, values: ANY, description: "Suppress every offer to open a link in a browser." },
   { name: NO_TUI_ENV, values: ANY, description: "Keep pithy dev to the plain stream, as --no-tui does." },
-  {
-    name: TUI_TRACE_ENV,
-    values: "a file path",
-    description: "Record every pithy dev terminal write, resize event, and cursor answer to that file.",
-  },
   { name: "NO_COLOR", values: ANY, description: "Turn color off." },
   { name: "FORCE_COLOR", values: ANY, description: "Turn color on, even where the stream is not a terminal." },
   ...Object.entries(CLOUDFLARE_KEYS).map(([name, description]) => ({ name, values: "the credential", description })),

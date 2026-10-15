@@ -8,13 +8,6 @@ import { stdinTakesInput } from "../../terminal/inputMode";
 export const NO_TUI_ENV = "PITHY_NO_TUI";
 
 /**
- * #736's trace rig, published here so the contract can name it without loading the renderer: with
- * `PITHY_TUI_TRACE=<file>`, every write to the terminal, every resize event, and the terminal's own
- * cursor answers are appended to that file. Unset, every trace call is a no-op.
- */
-export const TUI_TRACE_ENV = "PITHY_TUI_TRACE";
-
-/**
  * The facts the renderer choice turns on, passed in rather than read here.
  *
  * Explicit because this is the one decision that governs whether a session repaints at all, and reading
