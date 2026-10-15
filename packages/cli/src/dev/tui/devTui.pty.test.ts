@@ -160,11 +160,15 @@ const ANSI = /\x1b\[[0-9;?]*[a-zA-Z]/g;
 const plain = () => transcript.replace(ANSI, "");
 
 describe.runIf(RUNNABLE)("the live footer on a real terminal", () => {
-  test("every committed line survives, exactly once, in order", () => {
+  test("every committed line survives, in order, and none is destroyed", () => {
+    // First-appearance counting, not `toHaveLength(LINES)`: the resize rebuild (#736) restates the
+    // visible tail of the stream verbatim, which repeats tail lines in the bytes. What a reader must
+    // never see is a line missing or reordered — main's stale erases destroyed lines outright, and
+    // the unique count dropping below LINES is what goes red there.
     const seen = [...plain().matchAll(/\bL(\d+)\b/g)].map((m) => Number(m[1]));
-    expect(seen).toHaveLength(LINES);
-    expect(new Set(seen).size).toBe(LINES);
-    expect(seen).toEqual([...seen].sort((a, b) => a - b));
+    const firstSeen = seen.filter((n, index) => seen.indexOf(n) === index);
+    expect(firstSeen).toHaveLength(LINES);
+    expect(firstSeen).toEqual([...firstSeen].sort((a, b) => a - b));
   });
 
   test("a line far wider than the terminal arrives in one piece", () => {
@@ -200,9 +204,12 @@ describe.runIf(RUNNABLE)("the live footer on a real terminal", () => {
     expect(transcript.split(NO_WRAP).length - 1).toBeGreaterThan(SETTLED.length);
   });
 
-  test("a marker written at each settled size arrives once, in order", () => {
+  test("a marker written at each settled size arrives, in order, and none is lost", () => {
+    // Deduped first appearances, same as the committed lines above: the rebuild restates the visible
+    // tail, and a restated marker is a copy, not a loss. The claim is that each arrived once, in the
+    // order the sizes came, and that none was destroyed.
     const markers = [...plain().matchAll(/MARK-(\d+)/g)].map((m) => Number(m[1]));
-    expect(markers).toEqual(SETTLED);
+    expect(markers.filter((m, index) => markers.indexOf(m) === index)).toEqual(SETTLED);
   });
 
   test("after the last repaint the screen holds one roster header", () => {

@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Pithy
 // SPDX-License-Identifier: MIT
 
-import { appendFileSync } from "node:fs";
-import { Box, render, Static, Text, useApp, useCursor, useInput, useStdout } from "ink";
+import { Box, render, Static, Text, useCursor, useInput, useStdout } from "ink";
 import { useEffect, useReducer, useState, useSyncExternalStore } from "react";
 import { dim } from "../../terminal/style";
 import { stripAnsi } from "../logging";
 import { ticking } from "./choose";
 import { Footer, SPINNER_INTERVAL_MS } from "./footer";
 import { IdentityPicker } from "./identityPicker";
+import { TOP_LEFT, trace, useEraseOnResize } from "./resize";
 import type { BarKey } from "./roster";
 import type { WorkerRow } from "./session";
 import type { CommittedLine, DevStore } from "./store";
@@ -112,12 +112,6 @@ function applies(needs: "always" | "worker" | "ready-app" | "started", row: Mark
 /** §9: width from the terminal, falling back to 80 when it will not say. */
 const FALLBACK_COLUMNS = 80;
 
-/** Ink's cursor intent for the live region: its first row, its first column. */
-const TOP_LEFT = { x: 0, y: 0 };
-
-/** Erase from the cursor to the end of the screen. Never `\x1b[2J`, which reaches above it. */
-const ERASE_BELOW = "\x1b[J";
-
 /** Show the cursor. Ink writes it with every frame once a cursor position is set; `framesUnwrapped` drops it. */
 const SHOW_CURSOR = "\x1b[?25h";
 
@@ -125,88 +119,8 @@ const SHOW_CURSOR = "\x1b[?25h";
 export const NO_WRAP = "\x1b[?7l";
 const WRAP = "\x1b[?7h";
 
-/** Ask the terminal where the cursor is; the answer arrives on stdin as `ESC[<row>;<col>R`. Measurement only. */
-const CURSOR_QUERY = "\x1b[6n";
-
-/**
- * #736's trace rig: with `PITHY_TUI_TRACE=<file>` set, every write to the terminal, every resize event,
- * and the terminal's own cursor answers are appended to that file. Unset, the string is `undefined` and
- * every trace call is a no-op.
- */
-const TRACE_FILE = process.env.PITHY_TUI_TRACE;
-
-function trace(what: string): void {
-  if (TRACE_FILE) appendFileSync(TRACE_FILE, `${String(process.hrtime.bigint() / 1000n).padStart(12, "0")} ${what}\n`);
-}
-
 function traceVisible(s: string): string {
   return JSON.stringify(s.length > 140 ? `${s.slice(0, 70)}…[${s.length}]…${s.slice(-60)}` : s);
-}
-
-/**
- * Whether Ink believes it is running in CI, by the rule Ink uses (`is-in-ci`): `CI` or
- * `CONTINUOUS_INTEGRATION` present and neither `0` nor `false`. Ink then renders non-interactively —
- * no live frame, no `resize` listener — even on a TTY.
- */
-function inkSeesCi(): boolean {
-  return ["CI", "CONTINUOUS_INTEGRATION"].some(
-    (key) => key in process.env && process.env[key] !== "0" && process.env[key] !== "false",
-  );
-}
-
-/**
- * **Keep the cursor on the live region's first cell, and erase from there on every resize (#736).**
- *
- * Ink repaints the footer by moving the cursor up the number of rows it drew last time and erasing them.
- * A terminal that rewraps on resize — ConPTY does, and so does any terminal that reflows — moves those
- * rows, so the count goes stale and the erase lands on the wrong ones: on a drag, a stale rule and header
- * stacked up above the roster at every repaint. Three repairs on #741 tried to make the count right. The
- * terminal never says what it is.
- *
- * It does say one thing, without being asked: where the cursor is. A terminal that reflows carries the
- * cursor with the cell under it. So the cursor rests on the live region's first cell — Ink's own
- * `useCursor`, at `TOP_LEFT` — and the region's start is wherever the terminal put the cursor. Ink's erase
- * then starts from that cell, goes down the frame and back up to it, and cannot reach above it: the
- * committed stream is out of reach of any count, stale or not.
- *
- * What a stale count can still miss is below the anchor, so every resize erases that too. This hands the
- * terminal over through `suspendTerminal` — Ink's public way to drop its last frame — erases from the
- * anchor to the end of the screen, with no count at all, and restates the anchor so the repaint that
- * follows the suspension carries the cursor back to it. Nothing moves, nothing is pushed into scrollback,
- * and nothing is erased that Ink did not draw. One erase per resize event, the same cadence as the
- * repaint Ink already does for each.
- */
-function useEraseOnResize(reanchor: () => void): void {
-  const { stdout } = useStdout();
-  const { suspendTerminal } = useApp();
-  useEffect(() => {
-    // Ink subscribes to `resize` only on an interactive terminal, and so does this. Ink's test is its own
-    // and not `choose.ts`'s: a TTY, outside what `is-in-ci` calls CI.
-    if (!stdout?.isTTY || inkSeesCi()) return;
-    const erase = () => {
-      // `suspendTerminal` refuses a second suspension while one is open; a resize that arrives inside one
-      // is already being answered by it.
-      trace(`resize ${stdout.columns}x${stdout.rows}`);
-      suspendTerminal(() => {
-        stdout.write(ERASE_BELOW);
-        if (TRACE_FILE) stdout.write(CURSOR_QUERY);
-        reanchor();
-      }).catch(() => {});
-    };
-    // First, so the erase lands before Ink's own handler repaints.
-    stdout.prependListener("resize", erase);
-    const reportCpr = (data: Buffer | string): void => {
-      // The escape is built at runtime: Biome bans control characters in regex literals, and the
-      // formatter expands a `new RegExp` string right back into one.
-      const answer = new RegExp(`${"\x1b"}\\[(\\d+);(\\d+)R`).exec(String(data));
-      if (answer) trace(`cursor ${answer[1]}x${answer[2]}`);
-    };
-    if (TRACE_FILE) process.stdin.on("data", reportCpr);
-    return () => {
-      stdout.off("resize", erase);
-      if (TRACE_FILE) process.stdin.off("data", reportCpr);
-    };
-  }, [stdout, suspendTerminal, reanchor]);
 }
 
 /**
@@ -313,6 +227,12 @@ export function DevTui(props: {
    * way out, so the shell's prompt lands under the last frame rather than on top of it.
    */
   anchored?: boolean;
+  /**
+   * How tall the current live frame is, in rows. The resize rebuild (`resize.ts`) clears the viewport
+   * and restates the visible tail of the stream above it, and needs to know how many rows the footer
+   * itself will take. Ink counts those for every frame; `startTui` hands that count down.
+   */
+  frameRows?: () => number;
 }): React.ReactElement {
   const state = useSyncExternalStore(props.store.subscribe, props.store.state);
   const selectedRow = state.session.workers[state.selected];
@@ -328,7 +248,7 @@ export function DevTui(props: {
   const { setCursorPosition } = useCursor();
   setCursorPosition(props.anchored === false ? undefined : TOP_LEFT);
   const [, reanchor] = useReducer((renders: number) => renders + 1, 0);
-  useEraseOnResize(reanchor);
+  useEraseOnResize(reanchor, props.store, props.frameRows ?? (() => state.session.workers.length + 4));
 
   // **The tick runs only while something is still coming up.** A command left open all day should not be
   // redrawing a clock into somebody's battery, so once every worker has arrived the footer is static
@@ -528,6 +448,9 @@ export function startTui(options: {
   const tree = (anchored: boolean) => (
     <DevTui
       anchored={anchored}
+      // Ink counts the live frame's rows for every frame it writes; the resize rebuild asks it rather
+      // than recomputing them, so the restatement lines up with what the footer actually drew.
+      frameRows={() => (instance as unknown as { lastOutputHeight: number }).lastOutputHeight}
       store={options.store}
       keys={options.keys}
       onRestart={options.onRestart}
